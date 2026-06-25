@@ -17,6 +17,9 @@ from core.lighthouse_vision import (
     LIGHTHOUSE_MATCH_THRESHOLD,
     LIGHTHOUSE_SCAN_ROI,
     LighthouseMission,
+    LighthouseScanResult,
+    SKIP_MISSION_KINDS,
+    classify_scanned_missions,
     is_lighthouse_intel_screen,
     refine_mission_click,
     scan_mission_icons,
@@ -103,6 +106,7 @@ class AutoLighthouseTask:
         self._last_monster_dispatch_at = 0.0
         self._stop_event = threading.Event()
         self._slot_attempts: list[tuple[int, int, int]] = []
+        self._beast_skip_centers: list[tuple[int, int]] = []
         self.vision = Vision(TEMPLATE_DIR, threshold=0.70)
         self._deploy = DeployMarchHelper(
             adb,
@@ -342,13 +346,37 @@ class AutoLighthouseTask:
         self._slot_attempts.append((x, y, 1))
         return 1
 
+    def _is_beast_skip_center(self, center: tuple[int, int]) -> bool:
+        x, y = center
+        for sx, sy in self._beast_skip_centers:
+            if abs(x - sx) < MISSION_SLOT_TRACK_RADIUS and abs(y - sy) < MISSION_SLOT_TRACK_RADIUS:
+                return True
+        return False
+
+    def _mark_beast_skip_center(self, center: tuple[int, int]) -> None:
+        if self._is_beast_skip_center(center):
+            return
+        self._beast_skip_centers.append(center)
+
     def _pick_executable_mission(
         self, missions: tuple[LighthouseMission, ...]
     ) -> LighthouseMission | None:
-        """从扫描结果中取出下一个可点击的图标（跳过已达尝试上限的坐标）。"""
+        """从扫描结果中取出下一个可点击的图标（跳过特殊大怪与已达尝试上限的坐标）。"""
         if not missions:
             return None
         for mission in missions:
+            if mission.kind in SKIP_MISSION_KINDS:
+                logger.debug(
+                    f"[{self.name}] 跳过特殊大怪 "
+                    f"({mission.center[0]},{mission.center[1]})"
+                )
+                continue
+            if self._is_beast_skip_center(mission.center):
+                logger.debug(
+                    f"[{self.name}] 跳过已标记的特殊大怪坐标 "
+                    f"({mission.center[0]},{mission.center[1]})"
+                )
+                continue
             if self._is_slot_exhausted(mission.center):
                 logger.debug(
                     f"[{self.name}] 跳过已达上限坐标 "
@@ -358,6 +386,18 @@ class AutoLighthouseTask:
                 continue
             return mission
         return None
+
+    def _only_skippable_missions_remain(
+        self, missions: tuple[LighthouseMission, ...]
+    ) -> bool:
+        if not missions:
+            return False
+        return all(
+            m.kind in SKIP_MISSION_KINDS
+            or self._is_beast_skip_center(m.center)
+            or self._is_slot_exhausted(m.center)
+            for m in missions
+        )
 
     def _scan_missions(self, screen):
         if self._interrupted():
@@ -377,6 +417,14 @@ class AutoLighthouseTask:
         self._emit("扫描任务图标…")
         result = self._scan_missions(screen)
         if result.missions:
+            missions = classify_scanned_missions(screen, result.missions)
+            result = LighthouseScanResult(
+                mission=missions[0],
+                missions=missions,
+                best_confidence=result.best_confidence,
+                best_label=missions[0].label,
+                candidate_locations=result.candidate_locations,
+            )
             logger.debug(
                 f"[{self.name}] 扫描结果: {self._format_missions_summary(result.missions)}"
             )
@@ -467,7 +515,7 @@ class AutoLighthouseTask:
         screen = self.adb.screenshot()
 
         if self._deploy.is_deploy_screen(screen):
-            self._emit("点击后识别为：小怪（出征界面）")
+            self._emit("点击后识别为：需出征的任务（出征界面，具体类型见扫描分类）")
             return "small_monster"
 
         if self._is_on_lighthouse_intel_page(screen):
@@ -552,6 +600,7 @@ class AutoLighthouseTask:
         """扫描图标 → 点击 → 确认 → 分类 → 处理 → 回野外；下一轮再开情报页。"""
         handled = 0
         self._slot_attempts.clear()
+        self._beast_skip_centers.clear()
 
         while not self._interrupted():
             self._before_next_mission()
@@ -561,13 +610,22 @@ class AutoLighthouseTask:
                 raise InterruptedError("任务已停止")
 
             if mission is None:
-                if result.missions and all(
-                    self._is_slot_exhausted(m.center) for m in result.missions
+                if result.missions and self._only_skippable_missions_remain(
+                    result.missions
                 ):
-                    self._emit(
-                        f"剩余 {len(result.missions)} 个候选坐标均已尝试 "
-                        f"{MISSION_SLOT_MAX_ATTEMPTS} 次，结束本轮"
+                    beast_count = sum(
+                        1 for m in result.missions if m.kind in SKIP_MISSION_KINDS
                     )
+                    if beast_count:
+                        self._emit(
+                            f"剩余 {beast_count} 个特殊大怪任务已跳过，"
+                            f"结束本轮"
+                        )
+                    else:
+                        self._emit(
+                            f"剩余 {len(result.missions)} 个候选坐标均已尝试 "
+                            f"{MISSION_SLOT_MAX_ATTEMPTS} 次，结束本轮"
+                        )
                 else:
                     self._log_scan_miss(result, screen)
                     self._emit("页面上没有可处理的灯塔任务，扫描结束")
@@ -575,12 +633,20 @@ class AutoLighthouseTask:
                 self._after_mission_completed()
                 break
 
+            kind_hint = mission.label if mission.kind else "未分类"
             self._emit(
-                f"发现图标 ({mission.center[0]},{mission.center[1]})，"
+                f"发现{kind_hint} ({mission.center[0]},{mission.center[1]})，"
                 f"共 {len(result.missions)} 个候选"
             )
 
             tap_target = refine_mission_click(mission, screen, result.missions)
+            if tap_target.kind in SKIP_MISSION_KINDS:
+                self._emit(
+                    f"扫描识别为特殊大怪 ({tap_target.center[0]},{tap_target.center[1]})，"
+                    f"跳过不打"
+                )
+                self._mark_beast_skip_center(tap_target.center)
+                continue
             if tap_target.center != mission.center:
                 self._emit(
                     f"相邻图标校正落点 -> ({tap_target.center[0]},{tap_target.center[1]})"
@@ -595,6 +661,11 @@ class AutoLighthouseTask:
             kind = self._classify_post_click()
 
             if kind == "small_monster":
+                if tap_target.kind in SKIP_MISSION_KINDS:
+                    self._emit("点击后确认为特殊大怪，跳过（不打）")
+                    self._mark_beast_skip_center(tap_target.center)
+                    self._cancel_deploy_for_cooldown_skip()
+                    continue
                 cooldown = self._monster_cooldown_remaining()
                 if cooldown > 0:
                     mins, secs = divmod(int(cooldown), 60)

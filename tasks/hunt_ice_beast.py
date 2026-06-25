@@ -74,7 +74,7 @@ SEARCH_ICON_ROI = (0, 780, 160, 960)
 # 搜索面板内目标 tab 图标行
 SEARCH_TAB_ROI = (0, 850, 720, 980)
 # tab 栏横向滚动：先滑到最右端，再从左起选第 2 个（冰原巨兽）
-TAB_BAR_SCROLL_SWIPES = 4
+TAB_BAR_SCROLL_SWIPES = 3
 TAB_BAR_SWIPE_DURATION_MS = 400
 ICE_BEAST_TAB_SLOT = 2
 TAB_FIRST_CENTER_X = 90
@@ -164,6 +164,8 @@ class HuntIceBeastTask:
         self._last_run = 0.0
         self._stop_event = threading.Event()
         self._running = False
+        # 连续执行冰原巨兽时，搜索 tab 栏仍停留在上次滚动的位置
+        self._tab_bar_already_scrolled = False
 
     @property
     def name(self) -> str:
@@ -401,7 +403,11 @@ class HuntIceBeastTask:
 
     def _select_ice_beast_tab(self) -> None:
         """滚到 tab 栏最右端后，点击从左起第 2 个 tab「冰原巨兽」。"""
-        self._scroll_search_tab_bar_to_rightmost()
+        if self._tab_bar_already_scrolled:
+            self._emit("上次已是冰原巨兽任务，跳过 tab 栏拖动")
+        else:
+            self._scroll_search_tab_bar_to_rightmost()
+            self._tab_bar_already_scrolled = True
 
         tab_vision = Vision(TEMPLATE_DIR, threshold=0.68)
         screen = self.adb.screenshot()
@@ -410,6 +416,19 @@ class HuntIceBeastTask:
 
         unselected = tab_vision.match_template(roi, ICE_BEAST_TAB_TEMPLATE)
         selected = tab_vision.match_template(roi, ICE_BEAST_TAB_SELECTED)
+
+        # 跳过拖动后若 tab 不可见，补拖一次（例如中间执行了其它任务）
+        if (
+            self._tab_bar_already_scrolled
+            and not unselected.found
+            and not (selected.found and selected.confidence >= 0.88)
+        ):
+            self._emit("未找到冰原巨兽 tab，重新拖动 tab 栏")
+            self._scroll_search_tab_bar_to_rightmost()
+            screen = self.adb.screenshot()
+            roi = screen[y1:y2, x1:x2]
+            unselected = tab_vision.match_template(roi, ICE_BEAST_TAB_TEMPLATE)
+            selected = tab_vision.match_template(roi, ICE_BEAST_TAB_SELECTED)
 
         # 选中态模板在「野兽」tab 下也会部分匹配，需与未选中态对比
         already_selected = selected.found and (

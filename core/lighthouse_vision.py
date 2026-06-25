@@ -152,10 +152,12 @@ MISSION_DEFINITIONS: tuple[tuple[str, str, str, str], ...] = (
     ("hero_journey", "英雄之旅", "lighthouse/hero_journey.png", "lighthouse/hero_journey_edges.png"),
     ("tent", "帐篷", "lighthouse/tent.png", "lighthouse/tent_edges.png"),
     ("small_monster", "小怪", "lighthouse/small_monster.png", "lighthouse/small_monster_edges.png"),
-    ("small_monster_beast", "小怪", "lighthouse/small_monster_beast.png", "lighthouse/small_monster_beast_edges.png"),
+    ("small_monster_beast", "特殊大怪", "lighthouse/small_monster_beast.png", "lighthouse/small_monster_beast_edges.png"),
 )
 
 MONSTER_KINDS = frozenset({"small_monster", "small_monster_beast"})
+# 扫描/执行时直接跳过，不参与点击（打不过，会死循环耗兵）
+SKIP_MISSION_KINDS = frozenset({"small_monster_beast"})
 
 _ALT_TEMPLATE_SPECS: tuple[tuple[str, str, str], ...] = (
     ("hero_journey", "lighthouse/hero_journey_alt.png", "lighthouse/hero_journey_alt_edges.png"),
@@ -1540,6 +1542,26 @@ def _resolve_mission_at_pin(
         top_left=(ox + x1p, oy + y1p),
         size=(patch.shape[1], patch.shape[0]),
     )
+
+
+def classify_scanned_missions(
+    screen: np.ndarray,
+    missions: tuple[LighthouseMission, ...],
+    *,
+    scan_roi: tuple[int, int, int, int] = LIGHTHOUSE_SCAN_ROI,
+) -> tuple[LighthouseMission, ...]:
+    """对已定位的图钉做模板分类（背景差分只找位置，此处补上类型）。"""
+    if not missions:
+        return missions
+
+    screen = _normalize_screen_for_scan(screen)
+    x1, y1, x2, y2 = scan_roi
+    roi = screen[y1:y2, x1:x2]
+    classified: list[LighthouseMission] = []
+    for mission in missions:
+        resolved = _resolve_mission_at_pin(roi, mission.center, (x1, y1))
+        classified.append(resolved if resolved is not None else mission)
+    return tuple(classified)
 
 
 def refine_mission_click(
