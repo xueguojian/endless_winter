@@ -1,0 +1,27 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE / 编辑器
+.idea/
+.vscode/
+.claude/
+
+# 运行时产物
+logs/
+temp/
+assets/debug/*
+!assets/debug/.gitkeep
+assets/debug_patches/
+assets/debug_roi/
+assets/flow/*.png
+
+# 多开实例配置（首次启动从 config.yaml 自动复制生成）
+config_555*.yaml
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store

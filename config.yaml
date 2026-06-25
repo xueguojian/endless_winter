@@ -1,0 +1,266 @@
+device:
+  adb_host: 127.0.0.1
+  adb_port: 5555
+  adb_path: D:\leidian\LDPlayer9\adb.exe
+  touch_width: 720
+  touch_height: 1280
+emulator:
+  width: 1280
+  height: 720
+  dpi: 240
+game:
+  package: com.gof.china
+  activity: com.gof.china/com.unity3d.player.DDUnityLaunchActivity
+vision:
+  match_threshold: 0.8
+  action_delay: 1.5
+gui:
+  show_console: true
+  log_visible: true
+tasks:
+  hunt_monster:
+    enabled: false
+    interval: 300
+    monster_level: 30
+    max_monster_level: 30
+    skip_hour: 21
+    step_delay: 1.5
+    coords:
+      search_open:
+      - 55
+      - 880
+      level_minus:
+      - 95
+      - 1145
+      level_plus:
+      - 625
+      - 1145
+      search_confirm:
+      - 360
+      - 1170
+      attack:
+      - 360
+      - 1125
+      march:
+      - 360
+      - 1180
+      close_popup:
+      - 680
+      - 50
+  hunt_ice_beast:
+    enabled: true
+    interval: 600
+    beast_level: 8
+    default_beast_level: 1
+    formation_name: '6'
+    rally_duration_minutes: 5
+    use_stamina: false
+    check_march_heroes: true
+    use_formation: true
+    skip_hour: 21
+    step_delay: 1.5
+    coords:
+      world_map:
+      - 630
+      - 1220
+      search_open:
+      - 55
+      - 880
+      ice_beast_tab:
+      - 205
+      - 915
+      level_minus:
+      - 73
+      - 1065
+      level_plus:
+      - 470
+      - 1065
+      search_confirm:
+      - 360
+      - 1175
+      target_tap:
+      - 360
+      - 640
+      rally:
+      - 280
+      - 1100
+      rally_confirm:
+      - 360
+      - 882
+      rally_time_5:
+      - 220
+      - 462
+      rally_time_15:
+      - 500
+      - 462
+      rally_time_30:
+      - 220
+      - 518
+      rally_time_60:
+      - 500
+      - 518
+      march:
+      - 560
+      - 1200
+      dialog_cancel:
+      - 250
+      - 780
+      stamina_use:
+      - 630
+      - 570
+  auto_mining:
+    interval: 3600
+    use_mining_hero: true
+    level_min: 5
+    level_max: 8
+    enabled: false
+    step_delay: 1.5
+    hero_roi:
+    - 98
+    - 308
+    - 246
+    - 570
+    hero_match_threshold: 0.68
+    coords:
+      world_map:
+      - 630
+      - 1220
+      search_open:
+      - 55
+      - 880
+      meat_tab:
+      - 154
+      - 914
+      wood_tab:
+      - 320
+      - 914
+      coal_tab:
+      - 474
+      - 914
+      iron_mine_tab:
+      - 622
+      - 912
+      search_confirm:
+      - 360
+      - 1175
+      gather_btn:
+      - 354
+      - 628
+      hero_remove_2:
+      - 424
+      - 318
+      hero_remove_3:
+      - 618
+      - 318
+      level_minus:
+      - 73
+      - 1065
+      level_plus:
+      - 470
+      - 1065
+      dialog_cancel:
+      - 250
+      - 780
+      march:
+      - 560
+      - 1200
+  traverse_island:
+    enabled: false
+  collect_supplies:
+    enabled: false
+    step_delay: 1.5
+    coords:
+      explore_open:
+      - 90
+      - 1220
+      idle_reward_open:
+      - 615
+      - 875
+      idle_reward_confirm:
+      - 360
+      - 920
+    interval: 18000
+  donate_alliance_supplies:
+    enabled: false
+    interval: 3600
+    donate_times: 25
+    donate_click_delay: 0.35
+    step_delay: 1.5
+    coords:
+      alliance_open:
+      - 522
+      - 1220
+      alliance_tech:
+      - 546
+      - 938
+      perpetual_tech:
+      - 350
+      - 1040
+      donate_btn:
+      - 510
+      - 1040
+      popup_close:
+      - 660
+      - 195
+  collect_commander_supplies:
+    enabled: true
+    step_delay: 1.5
+    double_tap_delay: 1.0
+    coords:
+      commander_open:
+      - 482
+      - 76
+      claim_first:
+      - 616
+      - 288
+      claim_second:
+      - 584
+      - 818
+  auto_train_troops:
+    enabled: false
+    interval: 10800
+    step_delay: 1.5
+    train_ready_threshold: 0.65
+    coords:
+      status_open:
+      - 16
+      - 546
+      barracks_enter:
+      - 480
+      - 868
+      train_confirm:
+      - 524
+      - 1126
+      train_collect_tap:
+      - 356
+      - 566
+  auto_lighthouse:
+    enabled: false
+    interval: 28800
+    formation_slot: 8
+    use_stamina: false
+    monster_cooldown: 60
+    step_delay: 1.5
+    match_threshold: 0.55
+    coords:
+      lighthouse_open:
+      - 666
+      - 862
+      mission_confirm_1:
+      - 354
+      - 908
+      mission_confirm_2:
+      - 350
+      - 630
+      hero_journey_finish:
+      - 528
+      - 1196
+      march:
+      - 560
+      - 1200
+      hide_completed:
+      - 364
+      - 1124
+      mission_confirm_1_beast:
+      - 354
+      - 886
