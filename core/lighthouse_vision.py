@@ -1,4 +1,4 @@
-"""灯塔任务图标识别（按形状匹配，忽略颜色）。"""
+"""灯塔任务图标识别。"""
 
 from __future__ import annotations
 
@@ -19,6 +19,28 @@ TEMPLATE_DIR = Path(__file__).parent.parent / "assets" / "templates"
 
 # 情报页中间地图区域，排除顶部刷新条与底部等级栏
 LIGHTHOUSE_SCAN_ROI = (20, 130, 700, 1020)
+LIGHTHOUSE_MAP_BG_NAME = "lighthouse/lighthouse_map_bg.png"
+# 情报页顶部刷新条，用于区分「情报页」与「野外大地图」
+LIGHTHOUSE_HEADER_ROI = (0, 155, 720, 210)
+LIGHTHOUSE_HEADER_MEAN_DIFF_MAX = 18.0
+# 与背景图差分：仅保留相对背景新出现且颜色鲜艳的图钉
+BG_DIFF_THRESHOLD = 28
+BG_DIFF_VIVID_MIN = 0.10
+BG_DIFF_PIN_SUPPORT_MIN = 0.12
+BG_PIN_AREA_MIN = 60
+BG_PIN_AREA_MAX = 1800
+BG_DIFF_BLOB_MIN_AREA = 800
+BG_TEARDROP_TOP_BOTTOM_MIN = 1.05
+BG_TEARDROP_ASPECT_MIN = 0.85
+BG_TEARDROP_ASPECT_MAX = 2.8
+BOSS_CONTOUR_AREA_MIN = 4500
+PLANE_CONTOUR_AREA_MIN = 8000
+SUPER_BOSS_Y_MAX = 320
+UI_EXCLUDE_Y_MAX = 230
+UI_EXCLUDE_X_MAX = 120
+PLANE_EXCLUDE_Y_MIN = 820
+PLANE_EXCLUDE_X_MIN = 480
+BG_PIN_DIFF_SEARCH_RADIUS = 50
 LIGHTHOUSE_MATCH_THRESHOLD = 0.55
 LIGHTHOUSE_CANDIDATE_THRESHOLD = 0.28
 LIGHTHOUSE_HERO_CANDIDATE_THRESHOLD = 0.30
@@ -149,6 +171,8 @@ _ALT_TEMPLATE_SPECS: tuple[tuple[str, str, str], ...] = (
 
 _TYPE_TEMPLATES: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, str, str]] | None = None
 _ALT_TYPE_TEMPLATES: dict[str, list[tuple[np.ndarray, np.ndarray, np.ndarray]]] | None = None
+_MAP_BG_ROI: np.ndarray | None = None
+_MAP_BG_SCREEN: np.ndarray | None = None
 _scan_interrupt_cb: Callable[[], bool] | None = None
 
 
@@ -458,19 +482,113 @@ def _is_ignored_background_pin(
     *,
     contour_area: float = 0.0,
 ) -> bool:
-    """排除顶部强力大怪、左下移动飞机、中央固定基地等非任务元素。"""
+    """排除中央固定基地、左上角 UI 头像等非任务元素。"""
     x, y = center
-    if y <= BOSS_ZONE_Y_MAX:
-        if BOSS_ZONE_X[0] <= x <= BOSS_ZONE_X[1]:
-            return True
-        if contour_area >= BOSS_ZONE_MIN_AREA:
-            return True
-    if y >= PLANE_ZONE_Y_MIN and x <= PLANE_ZONE_X_MAX:
-        return True
     bx, by = BASE_EXCLUDE_CENTER
     if abs(x - bx) <= BASE_EXCLUDE_RADIUS and abs(y - by) <= BASE_EXCLUDE_RADIUS:
         return True
+    if x <= UI_EXCLUDE_X_MAX and y <= UI_EXCLUDE_Y_MAX:
+        return True
     return False
+
+
+def _is_super_boss_point(
+    center: tuple[int, int],
+    roi: np.ndarray,
+    hsv: np.ndarray,
+    roi_offset: tuple[int, int],
+) -> bool:
+    """顶部超级大怪：位置靠上 + 大橙色块 + 内部白色兽头。"""
+    x, y = center
+    if y > SUPER_BOSS_Y_MAX:
+        return False
+    rx, ry = x - roi_offset[0], y - roi_offset[1]
+    radius = 48
+    y1 = max(0, ry - radius)
+    y2 = min(roi.shape[0], ry + radius)
+    x1 = max(0, rx - radius)
+    x2 = min(roi.shape[1], rx + radius)
+    patch_hsv = hsv[y1:y2, x1:x2]
+    if patch_hsv.size == 0:
+        return False
+    orange = cv2.inRange(
+        patch_hsv, np.array((8, 100, 140)), np.array((28, 255, 255))
+    )
+    if float(orange.mean()) / 255.0 < 0.22:
+        return False
+    patch_gray = cv2.cvtColor(roi[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    white_ratio = float((patch_gray > 200).mean())
+    return white_ratio >= 0.05 or y <= 290
+
+
+def _is_plane_point(
+    center: tuple[int, int],
+    *,
+    blob_area: float = 0.0,
+    blob_width: int = 0,
+    blob_height: int = 0,
+) -> bool:
+    """排除右下角移动小飞机（宽扁、面积大）。"""
+    x, y = center
+    if y >= 880 and x >= 500:
+        return True
+    if y >= PLANE_EXCLUDE_Y_MIN and x >= PLANE_EXCLUDE_X_MIN:
+        if blob_area >= 3000 or blob_width > blob_height * 1.15:
+            return True
+    return False
+
+
+def _is_ui_diff_blob(
+    center_y: int, *, blob_height: int, blob_width: int
+) -> bool:
+    if center_y <= UI_EXCLUDE_Y_MAX:
+        return True
+    return blob_height <= 20 and blob_width >= 80
+
+
+def _patch_vivid_ratio(hsv: np.ndarray, center: tuple[int, int], radius: int = 22) -> float:
+    y, x = center[1], center[0]
+    y1 = max(0, y - radius)
+    y2 = min(hsv.shape[0], y + radius)
+    x1 = max(0, x - radius)
+    x2 = min(hsv.shape[1], x + radius)
+    patch = hsv[y1:y2, x1:x2]
+    if patch.size == 0:
+        return 0.0
+    sat, val = patch[:, :, 1], patch[:, :, 2]
+    return float(((sat > 100) & (val > 130)).mean())
+
+
+def _pin_diff_support(
+    center: tuple[int, int],
+    diff_mask: np.ndarray,
+    roi_offset: tuple[int, int],
+    *,
+    radius: int = BG_PIN_DIFF_SEARCH_RADIUS,
+) -> tuple[float, tuple[int, int]]:
+    """在图钉附近搜索差分最强的位置，返回 (差分占比,  refined_center)。"""
+    ox, oy = roi_offset
+    base_rx, base_ry = center[0] - ox, center[1] - oy
+    best_ratio = 0.0
+    best_center = center
+    patch_r = 20
+
+    for dy in range(-radius, radius + 1, 4):
+        for dx in range(-radius, radius + 1, 4):
+            rx, ry = base_rx + dx, base_ry + dy
+            if (
+                rx < patch_r
+                or ry < patch_r
+                or rx >= diff_mask.shape[1] - patch_r
+                or ry >= diff_mask.shape[0] - patch_r
+            ):
+                continue
+            patch = diff_mask[ry - patch_r : ry + patch_r, rx - patch_r : rx + patch_r]
+            ratio = float(patch.mean()) / 255.0
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_center = (ox + rx, oy + ry)
+    return best_ratio, best_center
 
 
 def _contour_white_ratio(gray: np.ndarray, contour: np.ndarray) -> float:
@@ -1260,12 +1378,16 @@ def _mission_slot_distance(a: LighthouseMission, b: LighthouseMission) -> float:
     return max(abs(a.center[0] - b.center[0]), abs(a.center[1] - b.center[1]))
 
 
-def _dedupe_missions_by_slot(missions: list[LighthouseMission]) -> list[LighthouseMission]:
+def _dedupe_missions_by_slot(
+    missions: list[LighthouseMission],
+    *,
+    merge_distance: float = LIGHTHOUSE_SLOT_MERGE_DISTANCE,
+) -> list[LighthouseMission]:
     ordered = sorted(missions, key=lambda item: item.confidence, reverse=True)
     kept: list[LighthouseMission] = []
     for mission in ordered:
         if any(
-            _mission_slot_distance(mission, existing) < LIGHTHOUSE_SLOT_MERGE_DISTANCE
+            _mission_slot_distance(mission, existing) < merge_distance
             for existing in kept
         ):
             continue
@@ -1511,11 +1633,10 @@ def scan_mission_icons(
     scan_roi: tuple[int, int, int, int] = LIGHTHOUSE_SCAN_ROI,
     interrupted: Callable[[], bool] | None = None,
 ) -> LighthouseScanResult:
-    """仅检测地图上的任务图标位置，不区分类型。
+    """检测地图上的任务图钉位置，不区分任务类型。
 
-    图标的类型分类在点击图标、确认弹窗之后再进行。
-    所有图标在地图上都是倒水滴形（图钉形），使用 HSV 颜色分割
-    即可可靠地找到位置。
+    相对固定背景图做差分，再结合鲜艳色 + 倒水滴轮廓过滤；
+    自动排除背景中的飞机、超级大怪及中央基地等干扰。
     """
     global _scan_interrupt_cb
     prev_interrupt = _scan_interrupt_cb
@@ -1528,132 +1649,469 @@ def scan_mission_icons(
         _scan_interrupt_cb = prev_interrupt
 
 
+def _load_map_background_screen() -> np.ndarray | None:
+    """加载完整灯塔情报页背景（720×1280）。"""
+    global _MAP_BG_SCREEN
+    if _MAP_BG_SCREEN is not None:
+        return _MAP_BG_SCREEN
+
+    path = TEMPLATE_DIR / LIGHTHOUSE_MAP_BG_NAME
+    image = cv2.imread(str(path))
+    if image is None:
+        logger.warning(f"灯塔地图背景缺失: {path}")
+        return None
+
+    _MAP_BG_SCREEN = _normalize_screen_for_scan(image)
+    return _MAP_BG_SCREEN
+
+
+def _load_map_background_roi() -> np.ndarray | None:
+    """加载灯塔情报页地图背景（720×1280 竖屏 ROI 切片）。"""
+    global _MAP_BG_ROI
+    if _MAP_BG_ROI is not None:
+        return _MAP_BG_ROI
+
+    screen = _load_map_background_screen()
+    if screen is None:
+        return None
+
+    x1, y1, x2, y2 = LIGHTHOUSE_SCAN_ROI
+    _MAP_BG_ROI = screen[y1:y2, x1:x2].copy()
+    return _MAP_BG_ROI
+
+
+def is_lighthouse_intel_screen(screen: np.ndarray) -> bool:
+    """当前截图是否为灯塔情报页（非野外大地图/出征界面）。"""
+    normalized = _normalize_screen_for_scan(screen)
+    bg = _load_map_background_screen()
+    if bg is None:
+        return False
+
+    x1, y1, x2, y2 = LIGHTHOUSE_HEADER_ROI
+    patch = normalized[y1:y2, x1:x2]
+    reference = bg[y1:y2, x1:x2]
+    if patch.shape != reference.shape:
+        return False
+    mean_diff = float(cv2.absdiff(patch, reference).mean())
+    return mean_diff <= LIGHTHOUSE_HEADER_MEAN_DIFF_MAX
+
+
+def _align_background_roi(
+    bg_roi: np.ndarray, roi_shape: tuple[int, ...]
+) -> np.ndarray:
+    if bg_roi.shape[:2] == roi_shape[:2]:
+        return bg_roi
+    return cv2.resize(
+        bg_roi,
+        (roi_shape[1], roi_shape[0]),
+        interpolation=cv2.INTER_LINEAR,
+    )
+
+
+def _build_vivid_pin_mask(hsv: np.ndarray) -> np.ndarray:
+    """任务图钉常见高饱和色（橙 / 紫 / 蓝）。"""
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lower, upper in (
+        ((10, 120, 140), (30, 255, 255)),
+        ((125, 55, 100), (155, 255, 255)),
+        ((98, 65, 110), (118, 255, 255)),
+        ((155, 80, 140), (175, 255, 255)),
+    ):
+        mask = cv2.bitwise_or(
+            mask, cv2.inRange(hsv, np.array(lower), np.array(upper))
+        )
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return mask
+
+
+def _contour_vivid_ratio(contour: np.ndarray, hsv: np.ndarray) -> float:
+    x, y, w, h = cv2.boundingRect(contour)
+    if w <= 0 or h <= 0:
+        return 0.0
+    patch_hsv = hsv[y : y + h, x : x + w]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    shifted = contour.copy()
+    shifted[:, 0, 0] -= x
+    shifted[:, 0, 1] -= y
+    cv2.drawContours(mask, [shifted], -1, 255, thickness=-1)
+    sat = patch_hsv[:, :, 1]
+    val = patch_hsv[:, :, 2]
+    vivid = ((sat > 100) & (val > 130)).astype(np.float32)
+    vivid[mask == 0] = 0.0
+    if mask.sum() <= 0:
+        return 0.0
+    return float(vivid.sum() / (mask.sum() / 255.0))
+
+
+def _is_plane_like_contour(contour: np.ndarray) -> bool:
+    """排除小飞机：宽扁、面积大、或飞机尾迹碎片。"""
+    x, y, w, h = cv2.boundingRect(contour)
+    area = cv2.contourArea(contour)
+    if area >= PLANE_CONTOUR_AREA_MIN:
+        return True
+    aspect = h / max(w, 1)
+    if w > h * 1.35 and area >= 1500:
+        return True
+    if aspect < 0.72 and area >= 800:
+        return True
+    return False
+
+
+def _is_boss_like_contour(
+    contour: np.ndarray, roi: np.ndarray, hsv: np.ndarray
+) -> bool:
+    """排除超级大怪：仅匹配顶部超大橙色块（普通任务橙色光晕不会触发）。"""
+    area = cv2.contourArea(contour)
+    if area < BOSS_CONTOUR_AREA_MIN:
+        return False
+    x, y, w, h = cv2.boundingRect(contour)
+    center = (x + w // 2, y + h // 2)
+    return _is_super_boss_point(center, roi, hsv, (0, 0))
+
+
+def _is_teardrop_contour(contour: np.ndarray, *, relaxed: bool = False) -> bool:
+    """倒水滴：上宽下窄、竖向略长。"""
+    x, y, w, h = cv2.boundingRect(contour)
+    area = cv2.contourArea(contour)
+    area_max = BG_PIN_AREA_MAX if not relaxed else 3200
+    if area < BG_PIN_AREA_MIN or area > area_max:
+        return False
+    aspect = h / max(w, 1)
+    aspect_min = BG_TEARDROP_ASPECT_MIN if not relaxed else 0.75
+    if aspect < aspect_min or aspect > BG_TEARDROP_ASPECT_MAX:
+        return False
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    shifted = contour.copy()
+    shifted[:, 0, 0] -= x
+    shifted[:, 0, 1] -= y
+    cv2.drawContours(mask, [shifted], -1, 255, thickness=-1)
+
+    top_band = mask[: max(1, h // 4), :]
+    bottom_band = mask[3 * h // 4 :, :]
+    top_width = int(np.count_nonzero(top_band.any(axis=0)))
+    bottom_width = int(np.count_nonzero(bottom_band.any(axis=0)))
+    if bottom_width <= 0:
+        return False
+    ratio_min = BG_TEARDROP_TOP_BOTTOM_MIN if not relaxed else 1.0
+    return (top_width / bottom_width) >= ratio_min
+
+
+def _snap_to_vivid_peak(
+    hsv: np.ndarray,
+    center: tuple[int, int],
+    roi_offset: tuple[int, int],
+    *,
+    radius: int = 36,
+) -> tuple[tuple[int, int], float]:
+    """将点击点吸附到附近的鲜艳色图钉头部。"""
+    ox, oy = roi_offset
+    base_rx, base_ry = center[0] - ox, center[1] - oy
+    best_vivid = 0.0
+    best_center = center
+    for dy in range(-radius, radius + 1, 4):
+        for dx in range(-radius, radius + 1, 4):
+            rx, ry = base_rx + dx, base_ry + dy
+            if rx < 0 or ry < 0 or rx >= hsv.shape[1] or ry >= hsv.shape[0]:
+                continue
+            vivid = _patch_vivid_ratio(hsv, (rx, ry), radius=14)
+            if vivid > best_vivid:
+                best_vivid = vivid
+                best_center = (ox + rx, oy + ry)
+    return best_center, best_vivid
+
+
+def _accept_pin_candidate(
+    center: tuple[int, int],
+    confidence: float,
+    roi: np.ndarray,
+    hsv: np.ndarray,
+    roi_offset: tuple[int, int],
+    diff_mask: np.ndarray,
+    *,
+    blob_area: float = 0.0,
+    blob_width: int = 0,
+    blob_height: int = 0,
+) -> tuple[tuple[int, int], float] | None:
+    if not _screen_center_in_map(center):
+        return None
+    if _is_ignored_background_pin(center):
+        return None
+    if _is_super_boss_point(center, roi, hsv, roi_offset):
+        return None
+    if _is_plane_point(
+        center,
+        blob_area=blob_area,
+        blob_width=blob_width,
+        blob_height=blob_height,
+    ):
+        return None
+
+    diff_ratio, refined = _pin_diff_support(center, diff_mask, roi_offset)
+    if diff_ratio < BG_DIFF_PIN_SUPPORT_MIN:
+        return None
+
+    snapped, vivid = _snap_to_vivid_peak(hsv, refined, roi_offset)
+    if vivid >= BG_DIFF_VIVID_MIN:
+        refined = snapped
+    elif confidence < BG_DIFF_VIVID_MIN and diff_ratio < 0.40:
+        return None
+    if _is_plane_point(refined):
+        return None
+    return refined, float(max(confidence, vivid, diff_ratio))
+
+
+def _extract_pins_from_diff_blob(
+    blob_contour: np.ndarray,
+    search_mask: np.ndarray,
+    hsv: np.ndarray,
+    roi: np.ndarray,
+    roi_offset: tuple[int, int],
+    diff_mask: np.ndarray,
+) -> list[tuple[tuple[int, int], float]]:
+    bx, by, bw, bh = cv2.boundingRect(blob_contour)
+    pad = 6
+    lx = max(0, bx - pad)
+    ly = max(0, by - pad)
+    rx = min(search_mask.shape[1], bx + bw + pad)
+    ry = min(search_mask.shape[0], by + pad + bh)
+    local_search = search_mask[ly:ry, lx:rx]
+    local_hsv = hsv[ly:ry, lx:rx]
+    if local_search.size == 0:
+        return []
+
+    blob_area = cv2.contourArea(blob_contour)
+    found: list[tuple[tuple[int, int], float]] = []
+    seen: set[tuple[int, int]] = set()
+
+    for erode_iters in (0, 2, 4, 6):
+        mask = local_search
+        if erode_iters:
+            mask = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=erode_iters)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        sub_contours = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )[0]
+        for sub in sub_contours:
+            sub_area = cv2.contourArea(sub)
+            if sub_area < 50:
+                continue
+            center: tuple[int, int] | None = None
+            confidence = _contour_vivid_ratio(sub, local_hsv)
+            if _is_teardrop_contour(sub):
+                center = _contour_screen_center(
+                    sub,
+                    (roi_offset[0] + lx, roi_offset[1] + ly),
+                    hsv=local_hsv,
+                    use_vivid_peak=True,
+                )
+            elif sub_area >= 120:
+                sx, sy, sw, sh = cv2.boundingRect(sub)
+                sub_hsv = local_hsv[sy : sy + sh, sx : sx + sw]
+                sat = sub_hsv[:, :, 1].astype(np.float32)
+                val = sub_hsv[:, :, 2]
+                score = sat * (val > 130)
+                if float(score.max()) > 0:
+                    _, _, _, peak = cv2.minMaxLoc(score)
+                    center = (
+                        roi_offset[0] + lx + sx + peak[0],
+                        roi_offset[1] + ly + sy + peak[1],
+                    )
+            if center is None:
+                continue
+            key = (center[0] // 8, center[1] // 8)
+            if key in seen:
+                continue
+            accepted = _accept_pin_candidate(
+                center,
+                confidence,
+                roi,
+                hsv,
+                roi_offset,
+                diff_mask,
+                blob_area=blob_area,
+                blob_width=bw,
+                blob_height=bh,
+            )
+            if accepted is None:
+                continue
+            seen.add(key)
+            found.append(accepted)
+    return found
+
+
+def _contour_pin_center(
+    contour: np.ndarray,
+    hsv: np.ndarray,
+    roi_offset: tuple[int, int],
+) -> tuple[int, int] | None:
+    center = _contour_screen_center(
+        contour,
+        roi_offset,
+        hsv=hsv,
+        use_vivid_peak=True,
+    )
+    if center is None:
+        return None
+    if not _screen_center_in_map(center):
+        return None
+    if _is_ignored_background_pin(center, contour_area=cv2.contourArea(contour)):
+        return None
+    return center
+
+
+def _find_mission_pins_bg_diff(
+    roi: np.ndarray,
+    bg_roi: np.ndarray,
+    roi_offset: tuple[int, int],
+) -> list[tuple[tuple[int, int], float]]:
+    """背景差分定位新增任务图钉（图钉 + 地面光晕会连成大片，需分块提取）。"""
+    bg_roi = _align_background_roi(bg_roi, roi.shape)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    diff = cv2.absdiff(roi, bg_roi)
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    _, diff_mask = cv2.threshold(
+        diff_gray, BG_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY
+    )
+    diff_mask = cv2.morphologyEx(
+        diff_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
+    )
+    search_mask = cv2.bitwise_and(_build_vivid_pin_mask(hsv), diff_mask)
+
+    candidates: list[tuple[tuple[int, int], float]] = []
+    rejected = {"ui": 0, "plane": 0, "boss": 0, "support": 0, "merged": 0}
+
+    for blob in cv2.findContours(
+        diff_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )[0]:
+        _check_scan_interrupted()
+        blob_area = cv2.contourArea(blob)
+        if blob_area < BG_DIFF_BLOB_MIN_AREA:
+            continue
+
+        bx, by, bw, bh = cv2.boundingRect(blob)
+        moments = cv2.moments(blob)
+        if moments["m00"] <= 0:
+            continue
+        blob_cx = int(moments["m10"] / moments["m00"]) + roi_offset[0]
+        blob_cy = int(moments["m01"] / moments["m00"]) + roi_offset[1]
+
+        if _is_ui_diff_blob(blob_cy, blob_height=bh, blob_width=bw):
+            rejected["ui"] += 1
+            continue
+        if _is_plane_point(
+            (blob_cx, blob_cy),
+            blob_area=blob_area,
+            blob_width=bw,
+            blob_height=bh,
+        ):
+            rejected["plane"] += 1
+            continue
+        if _is_super_boss_point((blob_cx, blob_cy), roi, hsv, roi_offset):
+            rejected["boss"] += 1
+            continue
+
+        for item in _extract_pins_from_diff_blob(
+            blob, search_mask, hsv, roi, roi_offset, diff_mask
+        ):
+            candidates.append(item)
+
+    color_pins = _find_mission_pin_centers(roi, roi_offset)
+    for pin in color_pins:
+        _check_scan_interrupted()
+        accepted = _accept_pin_candidate(
+            pin,
+            _patch_vivid_ratio(
+                hsv,
+                (pin[0] - roi_offset[0], pin[1] - roi_offset[1]),
+            ),
+            roi,
+            hsv,
+            roi_offset,
+            diff_mask,
+        )
+        if accepted is None:
+            rejected["support"] += 1
+            continue
+        if any(
+            abs(accepted[0][0] - c[0][0]) < MISSION_PIN_MERGE_DISTANCE
+            and abs(accepted[0][1] - c[0][1]) < MISSION_PIN_MERGE_DISTANCE
+            for c in candidates
+        ):
+            rejected["merged"] += 1
+            continue
+        candidates.append(accepted)
+
+    if candidates or any(rejected.values()):
+        logger.debug(
+            "灯塔差分扫描：保留 {} 个，剔除 ui={} plane={} boss={} "
+            "support={} merged={}",
+            len(candidates),
+            rejected["ui"],
+            rejected["plane"],
+            rejected["boss"],
+            rejected["support"],
+            rejected["merged"],
+        )
+    return candidates
+
+
 def _scan_icons_impl(
     screen: np.ndarray,
     *,
     scan_roi: tuple[int, int, int, int],
 ) -> LighthouseScanResult:
-    """颜色图钉定位 + 覆盖率/鲜艳色验证，不跑模板匹配分类。
-
-    颜色分割容易把雪山、浅色地形误判为图标。真图标有两种特征：
-    1. 蓝色/紫色图标：HSV 掩码覆盖率高（>40%），因图标颜色纯而集中
-    2. 橙色图标：鲜艳像素多（vivid > 0.01，sat>100 & val>130）
-    雪山等背景纹理两者都不满足。
-    """
+    """背景差分定位任务图钉，不区分类型。"""
     screen = _normalize_screen_for_scan(screen)
     x1, y1, x2, y2 = scan_roi
     roi = screen[y1:y2, x1:x2]
     if roi.size == 0:
         return LighthouseScanResult(mission=None)
 
-    color_pins = _find_mission_pin_centers(roi, (x1, y1))
-    total_candidates = len(color_pins)
-    if not color_pins:
+    bg_roi = _load_map_background_roi()
+    if bg_roi is None:
+        logger.error(
+            f"缺少灯塔背景图 {LIGHTHOUSE_MAP_BG_NAME}，无法扫描任务图标"
+        )
+        return LighthouseScanResult(mission=None)
+
+    pin_candidates = _find_mission_pins_bg_diff(roi, bg_roi, (x1, y1))
+    total_candidates = len(pin_candidates)
+    if not pin_candidates:
         return LighthouseScanResult(mission=None, candidate_locations=0)
 
-    # 用于覆盖率计算的 HSV 范围（与 _find_mission_pin_centers 的主掩码一致，
-    # 但蓝色 S 下限提高到 80 以排除浅蓝背景/雪山）
-    _PIN_COLOR_RANGES = (
-        ("蓝/紫色", np.array([98, 80, 110]), np.array([118, 255, 255])),
-        ("蓝/紫色", np.array([125, 80, 100]), np.array([155, 255, 255])),
-        ("橙色", np.array([10, 130, 150]), np.array([28, 255, 255])),
-    )
-
-    missions: list[LighthouseMission] = []
     half = LIGHTHOUSE_PIN_PATCH_HALF
-    verify_half = 20  # 小 patch 提高覆盖率精度（图钉头部 ~20-30px）
-    rejected_snow = 0
-
-    for pin_cx, pin_cy in color_pins:
-        _check_scan_interrupted()
-        roi_cx = pin_cx - x1
-        roi_cy = pin_cy - y1
-
-        # 小 patch 计算覆盖率（图钉头部 ~20-30px，大 patch 会稀释颜色占比）
-        vy1 = max(0, roi_cy - verify_half)
-        vy2 = min(roi.shape[0], roi_cy + verify_half)
-        vx1 = max(0, roi_cx - verify_half)
-        vx2 = min(roi.shape[1], roi_cx + verify_half)
-        verify_patch = roi[vy1:vy2, vx1:vx2]
-        patch_hsv = cv2.cvtColor(verify_patch, cv2.COLOR_BGR2HSV)
-
-        # 最高颜色覆盖率（严格 S 阈值）
-        best_coverage = 0.0
-        best_label = ""
-        for _label, lower, upper in _PIN_COLOR_RANGES:
-            mask = cv2.inRange(patch_hsv, lower, upper)
-            coverage = float(mask.mean()) / 255.0
-            if coverage > best_coverage:
-                best_coverage = coverage
-                best_label = _label
-
-        # 鲜艳像素比例
-        sat = patch_hsv[:, :, 1]
-        val = patch_hsv[:, :, 2]
-        vivid = float(((sat > 100) & (val > 130)).mean())
-
-        # 蓝/紫色图标：还需检查渐变过渡（宽松 S 范围的总覆盖率）
-        # 真图标从深色中心到浅色边缘有过渡（大量 S 70-79 像素），
-        # 背景只有深蓝像素缺少过渡。计算总蓝/深蓝比例。
-        has_gradient = True
-        if best_label == "蓝/紫色" and best_coverage >= 0.10 and vivid < 0.01:
-            # 宽松蓝/紫范围（S>=70）
-            loose_lower = np.array([98, 70, 110])
-            loose_upper = np.array([118, 255, 255])
-            loose_mask = cv2.inRange(patch_hsv, loose_lower, loose_upper)
-            total_coverage = float(loose_mask.mean()) / 255.0
-            # 也需要检查紫色范围
-            loose_purple_lower = np.array([125, 60, 100])
-            loose_purple_upper = np.array([155, 255, 255])
-            loose_purple_mask = cv2.inRange(patch_hsv, loose_purple_lower, loose_purple_upper)
-            total_coverage = max(total_coverage, float(loose_purple_mask.mean()) / 255.0)
-            # 总覆盖率必须明显大于严格覆盖率（有渐变过渡）
-            if total_coverage < best_coverage * 1.6:
-                has_gradient = False
-
-        # 组合判断
-        if best_coverage < 0.10 and vivid < 0.01:
-            rejected_snow += 1
-            continue
-        if not has_gradient:
-            rejected_snow += 1
-            continue
-
-        # 大 patch 用于 top_left/size 元数据
+    missions: list[LighthouseMission] = []
+    for center, confidence in pin_candidates:
+        roi_cx = center[0] - x1
+        roi_cy = center[1] - y1
         x1p = max(0, roi_cx - half)
         y1p = max(0, roi_cy - half)
         x2p = min(roi.shape[1], roi_cx + half)
         y2p = min(roi.shape[0], roi_cy + half)
-
         missions.append(
             LighthouseMission(
                 kind="",
                 label="图标",
                 template="",
-                center=(pin_cx, pin_cy),
-                confidence=float(max(best_coverage, vivid)),
+                center=center,
+                confidence=confidence,
                 top_left=(x1 + x1p, y1 + y1p),
                 size=(x2p - x1p, y2p - y1p),
             )
         )
 
-    if rejected_snow > 0:
-        logger.info(
-            f"图标扫描：{total_candidates} 个颜色候选 → "
-            f"剔除 {rejected_snow} 个低饱和背景 → "
-            f"保留 {len(missions)} 个图标"
-        )
-
-    missions = _dedupe_missions_by_slot(missions)
-    missions.sort(key=lambda m: m.center[1])  # 从上到下排列
+    missions = _dedupe_missions_by_slot(missions, merge_distance=28)
+    missions.sort(key=lambda item: item.center[1])
 
     best = missions[0] if missions else None
     return LighthouseScanResult(
         mission=best,
         missions=tuple(missions),
-        best_confidence=0.0,
+        best_confidence=best.confidence if best else 0.0,
         best_label="图标",
-        candidate_locations=len(color_pins),
+        candidate_locations=total_candidates,
     )
 
 

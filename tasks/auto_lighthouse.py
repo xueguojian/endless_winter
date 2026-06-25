@@ -17,6 +17,7 @@ from core.lighthouse_vision import (
     LIGHTHOUSE_MATCH_THRESHOLD,
     LIGHTHOUSE_SCAN_ROI,
     LighthouseMission,
+    is_lighthouse_intel_screen,
     refine_mission_click,
     scan_mission_icons,
 )
@@ -42,6 +43,8 @@ DEFAULT_MONSTER_COOLDOWN = 120.0
 MISSION_SCAN_SETTLE_SEC = 0.5
 SCAN_EMPTY_RETRY_WAIT_SEC = 1.0
 SCAN_REOPEN_WAIT_SEC = 1.2
+MISSION_SLOT_MAX_ATTEMPTS = 3
+MISSION_SLOT_TRACK_RADIUS = 28
 
 DEFAULT_COORDS: dict[str, list[int]] = {
     "lighthouse_open": [666, 862],
@@ -50,6 +53,7 @@ DEFAULT_COORDS: dict[str, list[int]] = {
     "mission_confirm_2": [350, 630],
     "hero_journey_finish": [528, 1196],
     "march": [560, 1200],
+    "dialog_cancel": [250, 780],
 }
 
 
@@ -98,6 +102,7 @@ class AutoLighthouseTask:
         self._last_run = 0.0
         self._last_monster_dispatch_at = 0.0
         self._stop_event = threading.Event()
+        self._slot_attempts: list[tuple[int, int, int]] = []
         self.vision = Vision(TEMPLATE_DIR, threshold=0.70)
         self._deploy = DeployMarchHelper(
             adb,
@@ -149,6 +154,12 @@ class AutoLighthouseTask:
             self.adb.back()
             time.sleep(0.5)
 
+    def _dismiss_exit_dialog(self) -> None:
+        """关闭「退出游戏」确认弹窗（点「返回」/取消，勿继续按 back）。"""
+        if "dialog_cancel" in self.coords:
+            self.adb.tap(*self.coords["dialog_cancel"])
+            time.sleep(0.5)
+
     def _match_in_roi(
         self, screen, template: str, roi: tuple[int, int, int, int]
     ) -> MatchResult:
@@ -176,6 +187,7 @@ class AutoLighthouseTask:
         for attempt in range(UI_CLEANUP_ATTEMPTS):
             if self._interrupted():
                 raise InterruptedError("任务已停止")
+            self._dismiss_exit_dialog()
             screen = self.adb.screenshot()
             if self._is_on_main_map(screen):
                 self._emit("界面已就绪")
@@ -188,11 +200,44 @@ class AutoLighthouseTask:
     def _is_on_main_map(self, screen) -> bool:
         return self._is_in_wilderness(screen) or self._is_in_town(screen)
 
+    def _is_on_lighthouse_intel_page(self, screen) -> bool:
+        """是否在灯塔情报页（区别于野外大地图）。"""
+        if self._is_on_main_map(screen):
+            return False
+        if self._deploy.is_deploy_screen(screen):
+            return False
+        return is_lighthouse_intel_screen(screen)
+
+    def _ensure_lighthouse_page(self) -> None:
+        """确保当前在情报页；若在野外/出征界面则重新打开。"""
+        for attempt in range(3):
+            if self._interrupted():
+                raise InterruptedError("任务已停止")
+            self._dismiss_exit_dialog()
+            screen = self.adb.screenshot()
+            if self._is_on_lighthouse_intel_page(screen):
+                return
+            if self._deploy.is_deploy_screen(screen):
+                self._emit("当前在出征界面，返回并重新打开情报页")
+                self._back(2)
+                time.sleep(0.8)
+                continue
+            if self._is_on_main_map(screen):
+                self._emit("当前在野外大地图，重新打开情报页")
+                self._open_lighthouse_page()
+                return
+            self._back(1)
+            time.sleep(0.5)
+        self._emit("未能确认情报页，尝试从野外重新打开")
+        self._return_to_wilderness_main()
+        self._open_lighthouse_page()
+
     def _ensure_wilderness(self) -> None:
         self._ensure_clean_ui()
         for attempt in range(10):
             if self._interrupted():
                 raise InterruptedError("任务已停止")
+            self._dismiss_exit_dialog()
             screen = self.adb.screenshot()
             if self._is_in_wilderness(screen):
                 self._emit("已在野外")
@@ -211,8 +256,38 @@ class AutoLighthouseTask:
 
     def _return_to_wilderness_main(self) -> None:
         self._emit("返回野外主界面…")
+        self._dismiss_exit_dialog()
+        screen = self.adb.screenshot()
+        if self._is_in_wilderness(screen):
+            self._emit("已在野外")
+            return
         return_to_main_screen(self.adb, on_status=self.on_status)
+        self._dismiss_exit_dialog()
         self._ensure_wilderness()
+
+    def _cancel_deploy_for_cooldown_skip(self) -> None:
+        """小怪冷却跳过时：退出出征界面，尽量留在情报页继续扫描。"""
+        self._dismiss_exit_dialog()
+        for attempt in range(5):
+            if self._interrupted():
+                raise InterruptedError("任务已停止")
+            screen = self.adb.screenshot()
+            self._dismiss_exit_dialog()
+            if self._is_on_lighthouse_intel_page(screen):
+                self._emit("已回到情报页，继续扫描")
+                return
+            if self._is_on_main_map(screen):
+                self._emit("已在野外，下一轮将重新打开情报页")
+                return
+            if self._deploy.is_deploy_screen(screen):
+                self._emit("退出出征界面…")
+                self._back(1)
+                time.sleep(0.6)
+                continue
+            self._back(1)
+            time.sleep(0.5)
+        self._emit("未能确认界面，已尝试轻量返回")
+        self._dismiss_exit_dialog()
 
     def _open_lighthouse_page(self) -> None:
         self._ensure_wilderness()
@@ -246,17 +321,43 @@ class AutoLighthouseTask:
             for m in missions
         )
 
+    def _slot_attempt_count(self, center: tuple[int, int]) -> int:
+        x, y = center
+        for sx, sy, count in self._slot_attempts:
+            if abs(x - sx) < MISSION_SLOT_TRACK_RADIUS and abs(y - sy) < MISSION_SLOT_TRACK_RADIUS:
+                return count
+        return 0
+
+    def _is_slot_exhausted(self, center: tuple[int, int]) -> bool:
+        return self._slot_attempt_count(center) >= MISSION_SLOT_MAX_ATTEMPTS
+
+    def _record_slot_attempt(self, center: tuple[int, int]) -> int:
+        """记录某坐标槽位的点击次数，返回当前次数。"""
+        x, y = center
+        for i, (sx, sy, count) in enumerate(self._slot_attempts):
+            if abs(x - sx) < MISSION_SLOT_TRACK_RADIUS and abs(y - sy) < MISSION_SLOT_TRACK_RADIUS:
+                count += 1
+                self._slot_attempts[i] = (sx, sy, count)
+                return count
+        self._slot_attempts.append((x, y, 1))
+        return 1
+
     def _pick_executable_mission(
         self, missions: tuple[LighthouseMission, ...]
     ) -> LighthouseMission | None:
-        """从扫描结果中取出下一个要点击的图标。
-
-        不区分类型，按从上到下的顺序处理。小怪冷却在点击后
-        识别出类型时再判断。
-        """
+        """从扫描结果中取出下一个可点击的图标（跳过已达尝试上限的坐标）。"""
         if not missions:
             return None
-        return missions[0]
+        for mission in missions:
+            if self._is_slot_exhausted(mission.center):
+                logger.debug(
+                    f"[{self.name}] 跳过已达上限坐标 "
+                    f"({mission.center[0]},{mission.center[1]}) "
+                    f"{self._slot_attempt_count(mission.center)}/{MISSION_SLOT_MAX_ATTEMPTS}"
+                )
+                continue
+            return mission
+        return None
 
     def _scan_missions(self, screen):
         if self._interrupted():
@@ -304,8 +405,8 @@ class AutoLighthouseTask:
         if mission is not None or result.candidate_locations > 0:
             return screen, result, mission
 
-        self._emit("再次打开灯塔页确认是否还有任务…")
-        self._open_lighthouse_page()
+        self._emit("再次刷新情报页筛选后重试…")
+        self._prepare_lighthouse_scan()
         self._sleep_interruptible(SCAN_REOPEN_WAIT_SEC)
         screen, result = self._capture_and_scan()
         mission = self._pick_executable_mission(result.missions)
@@ -324,18 +425,28 @@ class AutoLighthouseTask:
         else:
             self._emit("未发现任何任务图标")
 
-    def _handle_stamina_after_action(self, *, reopen_lighthouse: bool) -> bool:
-        """返回 True 表示已用体力处理，需重新打开灯塔页继续扫描。"""
+    def _handle_stamina_after_action(self) -> bool:
+        """处理体力弹窗。返回 True 表示已自动使用体力。"""
         try:
-            recovered = self._deploy.handle_stamina_popup_if_any()
+            return self._deploy.handle_stamina_popup_if_any()
         except StaminaInsufficientError:
             raise
-        if not recovered:
-            return False
-        if reopen_lighthouse:
-            self._return_to_wilderness_main()
-            self._open_lighthouse_page()
-        return True
+
+    def _before_next_mission(self) -> None:
+        """执行下一个小任务前：野外 → 打开灯塔情报页。"""
+        self._dismiss_exit_dialog()
+        screen = self.adb.screenshot()
+        if self._is_on_lighthouse_intel_page(screen):
+            self._emit("已在情报页，准备扫描")
+            self._prepare_lighthouse_scan()
+            return
+        self._emit("准备下一个小任务，打开情报页")
+        self._open_lighthouse_page()
+
+    def _after_mission_completed(self) -> None:
+        """每个小任务结束后：回到野外主界面。"""
+        self._emit("小任务完成，返回野外")
+        self._return_to_wilderness_main()
 
     def _tap_mission_confirms(self) -> None:
         """帐篷 / 英雄之旅 / 小怪：确认 1、确认 2 流程一致。"""
@@ -350,25 +461,23 @@ class AutoLighthouseTask:
     def _classify_post_click(self) -> str:
         """点击图标并确认弹窗后，根据当前界面判断任务类型。
 
-        返回值: "small_monster" | "hero_journey" | "tent"
-        - small_monster: 出征界面（底部有 march_btn）
-        - hero_journey: 奖励界面（不在主地图，也没有出征按钮）
-        - tent: 回到灯塔页（主地图可见）
+        返回值: "small_monster" | "hero_journey" | "tent" | "wilderness"
         """
         time.sleep(0.5)
         screen = self.adb.screenshot()
 
-        # 1. 检测出征界面 → 小怪
         if self._deploy.is_deploy_screen(screen):
             self._emit("点击后识别为：小怪（出征界面）")
             return "small_monster"
 
-        # 2. 检测是否回到主地图（灯塔页）→ 帐篷
-        if self._is_on_main_map(screen):
-            self._emit("点击后识别为：帐篷（回到灯塔页）")
+        if self._is_on_lighthouse_intel_page(screen):
+            self._emit("点击后识别为：帐篷（仍在情报页）")
             return "tent"
 
-        # 3. 不在主地图也不是出征界面 → 英雄之旅（奖励界面）
+        if self._is_on_main_map(screen):
+            self._emit("点击后识别为：已回到野外大地图")
+            return "wilderness"
+
         self._emit("点击后识别为：英雄之旅（奖励界面）")
         return "hero_journey"
 
@@ -378,35 +487,25 @@ class AutoLighthouseTask:
         self._tap_xy(*mission.center, delay=MISSION_ICON_WAIT_SEC)
         self._tap_mission_confirms()
 
-    def _handle_post_confirm(self, kind: str) -> bool:
-        """确认弹窗后根据类型执行后续操作。返回 True 表示需要重新打开灯塔页。"""
-        if kind == "tent":
+    def _handle_post_confirm(self, kind: str) -> None:
+        """确认弹窗后执行类型特定操作（导航由主循环统一处理）。"""
+        if kind in ("tent", "wilderness"):
             self._emit("帐篷任务完成")
-            return False  # 不需要重返灯塔页，已经在灯塔页
+            return
 
         if kind == "hero_journey":
             self._emit("执行英雄之旅后续…")
             self._tap("hero_journey_finish", delay=1.0)
             self._emit(f"等待 {int(HERO_JOURNEY_WAIT_SEC)} 秒…")
             time.sleep(HERO_JOURNEY_WAIT_SEC)
-            if self._handle_stamina_after_action(reopen_lighthouse=False):
-                self._return_to_wilderness_main()
-                self._open_lighthouse_page()
-                return True
-            self._return_to_wilderness_main()
-            self._open_lighthouse_page()
-            return True
+            self._handle_stamina_after_action()
+            return
 
         if kind == "small_monster":
             self._emit("执行小怪出征…")
-            try:
-                self._deploy.select_formation()
-                self._deploy.tap_march()
-            except StaminaInsufficientError:
-                raise
-            self._return_to_wilderness_main()
-            self._open_lighthouse_page()
-            return True
+            self._deploy.select_formation()
+            self._deploy.tap_march()
+            return
 
         raise RuntimeError(f"未知任务类型：{kind}")
 
@@ -424,12 +523,7 @@ class AutoLighthouseTask:
         self._tap("hero_journey_finish", delay=1.0)
         self._emit(f"等待 {int(HERO_JOURNEY_WAIT_SEC)} 秒…")
         time.sleep(HERO_JOURNEY_WAIT_SEC)
-        if self._handle_stamina_after_action(reopen_lighthouse=False):
-            self._return_to_wilderness_main()
-            self._open_lighthouse_page()
-            return True
-        self._return_to_wilderness_main()
-        self._open_lighthouse_page()
+        self._handle_stamina_after_action()
         return True
 
     def _execute_small_monster(self, mission: LighthouseMission) -> bool:
@@ -455,25 +549,30 @@ class AutoLighthouseTask:
         raise RuntimeError(f"未知灯塔任务类型：{mission.kind}")
 
     def run_lighthouse_cycle(self) -> int:
-        """新流程：扫描图标位置 → 逐个点击 → 确认弹窗 → 分类 → 处理。
-
-        扫描阶段不区分图标类型。点击图标并确认弹窗后，
-        根据界面状态判断任务类型（帐篷/英雄之旅/小怪），
-        再执行对应的后续操作。
-        """
+        """扫描图标 → 点击 → 确认 → 分类 → 处理 → 回野外；下一轮再开情报页。"""
         handled = 0
-        self._open_lighthouse_page()
+        self._slot_attempts.clear()
 
         while not self._interrupted():
-            # 1. 扫描图标位置（不分类）
+            self._before_next_mission()
+
             screen, result, mission = self._find_executable_mission()
             if self._interrupted():
                 raise InterruptedError("任务已停止")
 
             if mission is None:
-                self._log_scan_miss(result, screen)
-                self._emit("页面上没有可处理的灯塔任务，扫描结束")
+                if result.missions and all(
+                    self._is_slot_exhausted(m.center) for m in result.missions
+                ):
+                    self._emit(
+                        f"剩余 {len(result.missions)} 个候选坐标均已尝试 "
+                        f"{MISSION_SLOT_MAX_ATTEMPTS} 次，结束本轮"
+                    )
+                else:
+                    self._log_scan_miss(result, screen)
+                    self._emit("页面上没有可处理的灯塔任务，扫描结束")
                 self._back(1)
+                self._after_mission_completed()
                 break
 
             self._emit(
@@ -481,49 +580,41 @@ class AutoLighthouseTask:
                 f"共 {len(result.missions)} 个候选"
             )
 
-            # 2. 相邻图标点击位置校正
             tap_target = refine_mission_click(mission, screen, result.missions)
             if tap_target.center != mission.center:
                 self._emit(
                     f"相邻图标校正落点 -> ({tap_target.center[0]},{tap_target.center[1]})"
                 )
 
-            # 3. 点击图标 → 等待弹窗 → 确认 → 分类
+            attempt_no = self._record_slot_attempt(tap_target.center)
+            self._emit(
+                f"坐标 ({tap_target.center[0]},{tap_target.center[1]}) "
+                f"第 {attempt_no}/{MISSION_SLOT_MAX_ATTEMPTS} 次尝试"
+            )
             self._click_icon_and_confirm(tap_target)
-
-            # 4. 根据弹窗界面判断任务类型
             kind = self._classify_post_click()
 
-            # 5. 小怪冷却检查
             if kind == "small_monster":
                 cooldown = self._monster_cooldown_remaining()
                 if cooldown > 0:
                     mins, secs = divmod(int(cooldown), 60)
                     self._emit(
                         f"识别为小怪但冷却中（剩余 {mins} 分 {secs} 秒），"
-                        f"跳过此图标，返回灯塔页"
+                        f"跳过此图标"
                     )
-                    self._back(2)  # 取消出征界面
-                    self._sleep_interruptible(1.0)
-                    self._open_lighthouse_page()
+                    self._cancel_deploy_for_cooldown_skip()
                     continue
                 self._last_monster_dispatch_at = time.time()
 
-            # 6. 执行类型特定的后续操作
             try:
                 self._handle_post_confirm(kind)
             except StaminaInsufficientError:
                 raise
             except Exception as exc:
                 self._emit(f"执行失败：{exc}")
-                # 尝试恢复：返回野外并重新打开灯塔页
-                try:
-                    self._return_to_wilderness_main()
-                    self._open_lighthouse_page()
-                except Exception:
-                    pass
 
             handled += 1
+            self._after_mission_completed()
 
         return handled
 
