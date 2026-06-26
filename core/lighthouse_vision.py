@@ -26,7 +26,8 @@ LIGHTHOUSE_HEADER_MEAN_DIFF_MAX = 18.0
 # 与背景图差分：仅保留相对背景新出现且颜色鲜艳的图钉
 BG_DIFF_THRESHOLD = 28
 BG_DIFF_VIVID_MIN = 0.10
-BG_DIFF_PIN_SUPPORT_MIN = 0.12
+BG_DIFF_PIN_SUPPORT_MIN = 0.15
+BG_MAX_PINS_PER_DIFF_BLOB = 2
 BG_PIN_AREA_MIN = 60
 BG_PIN_AREA_MAX = 1800
 BG_DIFF_BLOB_MIN_AREA = 800
@@ -83,7 +84,7 @@ BOUNTY_SUBTITLE_TEMPLATES: tuple[tuple[str, float], ...] = (
     (BOUNTY_MASTER_LABEL, 0.45),
 )
 MISSION_DETAIL_BOUNTY_THRESHOLD = 0.45
-BOUNTY_SUBTITLE_SEARCH_WIDTH_RATIO = 0.58
+BOUNTY_SUBTITLE_SEARCH_WIDTH_RATIO = 0.40
 BOUNTY_SUBTITLE_MAX_MATCH_X_RATIO = 0.35
 BOUNTY_SUBTITLE_SCALES = (0.82, 0.90, 0.96, 1.0, 1.06, 1.14, 1.22)
 MONSTER_KEYWORD_LEVEL = "lighthouse/monster_keyword_level.png"
@@ -91,8 +92,8 @@ BEAST_KEYWORD_HAO = "lighthouse/beast_keyword_hao.png"
 MONSTER_LEVEL_SUBTITLE_MIN = 0.48
 MONSTER_LEVEL_MAX_MATCH_X_RATIO = 0.12
 BEAST_HAO_SUBTITLE_MIN = 0.78
-BEAST_HAO_SEARCH_WIDTH_RATIO = 0.58
-BEAST_HAO_MIN_MATCH_X_RATIO = 0.55
+BEAST_HAO_SEARCH_WIDTH_RATIO = 0.30
+BEAST_HAO_MIN_MATCH_X_RATIO = 0.70
 MISSION_DETAIL_BTN_THRESHOLD = 0.65
 MISSION_DETAIL_BTN_ACCEPT_SCORE = 0.60
 MISSION_DETAIL_BTN_MIN_MARGIN = 0.04
@@ -122,6 +123,7 @@ class MissionDetailClassification:
     label: str
     confidence: float = 0.0
     action_center: tuple[int, int] | None = None
+    beast_explicit: bool = False
 
 
 @dataclass(frozen=True)
@@ -275,6 +277,25 @@ def _pin_diff_support(
                 best_ratio = ratio
                 best_center = (ox + rx, oy + ry)
     return best_ratio, best_center
+
+
+def _merge_nearby_pin_candidates(
+    candidates: list[tuple[tuple[int, int], float]],
+    *,
+    merge_distance: int = MISSION_PIN_MERGE_DISTANCE,
+) -> list[tuple[tuple[int, int], float]]:
+    """合并邻近图钉候选，保留置信度最高者。"""
+    ordered = sorted(candidates, key=lambda item: item[1], reverse=True)
+    merged: list[tuple[tuple[int, int], float]] = []
+    for center, confidence in ordered:
+        if any(
+            abs(center[0] - existing[0]) < merge_distance
+            and abs(center[1] - existing[1]) < merge_distance
+            for existing, _ in merged
+        ):
+            continue
+        merged.append((center, confidence))
+    return merged
 
 
 def _contour_white_ratio(gray: np.ndarray, contour: np.ndarray) -> float:
@@ -1308,6 +1329,7 @@ def _classify_march_subtitle(
             kind="beast_skip",
             label="特殊大怪",
             confidence=max(base_confidence, hao_conf),
+            beast_explicit=True,
         )
 
     logger.info(
@@ -1318,6 +1340,7 @@ def _classify_march_subtitle(
         kind="beast_skip",
         label="特殊大怪",
         confidence=max(base_confidence, level_conf, bounty_conf, hao_conf),
+        beast_explicit=False,
     )
 
 
@@ -1752,7 +1775,7 @@ def _extract_pins_from_diff_blob(
                 continue
             seen.add(key)
             found.append(accepted)
-    return found
+    return _merge_nearby_pin_candidates(found)[:BG_MAX_PINS_PER_DIFF_BLOB]
 
 
 def _find_mission_pins_bg_diff(
@@ -1837,6 +1860,8 @@ def _find_mission_pins_bg_diff(
             rejected["merged"] += 1
             continue
         candidates.append(accepted)
+
+    candidates = _merge_nearby_pin_candidates(candidates)
 
     if candidates or any(rejected.values()):
         logger.debug(

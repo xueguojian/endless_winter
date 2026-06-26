@@ -555,6 +555,9 @@ class EndlessWinterApp(tk.Tk):
         ttk.Spinbox(
             tab_lighthouse, from_=5, to=1440, textvariable=self.var_lighthouse_interval, width=8
         ).grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
+        ttk.Label(tab_lighthouse, text="（已改为一次性任务，此项不再生效）", font=("", 8)).grid(
+            row=row, column=2, sticky=tk.W, padx=(4, 0)
+        )
         row += 1
 
         ttk.Label(tab_lighthouse, text="编队槽位").grid(row=row, column=0, sticky=tk.W, pady=2)

@@ -23,7 +23,7 @@ TASK_ENTRIES: tuple[TaskEntry, ...] = (
     TaskEntry(
         task_id="auto_lighthouse",
         label="自动灯塔任务",
-        kind="loop",
+        kind="once",
         config_key="auto_lighthouse",
         available=True,
     ),

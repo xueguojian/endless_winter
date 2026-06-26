@@ -46,6 +46,8 @@ SCAN_EMPTY_RETRY_WAIT_SEC = 1.0
 SCAN_REOPEN_WAIT_SEC = 1.2
 MISSION_SLOT_MAX_ATTEMPTS = 3
 MISSION_SLOT_TRACK_RADIUS = 28
+MAX_LIGHTHOUSE_CYCLE_ITERATIONS = 100
+MIN_PIN_CONFIDENCE = 0.20
 
 DEFAULT_COORDS: dict[str, list[int]] = {
     "lighthouse_open": [666, 862],
@@ -427,14 +429,19 @@ class AutoLighthouseTask:
         """从任务详情 / 出征 / 误点界面安全退回野外主界面。"""
         self._return_to_wilderness_main()
 
-    def _click_icon_and_view_detail(self, mission: LighthouseMission) -> None:
-        """点击地图图标 → 立即查看，进入任务详情页。"""
+    def _click_icon_and_view_detail(self, mission: LighthouseMission) -> bool:
+        """点击地图图标 → 立即查看，进入任务详情页。返回是否成功进入详情。"""
         self._emit(f"点击图标 @ ({mission.center[0]},{mission.center[1]})")
         self._tap_xy(*mission.center, delay=MISSION_ICON_WAIT_SEC)
         time.sleep(MISSION_CONFIRM_PRE_WAIT_SEC)
         x, y = self.coords["view_immediately"]
         self._emit(f"点击立即查看 @ ({x},{y})")
         self._tap_xy(x, y, delay=1.5)
+        screen = self.adb.screenshot()
+        if self._is_on_lighthouse_intel_page(screen):
+            self._emit("点击后仍在情报页，疑为误点空地")
+            return False
+        return True
 
     def _classify_mission_detail(self) -> MissionDetailClassification:
         """详情页底部行动按钮 + 副标题分类。"""
@@ -487,8 +494,18 @@ class AutoLighthouseTask:
         handled = 0
         self._slot_attempts.clear()
         self._skipped_centers.clear()
+        iteration = 0
 
         while not self._interrupted():
+            iteration += 1
+            if iteration > MAX_LIGHTHOUSE_CYCLE_ITERATIONS:
+                self._emit(
+                    f"已达到本轮上限 {MAX_LIGHTHOUSE_CYCLE_ITERATIONS} 次，"
+                    f"强制结束以防死循环"
+                )
+                self._after_mission_completed()
+                break
+
             self._before_next_mission()
 
             screen, result, mission = self._find_executable_mission()
@@ -523,6 +540,13 @@ class AutoLighthouseTask:
             )
 
             tap_target = mission
+            if tap_target.confidence < MIN_PIN_CONFIDENCE:
+                self._emit(
+                    f"图钉置信度 {tap_target.confidence:.2f} 过低，"
+                    f"跳过 ({tap_target.center[0]},{tap_target.center[1]})"
+                )
+                self._mark_skipped_center(tap_target.center)
+                continue
 
             attempt_no = self._record_slot_attempt(tap_target.center)
             self._emit(
@@ -530,7 +554,9 @@ class AutoLighthouseTask:
                 f"第 {attempt_no}/{MISSION_SLOT_MAX_ATTEMPTS} 次尝试"
             )
 
-            self._click_icon_and_view_detail(tap_target)
+            if not self._click_icon_and_view_detail(tap_target):
+                self._mark_skipped_center(tap_target.center)
+                continue
             detail = self._classify_mission_detail()
 
             if detail.kind == "bounty_skip":
@@ -581,17 +607,12 @@ class AutoLighthouseTask:
         return handled
 
     def run_once(self, *, force: bool = False) -> bool:
-        if not force and not self.should_run():
-            return False
-
+        _ = force
         self._last_run = time.time()
         try:
             count = self.run_lighthouse_cycle()
             self._return_to_wilderness_main()
-            self._emit(
-                f"本轮处理 {count} 个灯塔任务，"
-                f"{int(self.interval // 60)} 分钟后再次扫描"
-            )
+            self._emit(f"本轮处理 {count} 个灯塔任务，扫描结束")
             return True
         except InterruptedError:
             self._emit("任务已停止")
