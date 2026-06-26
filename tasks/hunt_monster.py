@@ -5,17 +5,26 @@ from __future__ import annotations
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
 from loguru import logger
 
 from core.adb_client import AdbClient
+from core.navigation import WildernessNavigator
+from core.vision import Vision
 
 StatusCallback = Callable[[str], None]
 
+TEMPLATE_DIR = Path(__file__).parent.parent / "assets" / "templates"
+
+DEFAULT_COORDS: dict[str, list[int]] = {
+    "dialog_cancel": [250, 780],
+}
+
 
 class HuntMonsterTask:
-    """在世界地图搜索野兽并发起攻击。"""
+    """野外 → 搜索野兽 → 攻击出征 → 回野外。"""
 
     def __init__(
         self,
@@ -29,7 +38,7 @@ class HuntMonsterTask:
         on_status: StatusCallback | None = None,
     ):
         self.adb = adb
-        self.coords = coords
+        self.coords = {**DEFAULT_COORDS, **coords}
         self.interval = interval
         self.monster_level = monster_level
         self.max_monster_level = max_monster_level
@@ -38,6 +47,8 @@ class HuntMonsterTask:
         self.on_status = on_status
         self._last_run = 0.0
         self._stop_event = threading.Event()
+        self.vision = Vision(TEMPLATE_DIR, threshold=0.70)
+        self._wilderness = WildernessNavigator.from_task(self)
 
     @property
     def name(self) -> str:
@@ -70,16 +81,12 @@ class HuntMonsterTask:
         self.adb.tap(x, y)
         time.sleep(delay if delay is not None else self.step_delay)
 
-    def _back(self, times: int = 1) -> None:
-        for _ in range(times):
-            if self._interrupted():
-                raise InterruptedError("任务已停止")
-            self.adb.back()
-            time.sleep(0.5)
+    def _return_to_wilderness(self) -> None:
+        self._wilderness.try_return_to_wilderness()
 
     def _close_popups(self) -> None:
-        self._tap("close_popup", delay=0.8)
-        self._back(2)
+        if "close_popup" in self.coords:
+            self._tap("close_popup", delay=0.8)
 
     def _set_monster_level(self) -> None:
         diff = self.max_monster_level - self.monster_level
@@ -91,24 +98,15 @@ class HuntMonsterTask:
             self._tap(key, delay=0.2)
 
     def run_hunt_cycle(self) -> None:
-        """执行一次完整的搜索 → 攻击 → 出征流程。"""
+        """野外 → 搜索 → 攻击 → 出征。"""
         self._emit(f"开始打怪，目标等级 {self.monster_level}")
-
+        self._wilderness.ensure_wilderness()
         self._close_popups()
 
-        # 1. 打开搜索面板
         self._tap("search_open")
-
-        # 2. 调整野怪等级
         self._set_monster_level()
-
-        # 3. 搜索最近野兽
         self._tap("search_confirm", delay=2.5)
-
-        # 4. 点击攻击
         self._tap("attack", delay=2.0)
-
-        # 5. 确认出征
         self._tap("march", delay=1.5)
 
         self._emit("已派出部队")
@@ -120,6 +118,7 @@ class HuntMonsterTask:
         self._last_run = time.time()
         try:
             self.run_hunt_cycle()
+            self._return_to_wilderness()
             self._emit(f"本轮完成，{int(self.interval // 60)} 分钟后再次打野")
             return True
         except InterruptedError:
@@ -128,5 +127,5 @@ class HuntMonsterTask:
         except Exception as exc:
             logger.exception(f"[{self.name}] 执行失败")
             self._emit(f"执行失败：{exc}")
-            self._back(3)
+            self._return_to_wilderness()
             return False

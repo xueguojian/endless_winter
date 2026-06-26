@@ -7,7 +7,8 @@
 #   ice_beast_tab.png, ice_beast_tab_selected.png,
 #   level_minus_btn.png, level_plus_btn.png
 #
-# lighthouse/：hero_journey, tent, small_monster, small_monster_beast（各含 _edges）
+# lighthouse/：lighthouse_map_bg.png, mission_btn_*.png, bounty_*,
+#   monster_keyword_level, beast_keyword_hao
 # training/：train_ready_btn.png, train_ready_collect.png
 # mining/：mining_hero_{meat,wood,coal,iron}_face.png
 # level_num/：1.png ~ N.png（calibrate_level_num.py 生成）

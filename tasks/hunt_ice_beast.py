@@ -12,6 +12,7 @@ import cv2
 from loguru import logger
 
 from core.adb_client import AdbClient
+from core.navigation import WildernessNavigator
 from core.vision import MatchResult, Vision
 
 StatusCallback = Callable[[str], None]
@@ -166,6 +167,9 @@ class HuntIceBeastTask:
         self._running = False
         # 连续执行冰原巨兽时，搜索 tab 栏仍停留在上次滚动的位置
         self._tab_bar_already_scrolled = False
+        self._wilderness = WildernessNavigator.from_task(
+            self, is_overlay_open=self._is_search_panel_visible
+        )
 
     @property
     def name(self) -> str:
@@ -284,71 +288,20 @@ class HuntIceBeastTask:
         return self._is_in_wilderness(screen) or self._is_in_town(screen)
 
     def _ensure_clean_ui(self) -> None:
-        """启动前关闭搜索面板，回到干净主界面（仅用返回键，不用 ESC）。"""
+        """启动前回到野外主界面（关闭搜索面板等遮挡）。"""
         self._emit("清理界面…")
-        for attempt in range(UI_CLEANUP_ATTEMPTS):
-            if self._interrupted():
-                raise InterruptedError("任务已停止")
-
-            self._dismiss_exit_dialog()
-            screen = self.adb.screenshot()
-
-            if not self._is_search_panel_visible(screen) and self._is_on_main_map(screen):
-                self._emit("界面已就绪")
-                time.sleep(0.5)
-                return
-
-            if self._is_search_panel_visible(screen):
-                logger.debug(f"关闭搜索面板 ({attempt + 1}/{UI_CLEANUP_ATTEMPTS})")
-                self._close_search_panel()
-            else:
-                # 可能有其它遮挡或退出弹窗，先取消再试一次返回
-                self._dismiss_exit_dialog()
-                if attempt < 2:
-                    self._close_search_panel()
-                else:
-                    break
+        if self._wilderness.return_to_wilderness():
+            self._emit("界面已就绪")
             time.sleep(0.5)
-
-        self._emit("已尝试清理界面，继续执行")
+        else:
+            self._emit("已尝试清理界面，继续执行")
 
     def _close_overlays(self) -> None:
-        for _ in range(4):
-            self._dismiss_exit_dialog()
-            screen = self.adb.screenshot()
-            if not self._is_search_panel_visible(screen):
-                return
-            self._close_search_panel()
-            time.sleep(0.5)
+        self._wilderness.return_to_wilderness()
 
     def _ensure_wilderness(self) -> None:
-        """确保处于野外场景（图2：右下角显示「城镇」）。"""
-        self._close_overlays()
-
-        for attempt in range(10):
-            screen = self.adb.screenshot()
-
-            if self._is_search_panel_visible(screen):
-                self._close_search_panel()
-                time.sleep(0.5)
-                continue
-
-            if self._is_in_wilderness(screen):
-                self._emit("已在野外地图")
-                return
-
-            if self._is_in_town(screen):
-                self._emit("当前在城镇，切换到野外…")
-                self._tap("world_map", delay=2.0)
-                continue
-
-            logger.warning(f"无法识别场景，重试切换 ({attempt + 1}/10)")
-            self._back(1)
-            time.sleep(0.6)
-
-        raise RuntimeError(
-            "无法进入野外地图。请手动切换到野外（右下角应显示「城镇」）后重试"
-        )
+        """确保处于野外场景（右下角显示「城镇」）。"""
+        self._wilderness.ensure_wilderness()
 
     def _open_search_panel(self) -> None:
         """在野外点击左下角放大镜，打开搜索面板（图3）。"""
@@ -1005,7 +958,7 @@ class HuntIceBeastTask:
             return
 
         self._emit("清理出征后的残留界面…")
-        self._ensure_clean_ui()
+        self._wilderness.return_to_wilderness()
 
     def run_hunt_cycle(self) -> None:
         self._ensure_clean_ui()
@@ -1047,31 +1000,19 @@ class HuntIceBeastTask:
         except NoStaminaError:
             if self.use_stamina:
                 self._emit("体力不足但已启用自动使用，跳过本轮继续循环")
-                try:
-                    self._back(3)
-                    self._ensure_clean_ui()
-                except Exception:
-                    pass
+                self._wilderness.try_return_to_wilderness()
                 return False
             self._stop_event.set()
             raise InterruptedError("没有体力，已停止")
         except MarchHeroCheckError as exc:
             self._emit(str(exc))
-            self._emit("退回主界面，等待下次循环")
-            try:
-                self._back(3)
-                self._ensure_clean_ui()
-            except Exception:
-                pass
+            self._emit("退回野外，等待下次循环")
+            self._wilderness.try_return_to_wilderness()
             return False
         except Exception as exc:
             logger.exception(f"[{self.name}] 执行失败，恢复界面后继续循环")
             self._emit(f"本轮异常：{exc}，恢复界面后继续")
-            try:
-                self._back(3)
-                self._ensure_clean_ui()
-            except Exception:
-                pass
+            self._wilderness.try_return_to_wilderness()
             return False
 
     def run_loop(self) -> None:

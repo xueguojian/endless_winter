@@ -13,19 +13,16 @@ import cv2
 from loguru import logger
 
 from core.adb_client import AdbClient
-from core.navigation import return_to_main_screen
+from core.navigation import WildernessNavigator
 from core.vision import MatchResult, Vision
 
 StatusCallback = Callable[[str], None]
 
 TEMPLATE_DIR = Path(__file__).parent.parent / "assets" / "templates"
 
-BTN_TOWN_LABEL = "btn_town_label.png"
-BTN_WILDERNESS_LABEL = "btn_wilderness_label.png"
 TRAIN_READY_COLLECT = "training/train_ready_collect.png"
 TRAIN_READY_BTN = "training/train_ready_btn.png"
 
-SCENE_TOGGLE_ROI = (500, 1150, 720, 1280)
 TRAIN_SCAN_ROI = (370, 530, 434, 732)
 TRAIN_SCAN_ROWS = 3
 TRAIN_READY_THRESHOLD = 0.65
@@ -36,6 +33,7 @@ DEFAULT_COORDS: dict[str, list[int]] = {
     "train_collect_tap": [356, 566],
     "barracks_enter": [480, 868],
     "train_confirm": [524, 1126],
+    "dialog_cancel": [250, 780],
 }
 
 TRAIN_READY_KINDS: tuple[tuple[str, str, str], ...] = (
@@ -45,6 +43,7 @@ TRAIN_READY_KINDS: tuple[tuple[str, str, str], ...] = (
 
 DEFAULT_STEP_DELAY = 1.5
 DEFAULT_INTERVAL = 3 * 3600  # 3 小时
+TRAIN_CYCLE_MAX_ATTEMPTS = 10
 
 
 @dataclass(frozen=True)
@@ -62,6 +61,7 @@ def merge_task_config(cfg: dict) -> dict:
         "train_ready_threshold": float(
             cfg.get("train_ready_threshold", TRAIN_READY_THRESHOLD)
         ),
+        "max_cycle_attempts": int(cfg.get("max_cycle_attempts", TRAIN_CYCLE_MAX_ATTEMPTS)),
     }
 
 
@@ -75,6 +75,7 @@ class AutoTrainTroopsTask:
         interval: float = DEFAULT_INTERVAL,
         step_delay: float = DEFAULT_STEP_DELAY,
         train_ready_threshold: float = TRAIN_READY_THRESHOLD,
+        max_cycle_attempts: int = TRAIN_CYCLE_MAX_ATTEMPTS,
         on_status: StatusCallback | None = None,
     ):
         merged = merge_task_config(
@@ -82,6 +83,7 @@ class AutoTrainTroopsTask:
                 "coords": coords or {},
                 "step_delay": step_delay,
                 "train_ready_threshold": train_ready_threshold,
+                "max_cycle_attempts": max_cycle_attempts,
             }
         )
         self.adb = adb
@@ -89,10 +91,12 @@ class AutoTrainTroopsTask:
         self.interval = interval
         self.step_delay = merged["step_delay"]
         self.train_ready_threshold = merged["train_ready_threshold"]
+        self.max_cycle_attempts = merged["max_cycle_attempts"]
         self.on_status = on_status
         self._last_run = 0.0
         self._stop_event = threading.Event()
         self.vision = Vision(TEMPLATE_DIR, threshold=self.train_ready_threshold)
+        self._wilderness = WildernessNavigator.from_task(self)
 
     @property
     def name(self) -> str:
@@ -133,62 +137,16 @@ class AutoTrainTroopsTask:
             self.adb.back()
             time.sleep(0.5)
 
-    def _has_scene_templates(self) -> bool:
-        return (TEMPLATE_DIR / BTN_TOWN_LABEL).is_file() or (
-            TEMPLATE_DIR / BTN_WILDERNESS_LABEL
-        ).is_file()
-
-    def _match_in_roi(
-        self, screen, template: str, roi: tuple[int, int, int, int]
-    ) -> MatchResult:
-        x1, y1, x2, y2 = roi
-        result = self.vision.match_template(screen[y1:y2, x1:x2], template)
-        if not result.found:
-            return result
-        cx, cy = result.center
-        return MatchResult(
-            found=True,
-            confidence=result.confidence,
-            center=(x1 + cx, y1 + cy),
-            top_left=(x1 + result.top_left[0], y1 + result.top_left[1]),
-            size=result.size,
-        )
-
-    def _is_in_wilderness(self, screen) -> bool:
-        return self._match_in_roi(screen, BTN_TOWN_LABEL, SCENE_TOGGLE_ROI).found
-
-    def _is_in_town(self, screen) -> bool:
-        return self._match_in_roi(screen, BTN_WILDERNESS_LABEL, SCENE_TOGGLE_ROI).found
-
     def _ensure_main_town(self) -> None:
-        self._emit("确保在城镇主界面…")
-        return_to_main_screen(self.adb, on_status=self.on_status)
+        self._emit("确保从野外进入城镇…")
+        self._wilderness.ensure_wilderness()
+        self._wilderness.switch_to_town()
+        self._emit("已在城镇主界面")
+        time.sleep(0.5)
 
-        for attempt in range(10):
-            if self._interrupted():
-                raise InterruptedError("任务已停止")
-            screen = self.adb.screenshot()
-            if self._is_in_town(screen):
-                self._emit("已在城镇主界面")
-                time.sleep(0.5)
-                return
-            if self._is_in_wilderness(screen):
-                self._emit("当前在野外，切换到城镇…")
-                result = self._match_in_roi(screen, BTN_TOWN_LABEL, SCENE_TOGGLE_ROI)
-                if result.found:
-                    self._tap_xy(*result.center, delay=2.0)
-                else:
-                    self._back(1)
-                continue
-            self._back(1)
-            time.sleep(0.5)
-
-        raise RuntimeError("无法进入城镇主界面")
-
-    def _return_to_town_main(self) -> None:
-        self._emit("返回城镇主界面…")
-        return_to_main_screen(self.adb, on_status=self.on_status)
-        self._ensure_main_town()
+    def _return_to_wilderness(self) -> None:
+        self._emit("返回野外主界面…")
+        self._wilderness.try_return_to_wilderness()
 
     def _has_red_notification_dot(
         self, screen, top_left: tuple[int, int], size: tuple[int, int]
@@ -272,8 +230,23 @@ class AutoTrainTroopsTask:
 
     def run_train_cycle(self) -> int:
         trained_count = 0
+        attempt_count = 0
+        hit_attempt_limit = False
 
         while not self._interrupted():
+            if attempt_count >= self.max_cycle_attempts:
+                self._emit(
+                    f"本轮识别已达上限 {self.max_cycle_attempts} 次，"
+                    f"停止当前任务，等待下次执行"
+                )
+                hit_attempt_limit = True
+                break
+
+            attempt_count += 1
+            self._emit(
+                f"第 {attempt_count}/{self.max_cycle_attempts} 次识别扫描"
+            )
+
             self._ensure_main_town()
             self._emit("打开城镇状态面板")
             self._tap("status_open", delay=1.5)
@@ -293,8 +266,10 @@ class AutoTrainTroopsTask:
 
             trained_count += 1
             self._emit(f"已完成第 {trained_count} 项练兵")
-            self._return_to_town_main()
+            self._return_to_wilderness()
+            self._ensure_main_town()
 
+        self._return_to_wilderness()
         return trained_count
 
     def run_once(self, *, force: bool = False) -> bool:
@@ -316,8 +291,5 @@ class AutoTrainTroopsTask:
         except Exception as exc:
             logger.exception(f"[{self.name}] 执行失败")
             self._emit(f"执行失败：{exc}")
-            try:
-                return_to_main_screen(self.adb, on_status=self.on_status)
-            except Exception as nav_exc:
-                logger.warning(f"[{self.name}] 返回主界面失败: {nav_exc}")
+            self._wilderness.try_return_to_wilderness()
             return False

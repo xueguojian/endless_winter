@@ -184,7 +184,6 @@ class EndlessWinterApp(tk.Tk):
         lighthouse["monster_cooldown"] = int(self.var_lighthouse_monster_cooldown.get()) * 60
         merged_lighthouse = merge_lighthouse_config(lighthouse)
         lighthouse["step_delay"] = merged_lighthouse["step_delay"]
-        lighthouse["match_threshold"] = merged_lighthouse["match_threshold"]
         lighthouse["coords"] = merged_lighthouse["coords"]
 
         monster = tasks.setdefault("hunt_monster", {})
@@ -985,7 +984,6 @@ class EndlessWinterApp(tk.Tk):
             use_stamina=bool(self.var_lighthouse_use_stamina.get()),
             monster_cooldown=float(self.var_lighthouse_monster_cooldown.get() * 60),
             step_delay=merged["step_delay"],
-            match_threshold=merged["match_threshold"],
             on_status=self._on_status,
         )
 

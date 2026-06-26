@@ -14,15 +14,13 @@ from loguru import logger
 import cv2
 
 from core.adb_client import AdbClient
-from core.navigation import return_to_main_screen
+from core.navigation import WildernessNavigator
 from core.vision import MatchResult, Vision
 
 StatusCallback = Callable[[str], None]
 
 TEMPLATE_DIR = Path(__file__).parent.parent / "assets" / "templates"
 
-BTN_TOWN_LABEL = "btn_town_label.png"
-BTN_WILDERNESS_LABEL = "btn_wilderness_label.png"
 SEARCH_ICON = "search_icon.png"
 SEARCH_CONFIRM_BTN = "search_confirm_btn.png"
 SEARCH_PANEL_MARKER = "beast_tab.png"
@@ -36,7 +34,6 @@ SEARCH_PANEL_TEMPLATES = (
     ICE_BEAST_TAB_SELECTED,
 )
 
-SCENE_TOGGLE_ROI = (500, 1150, 720, 1280)
 SEARCH_ICON_ROI = (0, 780, 160, 960)
 SEARCH_TAB_ROI = (0, 850, 720, 980)
 SEARCH_BTN_ROI = (100, 1130, 530, 1240)
@@ -48,7 +45,6 @@ LEVEL_PLUS_BTN = "level_plus_btn.png"
 TAB_BAR_FIRST_SCROLL_SWIPES = 3
 TAB_BAR_LATER_SCROLL_SWIPES = 1
 TAB_BAR_SWIPE_DURATION_MS = 400
-UI_CLEANUP_ATTEMPTS = 4
 
 MINING_HERO_MATCH_THRESHOLD = 0.68
 DEFAULT_HERO_ROI = (98, 308, 246, 570)
@@ -153,6 +149,9 @@ class AutoMiningTask:
         self._last_run = 0.0
         self._stop_event = threading.Event()
         self.vision = Vision(TEMPLATE_DIR, threshold=0.70)
+        self._wilderness = WildernessNavigator.from_task(
+            self, is_overlay_open=self._is_search_panel_visible
+        )
 
     @property
     def name(self) -> str:
@@ -207,11 +206,8 @@ class AutoMiningTask:
             self.adb.tap(*self.coords["dialog_cancel"])
             time.sleep(0.5)
 
-    def _return_to_main(self) -> None:
-        try:
-            return_to_main_screen(self.adb, on_status=self.on_status)
-        except Exception as exc:
-            logger.warning(f"[{self.name}] 返回主界面失败: {exc}")
+    def _return_to_wilderness(self) -> None:
+        self._wilderness.try_return_to_wilderness()
 
     def _match_in_roi(
         self, screen, template: str, roi: tuple[int, int, int, int]
@@ -229,17 +225,6 @@ class AutoMiningTask:
             size=result.size,
         )
 
-    def _has_scene_templates(self) -> bool:
-        return (TEMPLATE_DIR / BTN_TOWN_LABEL).is_file() or (
-            TEMPLATE_DIR / BTN_WILDERNESS_LABEL
-        ).is_file()
-
-    def _is_in_wilderness(self, screen) -> bool:
-        return self._match_in_roi(screen, BTN_TOWN_LABEL, SCENE_TOGGLE_ROI).found
-
-    def _is_in_town(self, screen) -> bool:
-        return self._match_in_roi(screen, BTN_WILDERNESS_LABEL, SCENE_TOGGLE_ROI).found
-
     def _is_search_panel_visible(self, screen=None) -> bool:
         if screen is None:
             screen = self.adb.screenshot()
@@ -248,49 +233,15 @@ class AutoMiningTask:
                 return True
         return False
 
-    def _is_on_main_map(self, screen) -> bool:
-        if not self._has_scene_templates():
-            return not self._is_search_panel_visible(screen)
-        return self._is_in_wilderness(screen) or self._is_in_town(screen)
-
     def _ensure_clean_ui(self) -> None:
         self._emit("清理界面…")
-        for attempt in range(UI_CLEANUP_ATTEMPTS):
-            if self._interrupted():
-                raise InterruptedError("任务已停止")
-            self._dismiss_dialog()
-            screen = self.adb.screenshot()
-            if not self._is_search_panel_visible(screen) and self._is_on_main_map(screen):
-                self._emit("界面已就绪")
-                time.sleep(0.5)
-                return
-            if self._is_search_panel_visible(screen):
-                self._back(1)
-            elif attempt < 2:
-                self._back(1)
-            else:
-                break
-            time.sleep(0.5)
-        self._emit("已尝试清理界面，继续执行")
+        if self._wilderness.return_to_wilderness():
+            self._emit("界面已就绪")
+        else:
+            self._emit("已尝试清理界面，继续执行")
 
     def _ensure_wilderness(self) -> None:
-        for attempt in range(10):
-            if self._interrupted():
-                raise InterruptedError("任务已停止")
-            screen = self.adb.screenshot()
-            if self._is_search_panel_visible(screen):
-                self._back(1)
-                time.sleep(0.5)
-                continue
-            if self._is_in_wilderness(screen):
-                return
-            if self._is_in_town(screen):
-                self._emit("当前在城镇，切换到野外…")
-                self._tap("world_map", delay=2.0)
-                continue
-            self._back(1)
-            time.sleep(0.5)
-        raise RuntimeError("无法进入野外地图")
+        self._wilderness.ensure_wilderness()
 
     def _open_search_panel(self) -> None:
         self._ensure_wilderness()
@@ -465,6 +416,7 @@ class AutoMiningTask:
                 succeeded.append(resource.label)
             else:
                 skipped.append(resource.label)
+        self._return_to_wilderness()
         return succeeded, skipped
 
     def run_once(self, *, force: bool = False) -> bool:
@@ -490,10 +442,10 @@ class AutoMiningTask:
             raise
         except MiningNotSupportedError as exc:
             self._emit(str(exc))
-            self._return_to_main()
+            self._return_to_wilderness()
             return False
         except Exception as exc:
             logger.exception(f"[{self.name}] 执行失败")
             self._emit(f"执行失败：{exc}")
-            self._return_to_main()
+            self._return_to_wilderness()
             return False

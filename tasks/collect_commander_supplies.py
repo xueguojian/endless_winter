@@ -2,26 +2,22 @@
 
 from __future__ import annotations
 
+import threading
 import time
-from pathlib import Path
 from typing import Callable
 
 from loguru import logger
 
 from core.adb_client import AdbClient
-from core.navigation import return_to_main_screen
+from core.navigation import WildernessNavigator
 
 StatusCallback = Callable[[str], None]
-
-TEMPLATE_DIR = Path(__file__).parent.parent / "assets" / "templates"
-BTN_TOWN_LABEL = "btn_town_label.png"
-BTN_WILDERNESS_LABEL = "btn_wilderness_label.png"
-MAIN_SCREEN_ENSURE_BACKS = 18
 
 DEFAULT_COORDS: dict[str, list[int]] = {
     "commander_open": [482, 76],
     "claim_first": [616, 288],
     "claim_second": [584, 818],
+    "dialog_cancel": [250, 780],
 }
 
 DEFAULT_STEP_DELAY = 1.5
@@ -38,7 +34,7 @@ def merge_task_config(cfg: dict) -> dict:
 
 
 class CollectCommanderSuppliesTask:
-    """主界面 → 统帅界面 → 两次领取操作 → 退回主界面。"""
+    """野外 → 统帅界面 → 两次领取 → 回野外。"""
 
     def __init__(
         self,
@@ -60,7 +56,9 @@ class CollectCommanderSuppliesTask:
         self.step_delay = merged["step_delay"]
         self.double_tap_delay = merged["double_tap_delay"]
         self.on_status = on_status
-        self._stop_requested = False
+        self._last_run = 0.0
+        self._stop_event = threading.Event()
+        self._wilderness = WildernessNavigator.from_task(self)
 
     @property
     def name(self) -> str:
@@ -72,31 +70,24 @@ class CollectCommanderSuppliesTask:
             self.on_status(message)
 
     def stop(self) -> None:
-        self._stop_requested = True
+        self._stop_event.set()
+
+    def reset_stop(self) -> None:
+        self._stop_event.clear()
+
+    def _interrupted(self) -> bool:
+        return self._stop_event.is_set()
 
     def _check_stop(self) -> None:
-        if self._stop_requested:
+        if self._stop_event.is_set():
             raise InterruptedError("任务已停止")
 
-    def _has_scene_templates(self) -> bool:
-        return (TEMPLATE_DIR / BTN_TOWN_LABEL).is_file() or (
-            TEMPLATE_DIR / BTN_WILDERNESS_LABEL
-        ).is_file()
+    def _ensure_wilderness(self) -> None:
+        self._emit("确保在野外主界面…")
+        self._wilderness.ensure_wilderness()
 
-    def _ensure_main_screen(self) -> None:
-        self._emit("返回主界面…")
-        if self._has_scene_templates():
-            return_to_main_screen(self.adb, on_status=self.on_status)
-            self._emit("已确认在主界面")
-            time.sleep(0.8)
-            return
-
-        for _ in range(MAIN_SCREEN_ENSURE_BACKS):
-            self._check_stop()
-            self.adb.back()
-            time.sleep(0.55)
-        time.sleep(1.0)
-        self._emit("已返回主界面，准备开始领取")
+    def _return_to_wilderness(self) -> None:
+        self._wilderness.try_return_to_wilderness()
 
     def _tap(self, key: str, delay: float | None = None) -> None:
         self._check_stop()
@@ -114,9 +105,8 @@ class CollectCommanderSuppliesTask:
         self._tap(key, delay=self.step_delay)
 
     def execute(self) -> None:
-        """打开统帅界面 → 领取物资 → 结束。"""
-        self._stop_requested = False
-        self._ensure_main_screen()
+        """野外 → 统帅界面 → 领取物资。"""
+        self._ensure_wilderness()
 
         self._emit("打开统帅界面")
         self._tap("commander_open", delay=2.0)
@@ -128,3 +118,20 @@ class CollectCommanderSuppliesTask:
 
         self._tap_twice("claim_second")
         self._emit("领取完成")
+
+    def run_once(self, *, force: bool = False) -> bool:
+        _ = force
+        self._stop_event.clear()
+        try:
+            self.execute()
+            self._return_to_wilderness()
+            self._emit("已回到野外")
+            return True
+        except InterruptedError:
+            self._emit("任务已停止")
+            raise
+        except Exception as exc:
+            logger.exception(f"[{self.name}] 执行失败")
+            self._emit(f"执行失败：{exc}")
+            self._return_to_wilderness()
+            return False

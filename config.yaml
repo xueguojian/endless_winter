@@ -241,11 +241,13 @@ tasks:
     use_stamina: false
     monster_cooldown: 60
     step_delay: 1.5
-    match_threshold: 0.55
     coords:
       lighthouse_open:
       - 666
       - 862
+      view_immediately:
+      - 354
+      - 908
       mission_confirm_1:
       - 354
       - 908

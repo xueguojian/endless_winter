@@ -5,19 +5,14 @@ from __future__ import annotations
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Callable
 
 from loguru import logger
 
 from core.adb_client import AdbClient
-from core.navigation import return_to_main_screen
+from core.navigation import WildernessNavigator
 
 StatusCallback = Callable[[str], None]
-
-TEMPLATE_DIR = Path(__file__).parent.parent / "assets" / "templates"
-BTN_TOWN_LABEL = "btn_town_label.png"
-BTN_WILDERNESS_LABEL = "btn_wilderness_label.png"
 
 # 720×1280 竖屏固定坐标
 DEFAULT_COORDS: dict[str, list[int]] = {
@@ -26,12 +21,12 @@ DEFAULT_COORDS: dict[str, list[int]] = {
     "perpetual_tech": [350, 1040],  # 联盟科技页「联盟永续」
     "donate_btn": [510, 1040],      # 捐献弹窗右下角蓝色「捐献」按钮（生肉 10000）
     "popup_close": [660, 195],      # 捐献弹窗右上角关闭
+    "dialog_cancel": [250, 780],
 }
 
 DEFAULT_STEP_DELAY = 1.5
 DEFAULT_DONATE_TIMES = 25
 DEFAULT_DONATE_CLICK_DELAY = 0.35
-MAIN_SCREEN_ENSURE_BACKS = 18
 
 
 def merge_task_config(cfg: dict) -> dict:
@@ -48,7 +43,7 @@ def merge_task_config(cfg: dict) -> dict:
 
 
 class DonateAllianceSuppliesTask:
-    """主界面 → 联盟 → 联盟科技 → 联盟永续 → 捐献 25 次。"""
+    """野外 → 联盟 → 联盟科技 → 联盟永续 → 捐献 N 次 → 回野外。"""
 
     def __init__(
         self,
@@ -79,6 +74,7 @@ class DonateAllianceSuppliesTask:
         self.on_status = on_status
         self._last_run = 0.0
         self._stop_event = threading.Event()
+        self._wilderness = WildernessNavigator.from_task(self)
 
     @property
     def name(self) -> str:
@@ -120,39 +116,16 @@ class DonateAllianceSuppliesTask:
             self.adb.back()
             time.sleep(0.5)
 
-    def _has_scene_templates(self) -> bool:
-        return (TEMPLATE_DIR / BTN_TOWN_LABEL).is_file() or (
-            TEMPLATE_DIR / BTN_WILDERNESS_LABEL
-        ).is_file()
+    def _ensure_wilderness(self) -> None:
+        self._emit("确保在野外主界面…")
+        self._wilderness.ensure_wilderness()
 
-    def _ensure_main_screen(self) -> None:
-        """确保回到城镇/野外主界面后再开始捐献流程。"""
-        self._emit("返回主界面…")
-
-        if self._has_scene_templates():
-            return_to_main_screen(self.adb, on_status=self.on_status)
-            self._emit("已确认在主界面")
-            time.sleep(0.8)
-            return
-
-        for i in range(MAIN_SCREEN_ENSURE_BACKS):
-            if self._interrupted():
-                raise InterruptedError("任务已停止")
-            self.adb.back()
-            time.sleep(0.55)
-
-        time.sleep(1.0)
-        self._emit("已返回主界面，准备开始捐献")
-
-    def _return_to_main(self) -> None:
-        try:
-            return_to_main_screen(self.adb, on_status=self.on_status)
-        except Exception as exc:
-            logger.warning(f"[{self.name}] 返回主界面失败: {exc}")
+    def _return_to_wilderness(self) -> None:
+        self._wilderness.try_return_to_wilderness()
 
     def run_donate_cycle(self) -> None:
-        """主界面 → 联盟 → 联盟科技 → 联盟永续 → 捐献 N 次 → 退回主界面。"""
-        self._ensure_main_screen()
+        """野外 → 联盟 → 联盟科技 → 联盟永续 → 捐献 N 次 → 回野外。"""
+        self._ensure_wilderness()
 
         self._emit("打开联盟")
         self._tap("alliance_open", delay=2.5)
@@ -182,8 +155,8 @@ class DonateAllianceSuppliesTask:
         else:
             self._back()
 
-        self._return_to_main()
-        self._emit("捐献完成，已退回主界面")
+        self._return_to_wilderness()
+        self._emit("捐献完成，已回到野外")
 
     def run_once(self, *, force: bool = False) -> bool:
         if not force and not self.should_run():
@@ -200,5 +173,5 @@ class DonateAllianceSuppliesTask:
         except Exception as exc:
             logger.exception(f"[{self.name}] 执行失败")
             self._emit(f"执行失败：{exc}")
-            self._return_to_main()
+            self._return_to_wilderness()
             return False
