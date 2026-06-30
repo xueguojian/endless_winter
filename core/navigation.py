@@ -20,6 +20,7 @@ SEARCH_TEMPLATES = ("beast_tab.png", "search_confirm_btn.png")
 
 MAX_ATTEMPTS = 20
 WILDERNESS_NAV_MAX_ATTEMPTS = 25
+TOWN_NAV_MAX_ATTEMPTS = 25
 FALLBACK_BACKS = 18
 SCENE_THRESHOLD = 0.70
 BACK_STEP_DELAY = 0.55
@@ -273,6 +274,123 @@ def return_to_wilderness_screen(
     return False
 
 
+def return_to_town_screen(
+    adb: AdbClient,
+    *,
+    vision: Vision | None = None,
+    dialog_cancel: tuple[int, int] | None = None,
+    on_status: Callable[[str], None] | None = None,
+    interrupted: Callable[[], bool] | None = None,
+    is_lighthouse_intel: Callable[[np.ndarray], bool] | None = None,
+    is_deploy_screen: Callable[[np.ndarray], bool] | None = None,
+    is_overlay_open: Callable[[np.ndarray], bool] | None = None,
+    max_attempts: int = TOWN_NAV_MAX_ATTEMPTS,
+) -> bool:
+    """状态机式返回城镇主界面（右下角出现「野外」按钮）。
+
+    已在城镇子界面（兵营、状态面板等）时逐步返回，不绕道野外；
+    若当前在野外则点击右下角「城镇」进入。
+    """
+    vision = _get_vision(vision)
+
+    if not _has_scene_templates():
+        logger.debug("未找到场景模板，使用固定次数返回")
+        for _ in range(FALLBACK_BACKS):
+            if interrupted and interrupted():
+                raise InterruptedError("任务已停止")
+            adb.back()
+            time.sleep(BACK_STEP_DELAY)
+        if on_status:
+            on_status("已尝试返回城镇（未确认场景）")
+        return False
+
+    saw_main_map = False
+
+    for attempt in range(max_attempts):
+        if interrupted and interrupted():
+            raise InterruptedError("任务已停止")
+
+        screen = adb.screenshot()
+
+        if is_in_town(vision, screen):
+            if on_status:
+                on_status("已在城镇")
+            return True
+
+        if is_in_wilderness(vision, screen):
+            saw_main_map = True
+            if on_status:
+                on_status("当前在野外，切换到城镇…")
+            if _tap_town_switch(adb, vision, screen):
+                continue
+            logger.warning("未能点击城镇切换按钮")
+            adb.back()
+            time.sleep(BACK_STEP_DELAY)
+            continue
+
+        if saw_main_map:
+            if _maybe_recover_exit_dialog(
+                adb,
+                vision,
+                screen,
+                dialog_cancel,
+                is_lighthouse_intel=is_lighthouse_intel,
+                is_deploy_screen=is_deploy_screen,
+                is_overlay_open=is_overlay_open,
+            ):
+                saw_main_map = False
+                continue
+
+        saw_main_map = False
+
+        if is_overlay_open and is_overlay_open(screen):
+            adb.back()
+            time.sleep(BACK_STEP_DELAY)
+            continue
+
+        if is_deploy_screen and is_deploy_screen(screen):
+            adb.back()
+            time.sleep(BACK_STEP_DELAY)
+            continue
+
+        if is_lighthouse_intel and is_lighthouse_intel(screen):
+            adb.back()
+            time.sleep(BACK_STEP_DELAY)
+            continue
+
+        if _overlay_open(vision, screen):
+            adb.back()
+            time.sleep(BACK_STEP_DELAY)
+            continue
+
+        adb.back()
+        time.sleep(BACK_STEP_DELAY)
+
+        screen_after = adb.screenshot()
+        if is_in_town(vision, screen_after):
+            if on_status:
+                on_status("已在城镇")
+            return True
+        if is_in_wilderness(vision, screen_after):
+            saw_main_map = True
+            continue
+
+        _maybe_recover_exit_dialog(
+            adb,
+            vision,
+            screen_after,
+            dialog_cancel,
+            is_lighthouse_intel=is_lighthouse_intel,
+            is_deploy_screen=is_deploy_screen,
+            is_overlay_open=is_overlay_open,
+        )
+
+    if on_status:
+        on_status("已尝试返回城镇（未确认场景）")
+    logger.warning("return_to_town_screen: 未能在限定步数内确认城镇")
+    return False
+
+
 def switch_to_town_screen(
     adb: AdbClient,
     *,
@@ -280,41 +398,23 @@ def switch_to_town_screen(
     dialog_cancel: tuple[int, int] | None = None,
     on_status: Callable[[str], None] | None = None,
     interrupted: Callable[[], bool] | None = None,
+    is_lighthouse_intel: Callable[[np.ndarray], bool] | None = None,
+    is_deploy_screen: Callable[[np.ndarray], bool] | None = None,
+    is_overlay_open: Callable[[np.ndarray], bool] | None = None,
     max_attempts: int = TOWN_SWITCH_MAX_ATTEMPTS,
 ) -> bool:
-    """确保处于城镇主界面（右下角出现「野外」按钮）。通常先回到野外再点「城镇」。"""
-    vision = _get_vision(vision)
-
-    for _ in range(max_attempts):
-        if interrupted and interrupted():
-            raise InterruptedError("任务已停止")
-
-        screen = adb.screenshot()
-        if is_in_town(vision, screen):
-            if on_status:
-                on_status("已在城镇")
-            return True
-
-        if is_in_wilderness(vision, screen):
-            if on_status:
-                on_status("当前在野外，切换到城镇…")
-            if _tap_town_switch(adb, vision, screen):
-                continue
-            logger.warning("未能点击城镇切换按钮")
-
-        if not return_to_wilderness_screen(
-            adb,
-            vision=vision,
-            dialog_cancel=dialog_cancel,
-            on_status=on_status,
-            interrupted=interrupted,
-            max_attempts=10,
-        ):
-            adb.back()
-            time.sleep(BACK_STEP_DELAY)
-
-    logger.warning("switch_to_town_screen: 未能在限定步数内确认城镇")
-    return False
+    """确保处于城镇主界面（右下角出现「野外」按钮）。"""
+    return return_to_town_screen(
+        adb,
+        vision=vision,
+        dialog_cancel=dialog_cancel,
+        on_status=on_status,
+        interrupted=interrupted,
+        is_lighthouse_intel=is_lighthouse_intel,
+        is_deploy_screen=is_deploy_screen,
+        is_overlay_open=is_overlay_open,
+        max_attempts=max_attempts,
+    )
 
 
 class WildernessNavigator:
@@ -389,15 +489,22 @@ class WildernessNavigator:
         except Exception as exc:
             logger.warning(f"返回野外失败: {exc}")
 
+    def return_to_town(self) -> bool:
+        return return_to_town_screen(self.adb, **self._kwargs())
+
+    def ensure_town(self) -> None:
+        if not self.return_to_town():
+            raise RuntimeError("无法进入城镇主界面")
+
+    def try_return_to_town(self) -> None:
+        try:
+            if not self.return_to_town():
+                logger.warning("未能确认已回到城镇")
+        except Exception as exc:
+            logger.warning(f"返回城镇失败: {exc}")
+
     def switch_to_town(self) -> None:
-        if not switch_to_town_screen(
-            self.adb,
-            vision=self.vision,
-            dialog_cancel=self.dialog_cancel,
-            on_status=self.on_status,
-            interrupted=self.interrupted,
-        ):
-            raise RuntimeError("无法进入城镇")
+        self.ensure_town()
 
 
 def return_to_main_screen(

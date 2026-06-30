@@ -29,6 +29,9 @@ echo [2/2] Installing packages (may take a few minutes)...
 if errorlevel 1 goto :pip_fail
 
 echo.
+echo Optional: network capture (mitmproxy)
+echo   .venv\Scripts\pip.exe install -r requirements-network.txt
+echo.
 echo ========================================
 echo   Setup complete
 echo ========================================

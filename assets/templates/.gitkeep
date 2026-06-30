@@ -7,7 +7,7 @@
 #   ice_beast_tab.png, ice_beast_tab_selected.png,
 #   level_minus_btn.png, level_plus_btn.png
 #
-# lighthouse/：lighthouse_map_bg.png, mission_btn_*.png, bounty_*,
+# lighthouse/：lighthouse_map_bg.png（平常）, lighthouse_map_bg_1.png（活动）, mission_btn_*.png, bounty_*,
 #   monster_keyword_level, beast_keyword_hao
 # training/：train_ready_btn.png, train_ready_collect.png
 # mining/：mining_hero_{meat,wood,coal,iron}_face.png

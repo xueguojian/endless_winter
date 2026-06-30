@@ -181,6 +181,7 @@ class EndlessWinterApp(tk.Tk):
             _normalize_formation_slot(self.var_lighthouse_formation_slot.get())
         )
         lighthouse["use_stamina"] = bool(self.var_lighthouse_use_stamina.get())
+        lighthouse["event_period"] = bool(self.var_lighthouse_event_period.get())
         lighthouse["monster_cooldown"] = int(self.var_lighthouse_monster_cooldown.get()) * 60
         merged_lighthouse = merge_lighthouse_config(lighthouse)
         lighthouse["step_delay"] = merged_lighthouse["step_delay"]
@@ -441,6 +442,9 @@ class EndlessWinterApp(tk.Tk):
         self.var_lighthouse_use_stamina = tk.BooleanVar(
             value=bool(lighthouse_cfg.get("use_stamina", True))
         )
+        self.var_lighthouse_event_period = tk.BooleanVar(
+            value=bool(lighthouse_cfg.get("event_period", False))
+        )
         self.var_lighthouse_monster_cooldown = tk.IntVar(
             value=max(1, int(lighthouse_cfg.get("monster_cooldown", 120) // 60))
         )
@@ -582,6 +586,14 @@ class EndlessWinterApp(tk.Tk):
         ttk.Label(tab_lighthouse, text="出征后冷却，期间可打帐篷/英雄之旅", font=("", 8)).grid(
             row=row, column=2, sticky=tk.W, padx=6
         )
+        row += 1
+
+        ttk.Checkbutton(
+            tab_lighthouse,
+            text="活动期间（使用含红色晶簇的活动背景图扫描）",
+            variable=self.var_lighthouse_event_period,
+            command=self._save_config,
+        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
         row += 1
 
         ttk.Checkbutton(
@@ -985,6 +997,7 @@ class EndlessWinterApp(tk.Tk):
                 _normalize_formation_slot(self.var_lighthouse_formation_slot.get())
             ),
             use_stamina=bool(self.var_lighthouse_use_stamina.get()),
+            event_period=bool(self.var_lighthouse_event_period.get()),
             monster_cooldown=float(self.var_lighthouse_monster_cooldown.get() * 60),
             step_delay=merged["step_delay"],
             on_status=self._on_status,

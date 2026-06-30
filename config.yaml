@@ -236,6 +236,7 @@ tasks:
       - 566
   auto_lighthouse:
     enabled: false
+    event_period: false
     interval: 28800
     formation_slot: 8
     use_stamina: false
@@ -266,3 +267,24 @@ tasks:
       mission_confirm_1_beast:
       - 354
       - 886
+network:
+  capture_dir: assets/captures
+  session_file: assets/captures/session.json
+  proxy:
+    listen_host: 0.0.0.0
+    listen_port: 8080
+  capture:
+    include_hosts: []
+    exclude_hosts:
+      - google
+      - gstatic
+      - googleapis
+      - facebook
+      - crashlytics
+      - firebase
+    save_response: true
+    max_body_bytes: 1048576
+  client:
+    timeout: 30.0
+    verify_ssl: true
+    proxy_url: null

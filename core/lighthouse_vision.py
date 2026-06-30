@@ -13,13 +13,16 @@ import numpy as np
 from core.coords import PORTRAIT_HEIGHT, PORTRAIT_WIDTH
 from loguru import logger
 
-from core.vision import MatchResult
+from core.vision import MatchResult, Vision
 
 TEMPLATE_DIR = Path(__file__).parent.parent / "assets" / "templates"
 
 # 情报页中间地图区域，排除顶部刷新条与底部等级栏
 LIGHTHOUSE_SCAN_ROI = (20, 130, 700, 1020)
-LIGHTHOUSE_MAP_BG_NAME = "lighthouse/lighthouse_map_bg.png"
+# 情报页背景：平常 / 活动期间（含红色晶簇）
+LIGHTHOUSE_MAP_BG_NORMAL = "lighthouse/lighthouse_map_bg.png"
+LIGHTHOUSE_MAP_BG_EVENT = "lighthouse/lighthouse_map_bg_1.png"
+_active_map_bg_name: str = LIGHTHOUSE_MAP_BG_NORMAL
 # 情报页顶部刷新条，用于区分「情报页」与「野外大地图」
 LIGHTHOUSE_HEADER_ROI = (0, 155, 720, 210)
 LIGHTHOUSE_HEADER_MEAN_DIFF_MAX = 18.0
@@ -94,6 +97,9 @@ MONSTER_LEVEL_MAX_MATCH_X_RATIO = 0.12
 BEAST_HAO_SUBTITLE_MIN = 0.78
 BEAST_HAO_SEARCH_WIDTH_RATIO = 0.30
 BEAST_HAO_MIN_MATCH_X_RATIO = 0.70
+BEAST_PIN_TEMPLATE = "lighthouse/small_monster_beast.png"
+BEAST_PIN_MATCH_MIN = 0.48
+SKIP_MISSION_KINDS = frozenset({"small_monster_beast"})
 MISSION_DETAIL_BTN_THRESHOLD = 0.65
 MISSION_DETAIL_BTN_ACCEPT_SCORE = 0.60
 MISSION_DETAIL_BTN_MIN_MARGIN = 0.04
@@ -147,6 +153,7 @@ class LighthouseScanResult:
 
 _MAP_BG_ROI: np.ndarray | None = None
 _MAP_BG_SCREEN: np.ndarray | None = None
+_event_period: bool = False
 _scan_interrupt_cb: Callable[[], bool] | None = None
 
 
@@ -1294,36 +1301,21 @@ def _classify_march_subtitle(
             confidence=bounty_conf,
         )
 
-    is_level, level_conf = _subtitle_is_level_monster(
-        screen, subtitle_roi=subtitle_roi, template_dir=template_dir
-    )
-    if is_level:
-        return None
-
     is_hao, hao_conf = _subtitle_is_beast_number(
         screen, subtitle_roi=subtitle_roi, template_dir=template_dir
     )
-    # 「等级」靠左且已有一定匹配度时，忽略右侧「号」误匹配（如 大角鹿 的 角/鹿）
-    if is_hao and level_conf >= 0.45:
-        x1, _y1, x2, _y2 = subtitle_roi
-        level_left = _match_subtitle_template(
-            screen,
-            MONSTER_KEYWORD_LEVEL,
-            subtitle_roi,
-            template_dir=template_dir,
-            threshold=0.0,
-            scales=BOUNTY_SUBTITLE_SCALES,
-            search_side="left",
-        )
-        rel_x = level_left.top_left[0] - x1 if level_left.top_left != (0, 0) else 999
-        max_left_x = int((x2 - x1) * MONSTER_LEVEL_MAX_MATCH_X_RATIO)
-        if rel_x <= max_left_x:
+    is_level, level_conf = _subtitle_is_level_monster(
+        screen, subtitle_roi=subtitle_roi, template_dir=template_dir
+    )
+
+    if is_hao:
+        # 仅当左侧「等级」明确匹配时，才忽略右侧「号」误匹配（如大角鹿）
+        if is_level:
             logger.info(
-                f"左侧已有「等级」匹配（conf={level_conf:.2f} rel_x={rel_x}），"
-                f"忽略右侧「号」误匹配 conf={hao_conf:.2f}"
+                f"左侧「等级」明确（conf={level_conf:.2f}），"
+                f"忽略右侧「号」误匹配 conf={hao_conf:.2f}，视为灯塔小怪"
             )
             return None
-    if is_hao:
         logger.info(f"副标题右侧含「号」，识别为特殊大怪（conf={hao_conf:.2f}）")
         return MissionDetailClassification(
             kind="beast_skip",
@@ -1331,6 +1323,9 @@ def _classify_march_subtitle(
             confidence=max(base_confidence, hao_conf),
             beast_explicit=True,
         )
+
+    if is_level:
+        return None
 
     logger.info(
         f"出征副标题非悬赏、无「等级」、无「号」（bounty={bounty_conf:.2f} "
@@ -1491,6 +1486,95 @@ def classify_mission_detail_screen(
         confidence=resolved_conf,
         action_center=action_center,
     )
+def configure_lighthouse_scan(*, event_period: bool = False) -> str:
+    """按是否活动期间切换差分背景图，切换时清空缓存。"""
+    global _active_map_bg_name, _MAP_BG_SCREEN, _MAP_BG_ROI, _event_period
+    desired = LIGHTHOUSE_MAP_BG_EVENT if event_period else LIGHTHOUSE_MAP_BG_NORMAL
+    _event_period = event_period
+    if desired != _active_map_bg_name:
+        _active_map_bg_name = desired
+        _MAP_BG_SCREEN = None
+        _MAP_BG_ROI = None
+    logger.info(f"灯塔扫描背景图: {_active_map_bg_name}")
+    return _active_map_bg_name
+
+
+def _is_event_period() -> bool:
+    return _event_period
+
+
+def _extract_pin_patch(
+    roi: np.ndarray,
+    screen_center: tuple[int, int],
+    roi_offset: tuple[int, int],
+    *,
+    half: int = LIGHTHOUSE_PIN_PATCH_HALF,
+) -> np.ndarray:
+    cx = screen_center[0] - roi_offset[0]
+    cy = screen_center[1] - roi_offset[1]
+    x1 = max(0, cx - half)
+    y1 = max(0, cy - half)
+    x2 = min(roi.shape[1], cx + half)
+    y2 = min(roi.shape[0], cy + half)
+    return roi[y1:y2, x1:x2]
+
+
+def is_beast_map_pin(
+    screen: np.ndarray,
+    center: tuple[int, int],
+    *,
+    scan_roi: tuple[int, int, int, int] = LIGHTHOUSE_SCAN_ROI,
+) -> MatchResult:
+    """地图图钉位置是否匹配特殊大怪（熊头/兽形橙钉）模板。"""
+    screen = _normalize_screen_for_scan(screen)
+    x1, y1, x2, y2 = scan_roi
+    roi = screen[y1:y2, x1:x2]
+    patch = _extract_pin_patch(roi, center, (x1, y1))
+    if patch.size == 0:
+        return MatchResult(found=False)
+    template_path = TEMPLATE_DIR / BEAST_PIN_TEMPLATE
+    if not template_path.is_file():
+        return MatchResult(found=False)
+    vision = Vision(TEMPLATE_DIR, threshold=BEAST_PIN_MATCH_MIN)
+    result = vision.match_template_multiscale(patch, BEAST_PIN_TEMPLATE)
+    if result.found:
+        logger.debug(
+            f"地图图钉 ({center[0]},{center[1]}) 匹配特殊大怪 "
+            f"conf={result.confidence:.2f}"
+        )
+    return result
+
+
+def tag_scanned_missions(
+    screen: np.ndarray,
+    missions: tuple[LighthouseMission, ...],
+    *,
+    scan_roi: tuple[int, int, int, int] = LIGHTHOUSE_SCAN_ROI,
+) -> tuple[LighthouseMission, ...]:
+    """扫描后补类型：标记特殊大怪图钉，供任务层跳过。"""
+    if not missions:
+        return missions
+
+    tagged: list[LighthouseMission] = []
+    for mission in missions:
+        beast = is_beast_map_pin(screen, mission.center, scan_roi=scan_roi)
+        if beast.found:
+            tagged.append(
+                LighthouseMission(
+                    kind="small_monster_beast",
+                    label="特殊大怪",
+                    template=BEAST_PIN_TEMPLATE,
+                    center=mission.center,
+                    confidence=beast.confidence,
+                    top_left=mission.top_left,
+                    size=mission.size,
+                )
+            )
+        else:
+            tagged.append(mission)
+    return tuple(tagged)
+
+
 def scan_mission_icons(
     screen: np.ndarray,
     *,
@@ -1519,7 +1603,7 @@ def _load_map_background_screen() -> np.ndarray | None:
     if _MAP_BG_SCREEN is not None:
         return _MAP_BG_SCREEN
 
-    path = TEMPLATE_DIR / LIGHTHOUSE_MAP_BG_NAME
+    path = TEMPLATE_DIR / _active_map_bg_name
     image = cv2.imread(str(path))
     if image is None:
         logger.warning(f"灯塔地图背景缺失: {path}")
@@ -1892,7 +1976,7 @@ def _scan_icons_impl(
     bg_roi = _load_map_background_roi()
     if bg_roi is None:
         logger.error(
-            f"缺少灯塔背景图 {LIGHTHOUSE_MAP_BG_NAME}，无法扫描任务图标"
+            f"缺少灯塔背景图 {_active_map_bg_name}，无法扫描任务图标"
         )
         return LighthouseScanResult(mission=None)
 

@@ -17,10 +17,13 @@ from core.lighthouse_vision import (
     LIGHTHOUSE_SCAN_ROI,
     LighthouseMission,
     MissionDetailClassification,
+    SKIP_MISSION_KINDS,
     classify_mission_detail_screen,
+    configure_lighthouse_scan,
     is_lighthouse_intel_screen,
     save_mission_detail_debug,
     scan_mission_icons,
+    tag_scanned_missions,
 )
 from core.navigation import (
     WildernessNavigator,
@@ -67,6 +70,7 @@ def merge_task_config(cfg: dict) -> dict:
         "step_delay": cfg.get("step_delay", DEFAULT_STEP_DELAY),
         "coords": coords,
         "monster_cooldown": float(cfg.get("monster_cooldown", DEFAULT_MONSTER_COOLDOWN)),
+        "event_period": bool(cfg.get("event_period", False)),
     }
 
 
@@ -82,6 +86,7 @@ class AutoLighthouseTask:
         use_stamina: bool = True,
         step_delay: float = DEFAULT_STEP_DELAY,
         monster_cooldown: float = DEFAULT_MONSTER_COOLDOWN,
+        event_period: bool = False,
         on_status: StatusCallback | None = None,
     ):
         merged = merge_task_config(
@@ -89,6 +94,7 @@ class AutoLighthouseTask:
                 "coords": coords or {},
                 "step_delay": step_delay,
                 "monster_cooldown": monster_cooldown,
+                "event_period": event_period,
             }
         )
         self.adb = adb
@@ -98,6 +104,7 @@ class AutoLighthouseTask:
         self.use_stamina = use_stamina
         self.step_delay = merged["step_delay"]
         self.monster_cooldown = merged["monster_cooldown"]
+        self.event_period = merged["event_period"]
         self.on_status = on_status
         self._last_run = 0.0
         self._last_monster_dispatch_at = 0.0
@@ -120,6 +127,7 @@ class AutoLighthouseTask:
             is_lighthouse_intel=is_lighthouse_intel_screen,
             is_deploy_screen=self._deploy.is_deploy_screen,
         )
+        configure_lighthouse_scan(event_period=self.event_period)
 
     @property
     def name(self) -> str:
@@ -311,6 +319,14 @@ class AutoLighthouseTask:
         if not missions:
             return None
         for mission in missions:
+            if mission.kind in SKIP_MISSION_KINDS:
+                logger.debug(
+                    f"[{self.name}] 跳过特殊大怪 "
+                    f"({mission.center[0]},{mission.center[1]}) "
+                    f"conf={mission.confidence:.2f}"
+                )
+                self._mark_skipped_center(mission.center)
+                continue
             if self._is_skipped_center(mission.center):
                 logger.debug(
                     f"[{self.name}] 跳过已标记不处理坐标 "
@@ -355,8 +371,24 @@ class AutoLighthouseTask:
         self._emit("扫描任务图标…")
         result = self._scan_missions(screen)
         if result.missions:
+            missions = tag_scanned_missions(screen, result.missions)
+            if any(m.kind in SKIP_MISSION_KINDS for m in missions):
+                beast_count = sum(
+                    1 for m in missions if m.kind in SKIP_MISSION_KINDS
+                )
+                self._emit(f"扫描识别到 {beast_count} 个特殊大怪，将自动跳过")
+            result = type(result)(
+                mission=next(
+                    (m for m in missions if m.kind not in SKIP_MISSION_KINDS),
+                    missions[0] if missions else None,
+                ),
+                missions=missions,
+                best_confidence=result.best_confidence,
+                best_label=result.best_label,
+                candidate_locations=result.candidate_locations,
+            )
             logger.debug(
-                f"[{self.name}] 扫描结果: {self._format_missions_summary(result.missions)}"
+                f"[{self.name}] 扫描结果: {self._format_missions_summary(missions)}"
             )
         return screen, result
 
@@ -565,7 +597,7 @@ class AutoLighthouseTask:
                 self._back_from_detail_page()
                 continue
 
-            if detail.kind == "beast_skip":
+            if detail.kind == "beast_skip" or tap_target.kind in SKIP_MISSION_KINDS:
                 self._emit("特殊大怪，跳过不打")
                 self._mark_skipped_center(tap_target.center)
                 self._back_from_detail_page()
@@ -608,6 +640,7 @@ class AutoLighthouseTask:
 
     def run_once(self, *, force: bool = False) -> bool:
         _ = force
+        configure_lighthouse_scan(event_period=self.event_period)
         self._last_run = time.time()
         try:
             count = self.run_lighthouse_cycle()

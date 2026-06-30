@@ -367,10 +367,10 @@ class AutoMiningTask:
         self._emit(f"{resource.label}采矿英雄匹配成功")
 
     def _configure_mining_heroes(self, resource: MiningResource) -> None:
+        self._verify_mining_hero(resource)
         self._emit("移除第 2、3 位英雄")
         self._tap("hero_remove_2", delay=0.8)
         self._tap("hero_remove_3", delay=0.8)
-        self._verify_mining_hero(resource)
 
     def _tap_march(self) -> None:
         self._emit("出征")

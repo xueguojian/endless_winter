@@ -137,11 +137,9 @@ class AutoTrainTroopsTask:
             self.adb.back()
             time.sleep(0.5)
 
-    def _ensure_main_town(self) -> None:
-        self._emit("确保从野外进入城镇…")
-        self._wilderness.ensure_wilderness()
-        self._wilderness.switch_to_town()
-        self._emit("已在城镇主界面")
+    def _ensure_town(self) -> None:
+        self._emit("确保在城镇主界面…")
+        self._wilderness.ensure_town()
         time.sleep(0.5)
 
     def _return_to_wilderness(self) -> None:
@@ -247,7 +245,7 @@ class AutoTrainTroopsTask:
                 f"第 {attempt_count}/{self.max_cycle_attempts} 次识别扫描"
             )
 
-            self._ensure_main_town()
+            self._ensure_town()
             self._emit("打开城镇状态面板")
             self._tap("status_open", delay=1.5)
 
@@ -266,8 +264,7 @@ class AutoTrainTroopsTask:
 
             trained_count += 1
             self._emit(f"已完成第 {trained_count} 项练兵")
-            self._return_to_wilderness()
-            self._ensure_main_town()
+            self._ensure_town()
 
         self._return_to_wilderness()
         return trained_count

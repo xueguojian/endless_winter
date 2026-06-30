@@ -1,0 +1,2 @@
+# 抓包代理（可选，仅在使用 tools/run_mitm_proxy.py 时需要）
+mitmproxy>=10.0.0

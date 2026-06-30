@@ -14,6 +14,8 @@ logs/
 temp/
 assets/debug/*
 !assets/debug/.gitkeep
+assets/captures/*
+!assets/captures/.gitkeep
 assets/debug_patches/
 assets/debug_roi/
 assets/flow/*.png
