@@ -24,8 +24,20 @@ _FORBIDDEN_FUZZY: frozenset[tuple[str, str]] = frozenset(
         ("梯子", "瞭望塔"),
         ("灯塔", "梯子"),
         ("瞭望塔", "梯子"),
+        ("X", "弓"),
+        ("弓", "X"),
     }
 )
+
+
+def _script_kind(text: str) -> str:
+    if not text:
+        return ""
+    if all(c.isascii() for c in text):
+        return "ascii"
+    if all("\u4e00" <= c <= "\u9fff" for c in text):
+        return "cjk"
+    return "mixed"
 
 
 def _is_valid_item_name(name: str) -> bool:
@@ -220,15 +232,24 @@ def _match_key_score(normalized: str, key: str) -> float:
     if normalized == nk:
         return 1.0
 
+    norm_script = _script_kind(normalized)
+    key_script = _script_kind(nk)
+    if norm_script and key_script and norm_script != key_script:
+        return 0.0
+
     ratio = SequenceMatcher(None, normalized, nk).ratio()
     best = ratio
 
     if len(normalized) == len(nk):
-        diffs = sum(a != b for a, b in zip(normalized, nk))
-        if diffs == 1:
-            best = max(best, 0.86)
-        elif diffs == 2 and len(nk) <= 4:
-            best = max(best, 0.72)
+        if len(normalized) == 1:
+            # 单字不能靠「差一字给 0.86」硬凑（否则 销/琐 会误匹配 X）
+            best = ratio
+        else:
+            diffs = sum(a != b for a, b in zip(normalized, nk))
+            if diffs == 1:
+                best = max(best, 0.86)
+            elif diffs == 2 and len(nk) <= 4:
+                best = max(best, 0.72)
     elif abs(len(normalized) - len(nk)) >= 2:
         # 长度差太多（如 灯塔 vs 单筒望远镜）时不靠 ratio 硬凑
         best = min(best, 0.55)

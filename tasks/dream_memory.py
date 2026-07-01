@@ -70,6 +70,7 @@ class DreamMemorySession:
             screen,
             self.config.target_slots,
             map_keys=self._map_keys(),
+            map_aliases=self.game_map.aliases,
             tesseract_cmd=self.config.tesseract_cmd,
             ocr_engine=self.config.ocr_engine,
             min_brightness=self.config.chip_active_min_brightness,

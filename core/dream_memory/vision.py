@@ -250,6 +250,7 @@ def read_target_chips(
     slots: tuple[tuple[int, int, int, int], ...] | None = None,
     *,
     map_keys: tuple[str, ...] | list[str] | None = None,
+    map_aliases: dict[str, str] | None = None,
     target_bar: tuple[int, int, int, int] | None = None,
     min_slots: int = 3,
     max_slots: int = 4,
@@ -284,11 +285,8 @@ def read_target_chips(
         from core.dream_memory.ocr_engine import resolve_ocr_engine
 
         if resolve_ocr_engine(ocr_engine) == "rapidocr" and sum(actives) >= 1:
-            from core.dream_memory.ocr_rapid import (
-                AMBIGUOUS_LABELS,
-                ocr_chip_rapid_robust,
-                ocr_slots_batch,
-            )
+            from core.dream_memory.label_resolve import resolve_chip_label
+            from core.dream_memory.ocr_rapid import ocr_chip_rapid_robust, ocr_slots_batch
 
             keys_set = set(map_keys)
             batch_labels = [("", "")] * len(patches)
@@ -296,29 +294,33 @@ def read_target_chips(
             active_patches = [patches[i] for i in active_indices]
             batch_texts = ocr_slots_batch(active_patches)
             for slot_index, raw_text in zip(active_indices, batch_texts):
-                ocr_text = raw_text
-                if ocr_text and ocr_text not in keys_set:
-                    fuzzy = fuzzy_match_map_key(
-                        ocr_text, map_keys, min_ratio=fuzzy_min_ratio
-                    )
-                    if fuzzy:
-                        name, score = fuzzy
-                        if name != ocr_text:
-                            logger.debug(
-                                f"槽位 {slot_index + 1} fuzzy"
-                                f"({ocr_text!r}->{name}, {score:.2f})"
-                            )
-                        ocr_text = name
-                if ocr_text in AMBIGUOUS_LABELS or (
-                    ocr_text and ocr_text not in keys_set
-                ):
-                    ocr_text = ocr_chip_rapid_robust(patches[slot_index], map_keys)
-                batch_labels[slot_index] = _label_from_ocr_text(
+                ocr_text = raw_text or ocr_chip_rapid_robust(
+                    patches[slot_index], map_keys
+                )
+                name, method = resolve_chip_label(
+                    patches[slot_index],
                     ocr_text,
                     map_keys,
-                    "rapidocr",
+                    map_aliases=map_aliases,
+                    refs_dir=refs_dir,
                     fuzzy_min_ratio=fuzzy_min_ratio,
+                    template_min_score=min(template_min_score, 0.75),
+                    template_min_margin=min(template_min_margin, 0.05),
                 )
+                if name not in keys_set and ocr_text:
+                    retry = ocr_chip_rapid_robust(patches[slot_index], map_keys)
+                    if retry and retry != ocr_text:
+                        name, method = resolve_chip_label(
+                            patches[slot_index],
+                            retry,
+                            map_keys,
+                            map_aliases=map_aliases,
+                            refs_dir=refs_dir,
+                            fuzzy_min_ratio=fuzzy_min_ratio,
+                            template_min_score=min(template_min_score, 0.75),
+                            template_min_margin=min(template_min_margin, 0.05),
+                        )
+                batch_labels[slot_index] = (name, method)
 
     for index, roi in enumerate(slots):
         patch = patches[index]
