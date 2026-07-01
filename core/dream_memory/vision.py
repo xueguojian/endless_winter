@@ -1,0 +1,369 @@
+"""寻梦记忆：底栏目标识别与坐标解析。"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import numpy as np
+from loguru import logger
+
+from core.dream_memory.chip_match import fuzzy_match_map_key
+from core.dream_memory.maps import DreamMemoryMap
+from core.dream_memory.ocr_engine import ocr_chip_text
+
+
+def normalize_item_name(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "").strip())
+
+
+@dataclass(frozen=True)
+class TargetChip:
+    slot_index: int
+    text: str
+    active: bool
+    roi: tuple[int, int, int, int]
+
+
+def _crop(screen: np.ndarray, roi: tuple[int, int, int, int]) -> np.ndarray:
+    x1, y1, x2, y2 = roi
+    h, w = screen.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return np.array([])
+    return screen[y1:y2, x1:x2]
+
+
+def chip_is_active(
+    chip_bgr: np.ndarray,
+    *,
+    min_brightness: float = 95.0,
+) -> bool:
+    """未找到的目标按钮较亮；已划线/变灰的跳过。"""
+    if chip_bgr.size == 0:
+        return False
+    gray = cv2.cvtColor(chip_bgr, cv2.COLOR_BGR2GRAY)
+    if float(gray.mean()) < min_brightness:
+        return False
+
+    # 检测中间横线（删除线）：中间带比上下带更暗
+    h = gray.shape[0]
+    if h >= 12:
+        band = max(2, h // 5)
+        mid_y = h // 2
+        mid = gray[mid_y - band : mid_y + band, :]
+        top = gray[max(0, mid_y - band * 3) : max(1, mid_y - band), :]
+        bottom = gray[min(h - 1, mid_y + band) : min(h, mid_y + band * 3), :]
+        if top.size and bottom.size and mid.size:
+            mid_mean = float(mid.mean())
+            surround = float(np.mean([top.mean(), bottom.mean()]))
+            if mid_mean + 12 < surround:
+                logger.debug(
+                    f"chip 中间横线检测 mid={mid_mean:.1f} surround={surround:.1f}"
+                )
+                return False
+    return True
+
+
+def _label_from_ocr_text(
+    ocr_text: str,
+    map_keys: tuple[str, ...] | list[str],
+    engine_name: str,
+    *,
+    fuzzy_min_ratio: float = 0.72,
+) -> tuple[str, str]:
+    keys_set = set(map_keys)
+    if ocr_text in keys_set:
+        return ocr_text, f"{engine_name}({ocr_text!r})"
+    fuzzy = fuzzy_match_map_key(ocr_text, map_keys, min_ratio=fuzzy_min_ratio)
+    if fuzzy:
+        name, score = fuzzy
+        if name != ocr_text:
+            return name, f"{engine_name}_fuzzy({ocr_text!r}->{name}, {score:.2f})"
+        return name, f"{engine_name}({ocr_text!r}, {score:.2f})"
+    if ocr_text:
+        return ocr_text, f"{engine_name}({ocr_text!r})"
+    return "", ""
+
+
+def recognize_chip_label(
+    chip_bgr: np.ndarray,
+    map_keys: tuple[str, ...] | list[str],
+    *,
+    ocr_engine: str | None = None,
+    tesseract_cmd: Path | str | None = None,
+    refs_dir: Path | None = None,
+    template_min_score: float = 0.88,
+    template_min_margin: float = 0.08,
+    fuzzy_min_ratio: float = 0.72,
+) -> tuple[str, str]:
+    """识别槽位文字：RapidOCR/Tesseract → 精确命中 → 模糊纠错。"""
+    if chip_bgr.size == 0:
+        return "", ""
+
+    ocr_text = ""
+    engine_name = ""
+
+    try:
+        from core.dream_memory.ocr_engine import resolve_ocr_engine
+
+        if resolve_ocr_engine(ocr_engine) == "rapidocr":
+            from core.dream_memory.ocr_rapid import ocr_chip_rapid_robust
+
+            ocr_text = ocr_chip_rapid_robust(chip_bgr, map_keys)
+            engine_name = "rapidocr"
+        else:
+            ocr_text, engine_name = ocr_chip_text(
+                chip_bgr,
+                engine=ocr_engine,
+                tesseract_cmd=tesseract_cmd,
+            )
+    except (FileNotFoundError, RuntimeError) as exc:
+        logger.warning(f"OCR 失败: {exc}")
+
+    return _label_from_ocr_text(
+        ocr_text,
+        map_keys,
+        engine_name,
+        fuzzy_min_ratio=fuzzy_min_ratio,
+    )
+
+
+def split_bar_into_slots(
+    bar: tuple[int, int, int, int],
+    slot_count: int,
+) -> tuple[tuple[int, int, int, int], ...]:
+    """将底栏 ROI 均分为 slot_count 个槽位。"""
+    x1, y1, x2, y2 = bar
+    count = max(1, slot_count)
+    width = x2 - x1
+    if width <= 0:
+        return ()
+    rois: list[tuple[int, int, int, int]] = []
+    for index in range(count):
+        sx1 = x1 + int(round(index * width / count))
+        sx2 = x1 + int(round((index + 1) * width / count)) if index < count - 1 else x2
+        if sx2 > sx1:
+            rois.append((sx1, y1, sx2, y2))
+    return tuple(rois)
+
+
+def estimate_slot_count(
+    bar_bgr: np.ndarray,
+    *,
+    min_slots: int = 3,
+    max_slots: int = 4,
+) -> int:
+    """根据底栏竖向分隔/空白估计槽位数量（3 或 4）。"""
+    min_slots = max(1, min_slots)
+    max_slots = max(min_slots, max_slots)
+    if bar_bgr.size == 0:
+        return min_slots
+
+    gray = cv2.cvtColor(bar_bgr, cv2.COLOR_BGR2GRAY)
+    _, width = gray.shape
+    if width < 40:
+        return min_slots
+
+    # 槽位间竖缝：列标准差较低（背景均匀）；文字区域标准差较高
+    col_std = gray.std(axis=0)
+    kernel = max(5, width // 35)
+    smoothed = np.convolve(col_std, np.ones(kernel) / kernel, mode="same")
+
+    margin = int(width * 0.06)
+    inner = smoothed[margin : width - margin]
+    if inner.size == 0:
+        return min_slots
+
+    low = float(np.percentile(inner, 35))
+    high = float(np.percentile(inner, 65))
+    gap_thresh = (low + high) / 2
+    min_gap = max(4, width // 45)
+
+    gap_count = 0
+    index = 0
+    while index < len(inner):
+        if inner[index] < gap_thresh:
+            start = index
+            while index < len(inner) and inner[index] < gap_thresh:
+                index += 1
+            if index - start >= min_gap:
+                gap_count += 1
+        else:
+            index += 1
+
+    # n 个槽位之间通常有 n-1 条内部分隔缝
+    estimated = gap_count + 1
+    if estimated < min_slots or estimated > max_slots:
+        # 竖缝不明显时，用边缘峰值再试一次
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        edge = np.abs(sobel_x).mean(axis=0)
+        edge = np.convolve(edge, np.ones(kernel) / kernel, mode="same")
+        segment = edge[margin : width - margin]
+        peak_thresh = float(np.percentile(segment, 78))
+        min_peak_dist = width // (max_slots + 1)
+        peaks: list[int] = []
+        for i in range(1, len(segment) - 1):
+            if segment[i] < peak_thresh:
+                continue
+            if segment[i] < segment[i - 1] or segment[i] < segment[i + 1]:
+                continue
+            if peaks and i - peaks[-1] < min_peak_dist:
+                if segment[i] > segment[peaks[-1]]:
+                    peaks[-1] = i
+            else:
+                peaks.append(i)
+        estimated = len(peaks) + 1
+
+    return max(min_slots, min(max_slots, estimated))
+
+
+def resolve_target_slots(
+    screen: np.ndarray,
+    *,
+    target_bar: tuple[int, int, int, int],
+    min_slots: int = 3,
+    max_slots: int = 4,
+    fixed_slots: tuple[tuple[int, int, int, int], ...] | None = None,
+) -> tuple[tuple[int, int, int, int], ...]:
+    """解析本轮 OCR 使用的槽位 ROI；fixed_slots 非空时直接返回。"""
+    if fixed_slots:
+        return fixed_slots
+    bar_patch = _crop(screen, target_bar)
+    slot_count = estimate_slot_count(
+        bar_patch,
+        min_slots=min_slots,
+        max_slots=max_slots,
+    )
+    slots = split_bar_into_slots(target_bar, slot_count)
+    logger.debug(
+        f"底栏 {target_bar} 检测到 {slot_count} 槽: {slots}"
+    )
+    return slots
+
+
+def read_target_chips(
+    screen: np.ndarray,
+    slots: tuple[tuple[int, int, int, int], ...] | None = None,
+    *,
+    map_keys: tuple[str, ...] | list[str] | None = None,
+    target_bar: tuple[int, int, int, int] | None = None,
+    min_slots: int = 3,
+    max_slots: int = 4,
+    tesseract_cmd: Path | str | None = None,
+    ocr_engine: str | None = None,
+    min_brightness: float = 95.0,
+    refs_dir: Path | None = None,
+    template_min_score: float = 0.88,
+    template_min_margin: float = 0.08,
+    fuzzy_min_ratio: float = 0.72,
+    save_matched_refs: bool = False,
+) -> list[TargetChip]:
+    if slots is None:
+        if target_bar is None:
+            raise ValueError("read_target_chips 需要 slots 或 target_bar")
+        slots = resolve_target_slots(
+            screen,
+            target_bar=target_bar,
+            min_slots=min_slots,
+            max_slots=max_slots,
+        )
+    results: list[TargetChip] = []
+    patches: list[np.ndarray] = []
+    actives: list[bool] = []
+    for roi in slots:
+        patch = _crop(screen, roi)
+        patches.append(patch)
+        actives.append(chip_is_active(patch, min_brightness=min_brightness))
+
+    batch_labels: list[tuple[str, str]] | None = None
+    if map_keys:
+        from core.dream_memory.ocr_engine import resolve_ocr_engine
+
+        if resolve_ocr_engine(ocr_engine) == "rapidocr" and sum(actives) >= 1:
+            from core.dream_memory.ocr_rapid import (
+                AMBIGUOUS_LABELS,
+                ocr_chip_rapid_robust,
+                ocr_slots_batch,
+            )
+
+            keys_set = set(map_keys)
+            batch_labels = [("", "")] * len(patches)
+            active_indices = [i for i, ok in enumerate(actives) if ok]
+            active_patches = [patches[i] for i in active_indices]
+            batch_texts = ocr_slots_batch(active_patches)
+            for slot_index, raw_text in zip(active_indices, batch_texts):
+                ocr_text = raw_text
+                if ocr_text and ocr_text not in keys_set:
+                    fuzzy = fuzzy_match_map_key(
+                        ocr_text, map_keys, min_ratio=fuzzy_min_ratio
+                    )
+                    if fuzzy:
+                        name, score = fuzzy
+                        if name != ocr_text:
+                            logger.debug(
+                                f"槽位 {slot_index + 1} fuzzy"
+                                f"({ocr_text!r}->{name}, {score:.2f})"
+                            )
+                        ocr_text = name
+                if ocr_text in AMBIGUOUS_LABELS or (
+                    ocr_text and ocr_text not in keys_set
+                ):
+                    ocr_text = ocr_chip_rapid_robust(patches[slot_index], map_keys)
+                batch_labels[slot_index] = _label_from_ocr_text(
+                    ocr_text,
+                    map_keys,
+                    "rapidocr",
+                    fuzzy_min_ratio=fuzzy_min_ratio,
+                )
+
+    for index, roi in enumerate(slots):
+        patch = patches[index]
+        active = actives[index]
+        text = ""
+        if active:
+            if batch_labels is not None:
+                text, method = batch_labels[index]
+                if text and method:
+                    logger.debug(f"槽位 {index + 1} {method} -> {text!r}")
+            elif map_keys:
+                text, method = recognize_chip_label(
+                    patch,
+                    map_keys,
+                    ocr_engine=ocr_engine,
+                    tesseract_cmd=tesseract_cmd,
+                    refs_dir=refs_dir,
+                    template_min_score=template_min_score,
+                    template_min_margin=template_min_margin,
+                    fuzzy_min_ratio=fuzzy_min_ratio,
+                )
+                if text and method:
+                    logger.debug(f"槽位 {index + 1} {method} -> {text!r}")
+            else:
+                try:
+                    text, _engine = ocr_chip_text(
+                        patch,
+                        engine=ocr_engine,
+                        tesseract_cmd=tesseract_cmd,
+                    )
+                except (FileNotFoundError, RuntimeError) as exc:
+                    logger.warning(f"OCR 失败 slot={index}: {exc}")
+        results.append(
+            TargetChip(
+                slot_index=index,
+                text=text,
+                active=active and bool(text),
+                roi=roi,
+            )
+        )
+    return results
+
+
+def resolve_item_coord(
+    game_map: DreamMemoryMap,
+    label: str,
+) -> tuple[int, int] | None:
+    return game_map.lookup(label)

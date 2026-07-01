@@ -288,3 +288,15 @@ network:
     timeout: 30.0
     verify_ssl: true
     proxy_url: null
+dream_memory:
+  tesseract_cmd: C:\Program Files\Tesseract-OCR\tesseract.exe
+  selected_map: example_gazebo
+  tap_delay: 1.2
+  tap_between_delay: 0.4
+  scan_interval: 0.35
+  chip_active_min_brightness: 95
+  ocr_engine: rapidocr
+  target_slots:
+    - [38, 1140, 248, 1194]
+    - [250, 1142, 462, 1196]
+    - [468, 1136, 674, 1200]

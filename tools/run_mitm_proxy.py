@@ -17,9 +17,6 @@
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -27,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.network.config import load_network_config
+from core.network.proxy_runner import MitmNotInstalledError, build_mitm_command, mitm_proxy_env
 
 
 def main() -> None:
@@ -47,46 +45,22 @@ def main() -> None:
     cfg = load_network_config(args.config)
     cfg.ensure_dirs()
 
-    addon = ROOT / "core" / "network" / "mitm_addon.py"
-    if not addon.is_file():
-        raise FileNotFoundError(addon)
-
-    mitm_bin = shutil.which("mitmdump" if not args.web else "mitmweb")
-    if mitm_bin is None:
-        venv_scripts = ROOT / ".venv" / "Scripts"
-        name = "mitmweb.exe" if args.web else "mitmdump.exe"
-        candidate = venv_scripts / name
-        mitm_bin = str(candidate) if candidate.is_file() else None
-    if not mitm_bin:
-        print(
-            "未找到 mitmdump/mitmweb。请先安装:\n"
-            "  .venv\\Scripts\\pip.exe install -r requirements-network.txt",
-            file=sys.stderr,
-        )
+    try:
+        cmd = build_mitm_command(cfg, config_path=args.config, web=args.web)
+    except MitmNotInstalledError as exc:
+        print(str(exc), file=sys.stderr)
         sys.exit(1)
 
-    env = os.environ.copy()
-    if args.config is not None:
-        env["EW_CONFIG_PATH"] = str(args.config.resolve())
+    import subprocess
 
-    cmd = [
-        mitm_bin,
-        "-s",
-        str(addon),
-        "--listen-host",
-        cfg.proxy.listen_host,
-        "--listen-port",
-        str(cfg.proxy.listen_port),
-        "--set",
-        "block_global=false",
-    ]
-    if args.web:
-        cmd.extend(["--web-host", "127.0.0.1"])
+    env = mitm_proxy_env(args.config)
 
     print(f"监听 {cfg.proxy.listen_host}:{cfg.proxy.listen_port}")
     print(f"抓包目录 {cfg.capture_dir}")
     if cfg.capture.include_hosts:
         print(f"仅保存 host 含: {cfg.capture.include_hosts}")
+    if args.web:
+        print("流量面板 http://127.0.0.1:8081")
     print("Ctrl+C 停止\n")
 
     subprocess.run(cmd, cwd=str(ROOT), env=env, check=False)

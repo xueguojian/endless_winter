@@ -92,11 +92,13 @@ BOUNTY_SUBTITLE_MAX_MATCH_X_RATIO = 0.35
 BOUNTY_SUBTITLE_SCALES = (0.82, 0.90, 0.96, 1.0, 1.06, 1.14, 1.22)
 MONSTER_KEYWORD_LEVEL = "lighthouse/monster_keyword_level.png"
 BEAST_KEYWORD_HAO = "lighthouse/beast_keyword_hao.png"
-MONSTER_LEVEL_SUBTITLE_MIN = 0.48
+MONSTER_LEVEL_SUBTITLE_MIN = 0.55
 MONSTER_LEVEL_MAX_MATCH_X_RATIO = 0.12
-BEAST_HAO_SUBTITLE_MIN = 0.78
-BEAST_HAO_SEARCH_WIDTH_RATIO = 0.30
-BEAST_HAO_MIN_MATCH_X_RATIO = 0.70
+BEAST_HAO_SUBTITLE_MIN = 0.70
+BEAST_HAO_SEARCH_WIDTH_RATIO = 0.58
+BEAST_HAO_MIN_MATCH_X_RATIO = 0.55
+BEAST_HAO_SOFT_MIN = 0.65
+LEVEL_OVERRIDE_HAO_MIN = 0.55
 BEAST_PIN_TEMPLATE = "lighthouse/small_monster_beast.png"
 BEAST_PIN_MATCH_MIN = 0.48
 SKIP_MISSION_KINDS = frozenset({"small_monster_beast"})
@@ -1226,10 +1228,13 @@ def _subtitle_is_beast_number(
     *,
     subtitle_roi: tuple[int, int, int, int] = MISSION_DETAIL_SUBTITLE_ROI,
     template_dir: Path = TEMPLATE_DIR,
-) -> tuple[bool, float]:
-    """副标题右侧含「号」（如 …1号）→ 特殊大怪。"""
+) -> tuple[bool, float, bool]:
+    """副标题右侧含「号」（如 …1号）→ 特殊大怪。
+
+    返回 (accepted, confidence, position_ok)。
+    """
     if not (template_dir / BEAST_KEYWORD_HAO).is_file():
-        return False, 0.0
+        return False, 0.0, False
 
     x1, _y1, x2, _y2 = subtitle_roi
     roi_width = x2 - x1
@@ -1245,14 +1250,13 @@ def _subtitle_is_beast_number(
         search_width_ratio=BEAST_HAO_SEARCH_WIDTH_RATIO,
     )
     rel_x = result.top_left[0] - x1 if result.top_left != (0, 0) else 0
-    accepted = (
-        result.confidence >= BEAST_HAO_SUBTITLE_MIN and rel_x >= min_match_x
-    )
+    position_ok = rel_x >= min_match_x
+    accepted = result.confidence >= BEAST_HAO_SUBTITLE_MIN and position_ok
     logger.debug(
         f"大怪副标题 {BEAST_KEYWORD_HAO} conf={result.confidence:.2f} "
         f"rel_x={rel_x} min_x={min_match_x} accepted={accepted}"
     )
-    return accepted, result.confidence
+    return accepted, result.confidence, position_ok
 
 
 def _subtitle_is_level_monster(
@@ -1301,31 +1305,48 @@ def _classify_march_subtitle(
             confidence=bounty_conf,
         )
 
-    is_hao, hao_conf = _subtitle_is_beast_number(
-        screen, subtitle_roi=subtitle_roi, template_dir=template_dir
-    )
     is_level, level_conf = _subtitle_is_level_monster(
         screen, subtitle_roi=subtitle_roi, template_dir=template_dir
     )
+    if is_level:
+        return None
 
-    if is_hao:
-        # 仅当左侧「等级」明确匹配时，才忽略右侧「号」误匹配（如大角鹿）
-        if is_level:
+    is_hao, hao_conf, hao_pos_ok = _subtitle_is_beast_number(
+        screen, subtitle_roi=subtitle_roi, template_dir=template_dir
+    )
+    # 「等级」靠左且匹配足够强时，忽略右侧「号」误匹配（如 大角鹿）
+    if is_hao and level_conf >= LEVEL_OVERRIDE_HAO_MIN:
+        x1, _y1, x2, _y2 = subtitle_roi
+        level_left = _match_subtitle_template(
+            screen,
+            MONSTER_KEYWORD_LEVEL,
+            subtitle_roi,
+            template_dir=template_dir,
+            threshold=0.0,
+            scales=BOUNTY_SUBTITLE_SCALES,
+            search_side="left",
+        )
+        rel_x = (
+            level_left.top_left[0] - x1 if level_left.top_left != (0, 0) else 999
+        )
+        max_left_x = int((x2 - x1) * MONSTER_LEVEL_MAX_MATCH_X_RATIO)
+        if rel_x <= max_left_x:
             logger.info(
-                f"左侧「等级」明确（conf={level_conf:.2f}），"
-                f"忽略右侧「号」误匹配 conf={hao_conf:.2f}，视为灯塔小怪"
+                f"左侧已有「等级」匹配（conf={level_conf:.2f} rel_x={rel_x}），"
+                f"忽略右侧「号」误匹配 conf={hao_conf:.2f}"
             )
             return None
-        logger.info(f"副标题右侧含「号」，识别为特殊大怪（conf={hao_conf:.2f}）")
+
+    if is_hao or (hao_pos_ok and hao_conf >= BEAST_HAO_SOFT_MIN):
+        logger.info(
+            f"副标题右侧含「号」，识别为特殊大怪（conf={hao_conf:.2f}）"
+        )
         return MissionDetailClassification(
             kind="beast_skip",
             label="特殊大怪",
             confidence=max(base_confidence, hao_conf),
-            beast_explicit=True,
+            beast_explicit=is_hao,
         )
-
-    if is_level:
-        return None
 
     logger.info(
         f"出征副标题非悬赏、无「等级」、无「号」（bounty={bounty_conf:.2f} "

@@ -476,10 +476,25 @@ class AutoLighthouseTask:
         return True
 
     def _classify_mission_detail(self) -> MissionDetailClassification:
-        """详情页底部行动按钮 + 副标题分类。"""
-        time.sleep(0.5)
-        screen = self.adb.screenshot()
-        detail = classify_mission_detail_screen(screen)
+        """详情页底部行动按钮 + 副标题分类（多帧采样，避免 Toast 遮挡误判）。"""
+        detail: MissionDetailClassification | None = None
+        for attempt in range(3):
+            time.sleep(0.55 if attempt == 0 else 0.35)
+            screen = self.adb.screenshot()
+            current = classify_mission_detail_screen(screen)
+            logger.debug(
+                f"详情页第 {attempt + 1} 帧: {current.label} "
+                f"({current.kind}, conf={current.confidence:.2f})"
+            )
+            if current.kind == "beast_skip":
+                detail = current
+                break
+            if current.kind == "bounty_skip":
+                detail = current
+                break
+            if detail is None or current.confidence > detail.confidence:
+                detail = current
+        assert detail is not None
         self._emit(
             f"详情页识别为：{detail.label}（{detail.kind}，"
             f"置信度 {detail.confidence:.2f}）"
