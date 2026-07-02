@@ -292,11 +292,11 @@ dream_memory_pk:
   selected_map: ''
   pk_item_filter: all
   enable_misclick: false
-  tap_between_delay: 0.09
-  tap_between_delay_min: 0.09
-  tap_between_delay_max: 0.09
-  tap_between_delay_mode: 0.09
-  scan_interval: 0.2
+  tap_between_delay: 0.1
+  tap_between_delay_min: 0.1
+  tap_between_delay_max: 0.1
+  tap_between_delay_mode: 0.1
+  scan_interval: 0.3
   bar_refresh_min_wait: 0
   bar_refresh_poll: 0.05
   bar_refresh_timeout: 0

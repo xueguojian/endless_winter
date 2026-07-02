@@ -154,11 +154,11 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
         default_maps = PK_MAPS_DIR
         default_previews = PK_PREVIEWS_DIR
         timing = dict(
-            tap_between_delay=0.09,
-            tap_between_delay_min=0.09,
-            tap_between_delay_max=0.09,
-            tap_between_delay_mode=0.09,
-            scan_interval=0.2,
+            tap_between_delay=0.1,
+            tap_between_delay_min=0.1,
+            tap_between_delay_max=0.1,
+            tap_between_delay_mode=0.1,
+            scan_interval=0.3,
             bar_refresh_min_wait=0.0,
             bar_refresh_poll=0.05,
             bar_refresh_timeout=0.0,

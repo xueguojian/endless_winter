@@ -180,7 +180,7 @@ class DreamMemorySession:
                         f" — 未匹配地图，请标定"
                     )
                 continue
-            if self.config.pk_mode:
+            if self.config.pk_mode and self._pk_item_filter_active():
                 ordinal = self.game_map.item_ordinal_index(chip.text)
                 if ordinal is None or not pk_item_filter_matches(
                     ordinal, self.config.pk_item_filter
@@ -289,6 +289,9 @@ class DreamMemorySession:
             fresh.append(item)
         return fresh
 
+    def _pk_item_filter_active(self) -> bool:
+        return normalize_pk_item_filter(self.config.pk_item_filter) != "all"
+
     def _pk_scan_loop(self, queue: _PKTapQueue, seen: set[str]) -> None:
         """PK 扫描线程：定时 OCR，仅首次见到的物品入队。"""
         while not self._interrupted():
@@ -308,10 +311,6 @@ class DreamMemorySession:
                         f"PK 扫描入队 +{added}（新 {len(fresh)}/{len(batch)}，"
                         f"已见 {len(seen)}，队列 {len(queue)}）"
                     )
-
-            # 首帧未识别到任何物品时不等待 scan_interval，连续重扫直到底栏就绪
-            if not seen:
-                continue
 
             interval = max(0.0, self.config.scan_interval)
             if interval > 0:

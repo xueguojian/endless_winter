@@ -319,12 +319,7 @@ def read_target_chips(
 
         if resolve_ocr_engine(ocr_engine) == "rapidocr" and sum(actives) >= 1:
             from core.dream_memory.label_resolve import resolve_chip_label
-            from core.dream_memory.ocr_rapid import (
-                RETRY_SCALE,
-                ocr_chip_rapid,
-                ocr_chip_rapid_robust,
-                ocr_slots_batch,
-            )
+            from core.dream_memory.ocr_rapid import ocr_chip_rapid_robust, ocr_slots_batch
 
             keys_set = set(map_keys)
             batch_labels = [("", "")] * len(patches)
@@ -332,12 +327,9 @@ def read_target_chips(
             active_patches = [patches[i] for i in active_indices]
             batch_texts = ocr_slots_batch(active_patches)
             for slot_index, raw_text in zip(active_indices, batch_texts):
-                if pk_mode and not raw_text:
-                    ocr_text = ocr_chip_rapid(patches[slot_index], scale=RETRY_SCALE)
-                else:
-                    ocr_text = raw_text or ocr_chip_rapid_robust(
-                        patches[slot_index], map_keys
-                    )
+                ocr_text = raw_text or ocr_chip_rapid_robust(
+                    patches[slot_index], map_keys
+                )
                 name, method = resolve_chip_label(
                     patches[slot_index],
                     ocr_text,

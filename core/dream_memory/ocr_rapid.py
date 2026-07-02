@@ -120,7 +120,7 @@ def ocr_slots_batch(
                 logger.debug(f"RapidOCR rec scale={scale}: {text!r} ({total:.3f}s)")
             texts.append(text)
     elapsed = time.perf_counter() - t0
-    logger.info(f"RapidOCR {len(patches)} 槽识别: {texts} ({elapsed:.2f}s)")
+    logger.debug(f"RapidOCR {len(patches)} 槽识别: {texts} ({elapsed:.2f}s)")
     return texts
 
 
