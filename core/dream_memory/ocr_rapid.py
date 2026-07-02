@@ -21,6 +21,9 @@ _warmed = False
 AMBIGUOUS_LABELS = frozenset({"梯子", "灯塔", "瞭望塔", "喇叭", "毛巾", "石像"})
 DEFAULT_SCALE = 2.0
 RETRY_SCALE = 3.0
+# PK 典型槽位尺寸，预热时用真实 scale 走一遍推理路径
+_WARMUP_CHIP_WH = (210, 58)
+_WARMUP_SLOT_COUNT = 6
 
 
 def rapidocr_available() -> bool:
@@ -41,17 +44,21 @@ def _get_rec_engine() -> RapidOCR:
     return _rec_engine
 
 
-def warmup_rapidocr() -> None:
-    """预加载模型，避免首次识别卡顿。"""
+def warmup_rapidocr(
+    *,
+    slot_count: int = _WARMUP_SLOT_COUNT,
+    scale: float = DEFAULT_SCALE,
+) -> None:
+    """预加载模型并用真实槽位尺寸跑一遍 batch，避免首帧 ONNX 再编译。"""
     global _warmed
     if _warmed:
         return
-    engine = _get_rec_engine()
-    dummy = np.full((48, 160, 3), 180, dtype=np.uint8)
-    with _engine_lock:
-        engine(_prepare_chip(dummy, scale=1.5))
+    _get_rec_engine()
+    w, h = _WARMUP_CHIP_WH
+    patches = [np.full((h, w, 3), 180, dtype=np.uint8) for _ in range(slot_count)]
+    ocr_slots_batch(patches, scale=scale)
     _warmed = True
-    logger.debug("RapidOCR 预热完成")
+    logger.debug(f"RapidOCR 预热完成 ({slot_count} 槽, scale={scale})")
 
 
 def _prepare_chip(chip_bgr, *, scale: float = DEFAULT_SCALE):
@@ -98,9 +105,22 @@ def ocr_slots_batch(
         return []
 
     t0 = time.perf_counter()
-    texts = [ocr_chip_rapid(patch, scale=scale) for patch in patches]
+    engine = _get_rec_engine()
+    prepared = [_prepare_chip(patch, scale=scale) for patch in patches]
+    texts: list[str] = []
+    with _engine_lock:
+        for image in prepared:
+            if image.size == 0:
+                texts.append("")
+                continue
+            result, elapse = engine(image)
+            total = sum(elapse) if elapse else 0.0
+            text = _parse_rec_result(result)
+            if text:
+                logger.debug(f"RapidOCR rec scale={scale}: {text!r} ({total:.3f}s)")
+            texts.append(text)
     elapsed = time.perf_counter() - t0
-    logger.info(f"RapidOCR 三槽识别 {len(patches)} 个: {texts} ({elapsed:.2f}s)")
+    logger.info(f"RapidOCR {len(patches)} 槽识别: {texts} ({elapsed:.2f}s)")
     return texts
 
 

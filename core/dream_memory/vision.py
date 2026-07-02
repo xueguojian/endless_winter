@@ -42,7 +42,7 @@ def chip_is_active(
     *,
     min_brightness: float = 95.0,
 ) -> bool:
-    """未找到的目标按钮较亮；已划线/变灰的跳过。"""
+    """未找到的目标按钮较亮；已划线/变灰的跳过（普通模式）。"""
     if chip_bgr.size == 0:
         return False
     gray = cv2.cvtColor(chip_bgr, cv2.COLOR_BGR2GRAY)
@@ -66,6 +66,28 @@ def chip_is_active(
                 )
                 return False
     return True
+
+
+def pk_slot_has_content(chip_bgr: np.ndarray) -> bool:
+    """PK 槽位是否仍存在（不检测变灰/划线；消失后多为空白均匀区）。"""
+    if chip_bgr.size == 0:
+        return False
+    gray = cv2.cvtColor(chip_bgr, cv2.COLOR_BGR2GRAY)
+    mean = float(gray.mean())
+    std = float(gray.std())
+    if std < 10.0:
+        return False
+    if mean < 35.0 and std < 18.0:
+        return False
+    return True
+
+
+def pk_last_present_slot_index(patches: list[np.ndarray]) -> int:
+    """PK 自槽位 6 起向左消失，返回仍存在的最高槽位索引（无则 -1）。"""
+    for index in range(len(patches) - 1, -1, -1):
+        if pk_slot_has_content(patches[index]):
+            return index
+    return -1
 
 
 def _label_from_ocr_text(
@@ -262,6 +284,7 @@ def read_target_chips(
     template_min_margin: float = 0.08,
     fuzzy_min_ratio: float = 0.72,
     save_matched_refs: bool = False,
+    pk_mode: bool = False,
 ) -> list[TargetChip]:
     if slots is None:
         if target_bar is None:
@@ -275,10 +298,20 @@ def read_target_chips(
     results: list[TargetChip] = []
     patches: list[np.ndarray] = []
     actives: list[bool] = []
+    slot_limit = len(slots)
     for roi in slots:
         patch = _crop(screen, roi)
         patches.append(patch)
-        actives.append(chip_is_active(patch, min_brightness=min_brightness))
+
+    if pk_mode:
+        last_present = pk_last_present_slot_index(patches)
+        if last_present < 0:
+            return []
+        slot_limit = last_present + 1
+        actives = [pk_slot_has_content(patch) for patch in patches[:slot_limit]]
+    else:
+        for patch in patches:
+            actives.append(chip_is_active(patch, min_brightness=min_brightness))
 
     batch_labels: list[tuple[str, str]] | None = None
     if map_keys:
@@ -286,17 +319,25 @@ def read_target_chips(
 
         if resolve_ocr_engine(ocr_engine) == "rapidocr" and sum(actives) >= 1:
             from core.dream_memory.label_resolve import resolve_chip_label
-            from core.dream_memory.ocr_rapid import ocr_chip_rapid_robust, ocr_slots_batch
+            from core.dream_memory.ocr_rapid import (
+                RETRY_SCALE,
+                ocr_chip_rapid,
+                ocr_chip_rapid_robust,
+                ocr_slots_batch,
+            )
 
             keys_set = set(map_keys)
             batch_labels = [("", "")] * len(patches)
-            active_indices = [i for i, ok in enumerate(actives) if ok]
+            active_indices = [i for i, ok in enumerate(actives[:slot_limit]) if ok]
             active_patches = [patches[i] for i in active_indices]
             batch_texts = ocr_slots_batch(active_patches)
             for slot_index, raw_text in zip(active_indices, batch_texts):
-                ocr_text = raw_text or ocr_chip_rapid_robust(
-                    patches[slot_index], map_keys
-                )
+                if pk_mode and not raw_text:
+                    ocr_text = ocr_chip_rapid(patches[slot_index], scale=RETRY_SCALE)
+                else:
+                    ocr_text = raw_text or ocr_chip_rapid_robust(
+                        patches[slot_index], map_keys
+                    )
                 name, method = resolve_chip_label(
                     patches[slot_index],
                     ocr_text,
@@ -306,8 +347,9 @@ def read_target_chips(
                     fuzzy_min_ratio=fuzzy_min_ratio,
                     template_min_score=min(template_min_score, 0.75),
                     template_min_margin=min(template_min_margin, 0.05),
+                    strict=pk_mode,
                 )
-                if name not in keys_set and ocr_text:
+                if name not in keys_set and ocr_text and not pk_mode:
                     retry = ocr_chip_rapid_robust(patches[slot_index], map_keys)
                     if retry and retry != ocr_text:
                         name, method = resolve_chip_label(
@@ -319,10 +361,15 @@ def read_target_chips(
                             fuzzy_min_ratio=fuzzy_min_ratio,
                             template_min_score=min(template_min_score, 0.75),
                             template_min_margin=min(template_min_margin, 0.05),
+                            strict=pk_mode,
                         )
+                if pk_mode and name not in keys_set:
+                    name, method = "", ""
                 batch_labels[slot_index] = (name, method)
 
     for index, roi in enumerate(slots):
+        if pk_mode and index >= slot_limit:
+            break
         patch = patches[index]
         active = actives[index]
         text = ""
@@ -353,14 +400,18 @@ def read_target_chips(
                     )
                 except (FileNotFoundError, RuntimeError) as exc:
                     logger.warning(f"OCR 失败 slot={index}: {exc}")
+        if pk_mode:
+            active = active and bool(text)
         results.append(
             TargetChip(
                 slot_index=index,
                 text=text,
-                active=active and bool(text),
+                active=active,
                 roi=roi,
             )
         )
+    if pk_mode:
+        logger.debug(f"PK 有效槽 {slot_limit}/{len(slots)}")
     return results
 
 

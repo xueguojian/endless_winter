@@ -19,6 +19,8 @@ DEFAULT_OCR_ALIASES: dict[str, str] = {
     "琐": "锁",
     "所": "锁",
     "引": "弓",
+    "東茄子": "茄子",
+    "东茄子": "茄子",
 }
 
 # 同图并存时需视觉/多路 OCR 消歧（不能单靠 OCR 字面）
@@ -58,6 +60,18 @@ def apply_ocr_aliases(
     if canonical and canonical in keys_set:
         logger.debug(f"OCR 别名: {key!r} -> {canonical!r}")
         return canonical
+
+    # OCR 偶发多识 1~2 字前缀（如 東茄子 -> 茄子）
+    suffix_hits = [
+        map_key
+        for map_key in keys_set
+        if len(map_key) >= 2 and key.endswith(map_key) and 0 < len(key) - len(map_key) <= 2
+    ]
+    if len(suffix_hits) == 1:
+        hit = suffix_hits[0]
+        logger.debug(f"OCR 后缀纠错: {key!r} -> {hit!r}")
+        return hit
+
     return key
 
 
@@ -151,8 +165,9 @@ def resolve_chip_label(
     fuzzy_min_ratio: float = 0.72,
     template_min_score: float = 0.72,
     template_min_margin: float = 0.05,
+    strict: bool = False,
 ) -> tuple[str, str]:
-    """OCR 原始文本 → 地图物品名。"""
+    """OCR 原始文本 → 地图物品名。strict=True 时未命中地图名则返回空（PK 用）。"""
     keys_set = set(map_keys)
     raw = (ocr_text or "").strip()
     text = apply_ocr_aliases(raw, map_keys, map_aliases)
@@ -195,8 +210,11 @@ def resolve_chip_label(
         voted = _ocr_vote_among(
             chip_bgr, tuple(k for k in map_keys if len(k) == 1 and _script_kind(k) == "cjk")
         )
-        if voted:
+        if voted and voted in keys_set:
             return voted, f"short_vote({raw!r}->{voted})"
+
+    if strict:
+        return "", ""
 
     if text:
         return text, f"rapidocr({raw!r})"

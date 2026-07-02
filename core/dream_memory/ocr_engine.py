@@ -58,9 +58,16 @@ def ocr_chip_text(
 
 
 def warmup_ocr(engine: str | None = None) -> None:
-    """后台预加载 OCR 模型，减少首次识别等待。"""
+    """后台预加载 OCR 模型与首扫依赖，减少首次识别等待。"""
     if resolve_ocr_engine(engine) != OCR_ENGINE_RAPID:
         return
+    from core.dream_memory.chip_match import _ensure_manifest
+    from core.dream_memory.config import CHIP_REFS_DIR
+    from core.dream_memory.label_resolve import resolve_chip_label  # noqa: F401
     from core.dream_memory.ocr_rapid import warmup_rapidocr
 
+    try:
+        _ensure_manifest(CHIP_REFS_DIR)
+    except Exception as exc:
+        logger.debug(f"底栏模板 manifest 预加载跳过: {exc}")
     warmup_rapidocr()

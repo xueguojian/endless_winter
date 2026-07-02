@@ -3,18 +3,31 @@
 from __future__ import annotations
 
 import ast
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 from loguru import logger
 
-from core.dream_memory.config import MAPS_DIR
+from core.dream_memory.config import MAPS_DIR, PREVIEWS_DIR
+
+
+def _ensure_writable(path: Path) -> None:
+    """Windows 下从别处复制的 YAML 常带只读属性，写入前先清除。"""
+    if not path.exists():
+        return
+    mode = path.stat().st_mode
+    if not mode & stat.S_IWRITE:
+        path.chmod(mode | stat.S_IWRITE)
 
 
 def _parse_coord(value) -> list[int] | None:
     """解析 YAML 坐标或误写入 aliases 的坐标字符串。"""
     if isinstance(value, (list, tuple)) and len(value) >= 2:
+        if isinstance(value[0], (list, tuple)):
+            first = _parse_coord(value[0])
+            return first
         try:
             return [int(value[0]), int(value[1])]
         except (TypeError, ValueError):
@@ -124,10 +137,33 @@ class DreamMemoryMap:
             if norm == key:
                 if len(coord) >= 2:
                     return int(coord[0]), int(coord[1])
-            # 仅当 OCR 更长时允许前缀扩展（如 单筒望远镜 包含 望远镜）
             elif len(key) > len(norm) and norm in key:
                 if len(coord) >= 2:
                     return int(coord[0]), int(coord[1])
+        return None
+
+    def lookup_strict(self, label: str) -> tuple[int, int] | None:
+        """仅精确/别名命中，不做前缀模糊（PK 防误点）。"""
+        from core.dream_memory.vision import normalize_item_name
+
+        key = normalize_item_name(label)
+        if not key:
+            return None
+        direct = self.resolve_label(key)
+        if direct in self.items:
+            coord = self.items[direct]
+            if len(coord) >= 2:
+                return int(coord[0]), int(coord[1])
+        return None
+
+    def item_ordinal_index(self, label: str) -> int | None:
+        """物品在地图 YAML 中的标定顺序（从 1 开始）。"""
+        resolved = self.resolve_label(label)
+        if not resolved or resolved not in self.items:
+            return None
+        for index, name in enumerate(self.items.keys(), start=1):
+            if name == resolved:
+                return index
         return None
 
 
@@ -166,8 +202,9 @@ def load_map(map_id_or_path: str | Path, *, maps_dir: Path | None = None) -> Dre
     items_raw = raw.get("items") or {}
     items: dict[str, list[int]] = {}
     for label, coord in items_raw.items():
-        if isinstance(coord, (list, tuple)) and len(coord) >= 2:
-            items[str(label)] = [int(coord[0]), int(coord[1])]
+        parsed = _parse_coord(coord)
+        if parsed:
+            items[str(label)] = parsed
 
     aliases_raw = raw.get("aliases") or {}
     aliases = _load_aliases_raw(aliases_raw, items)
@@ -204,6 +241,7 @@ def save_map(
     }
     if dream_map.aliases:
         payload["aliases"] = dict(sorted(dream_map.aliases.items()))
+    _ensure_writable(out)
     with out.open("w", encoding="utf-8") as fh:
         yaml.safe_dump(payload, fh, allow_unicode=True, sort_keys=False, width=88)
     dream_map.source_path = out
@@ -225,8 +263,13 @@ def rename_map_name(
     return save_map(dream_map, maps_dir=maps_dir)
 
 
-def delete_map(map_id: str, *, maps_dir: Path | None = None) -> None:
-    """删除整张地图配置文件。"""
+def delete_map(
+    map_id: str,
+    *,
+    maps_dir: Path | None = None,
+    previews_dir: Path | None = None,
+) -> None:
+    """删除整张地图配置文件及预览图。"""
     dream_map = load_map(map_id, maps_dir=maps_dir)
     path = dream_map.source_path
     if path is None or not path.is_file():
@@ -234,4 +277,60 @@ def delete_map(map_id: str, *, maps_dir: Path | None = None) -> None:
         path = root / f"{map_id}.yaml"
     if not path.is_file():
         raise FileNotFoundError(f"地图不存在: {map_id}")
+    _ensure_writable(path)
     path.unlink()
+    delete_map_preview(map_id, previews_dir=previews_dir)
+
+
+PREVIEW_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+
+def find_map_preview(map_id: str, *, previews_dir: Path | None = None) -> Path | None:
+    root = previews_dir or PREVIEWS_DIR
+    if not root.is_dir():
+        return None
+    for ext in PREVIEW_EXTENSIONS:
+        path = root / f"{map_id}{ext}"
+        if path.is_file():
+            return path
+    return None
+
+
+def has_map_preview(map_id: str, *, previews_dir: Path | None = None) -> bool:
+    return find_map_preview(map_id, previews_dir=previews_dir) is not None
+
+
+def delete_map_preview(map_id: str, *, previews_dir: Path | None = None) -> None:
+    root = previews_dir or PREVIEWS_DIR
+    if not root.is_dir():
+        return
+    for ext in PREVIEW_EXTENSIONS:
+        path = root / f"{map_id}{ext}"
+        if path.is_file():
+            path.unlink()
+
+
+def save_map_preview(
+    map_id: str,
+    source: Path | str,
+    *,
+    previews_dir: Path | None = None,
+) -> Path:
+    """上传/替换地图预览图，统一保存为 PNG。"""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("需要安装 Pillow 才能保存预览图") from exc
+
+    root = previews_dir or PREVIEWS_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    delete_map_preview(map_id, previews_dir=root)
+
+    src = Path(source)
+    if not src.is_file():
+        raise FileNotFoundError(f"图片不存在: {src}")
+
+    out = root / f"{map_id}.png"
+    with Image.open(src) as img:
+        img.convert("RGB").save(out, format="PNG")
+    return out

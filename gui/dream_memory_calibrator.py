@@ -35,9 +35,10 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         on_saved: callable | None = None,
         touch_width: int = 720,
         touch_height: int = 1280,
+        pk_mode: bool = False,
     ):
         super().__init__(master)
-        self.title("寻梦记忆 — 地图标定")
+        self.title("寻梦记忆PK — 地图标定" if pk_mode else "寻梦记忆 — 地图标定")
         self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -47,6 +48,7 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         self._on_saved = on_saved
         self.touch_width = touch_width
         self.touch_height = touch_height
+        self._pk_mode = pk_mode
 
         self._photo: ImageTk.PhotoImage | None = None
         self._pil_image: Image.Image | None = None
@@ -194,6 +196,10 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         self.focus_force()
 
     def _dm_cfg(self):
+        if self._pk_mode:
+            from core.dream_memory.config import load_dream_memory_pk_config
+
+            return load_dream_memory_pk_config(self.config_path)
         return load_dream_memory_config(self.config_path)
 
     def _current_map_id(self) -> str:
@@ -223,11 +229,11 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         except FileNotFoundError:
             self._redraw_markers()
             return
-        for name, coord in sorted(dream_map.items.items()):
+        for index, (name, coord) in enumerate(dream_map.items.items(), start=1):
             if len(coord) >= 2:
                 x, y = int(coord[0]), int(coord[1])
                 self._saved_markers[name] = (x, y)
-                self.list_items.insert(tk.END, f"{name}  ({x}, {y})")
+                self.list_items.insert(tk.END, f"{index}. {name}  ({x}, {y})")
         self._redraw_markers()
 
     def _create_map_dialog(self) -> None:
@@ -337,12 +343,29 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
             return
 
         dream_map.items[name] = [self._pending_tx, self._pending_ty]
-        path = save_map(dream_map, maps_dir=self._dm_cfg().maps_dir)
+        try:
+            save_map(dream_map, maps_dir=self._dm_cfg().maps_dir)
+        except PermissionError:
+            messagebox.showerror(
+                "无法保存",
+                f"没有写入权限: {map_id}.yaml\n\n"
+                "若该文件是从别处复制来的，可能带有「只读」属性。"
+                "请在资源管理器中右键文件 → 属性 → 取消「只读」，或删除后重新标定。",
+                parent=self,
+            )
+            return
         self.var_hint.set(f"已保存「{name}」→ ({self._pending_tx}, {self._pending_ty})")
         self.var_item_name.set("")
         self._reload_item_list()
         if self._on_saved:
             self._on_saved(map_id)
+
+    def _item_name_from_list_line(self, line: str) -> str:
+        name = line.split("  (", 1)[0].strip()
+        prefix, sep, rest = name.partition(". ")
+        if sep and prefix.isdigit():
+            return rest
+        return name
 
     def _delete_selected_item(self) -> None:
         selection = self.list_items.curselection()
@@ -350,7 +373,7 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
             messagebox.showinfo("提示", "请先在列表中选择一项", parent=self)
             return
         line = self.list_items.get(selection[0])
-        name = line.split("  (", 1)[0].strip()
+        name = self._item_name_from_list_line(line)
         map_id = self._current_map_id()
         if not map_id:
             return
@@ -371,7 +394,7 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         if not selection:
             return
         line = self.list_items.get(selection[0])
-        name = line.split("  (", 1)[0].strip()
+        name = self._item_name_from_list_line(line)
         self.var_item_name.set(name)
         if name in self._saved_markers:
             x, y = self._saved_markers[name]

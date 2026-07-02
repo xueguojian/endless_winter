@@ -12,31 +12,32 @@ from tkinter import messagebox, scrolledtext, simpledialog, ttk
 import yaml
 
 from core.adb_client import AdbClient
-from core.network.proxy_runner import (
-    MITMWEB_DEFAULT_PORT,
-    MitmAlreadyRunningError,
-    MitmNotInstalledError,
-    MitmProxyRunner,
-    mitm_is_installed,
-)
 from core.config_path import (
     DEFAULT_CONFIG_PATH,
     default_instance_name,
     ensure_config_file,
     resolve_config_path,
 )
-from core.dream_memory.config import load_dream_memory_config
-from core.dream_memory.maps import (
-    delete_map,
-    format_map_choice,
-    list_maps,
-    load_map,
-    rename_map_name,
+from core.dream_memory.config import (
+    load_dream_memory_config,
+    load_dream_memory_pk_config,
+    normalize_pk_item_filter,
+    PK_ITEM_FILTER_LABELS,
 )
+from core.dream_memory.maps import delete_map, list_maps, load_map, rename_map_name
 from core.dream_memory.ocr_engine import ocr_engine_available, resolve_ocr_engine, warmup_ocr
 from core.navigation import return_to_main_screen
 from gui.coord_ruler import CoordRulerWindow
 from gui.dream_memory_calibrator import DreamMemoryCalibratorWindow
+from gui.dream_memory_panel import (
+    DreamTabWidgets,
+    build_dream_tab,
+    get_selected_map_id,
+    load_dream_cfg,
+    rebuild_map_index,
+    set_map_selection,
+    update_summary,
+)
 from gui.task_registry import TaskEntry, loop_tasks, once_tasks
 from tasks.auto_lighthouse import AutoLighthouseTask, merge_task_config as merge_lighthouse_config
 from tasks.auto_mining import AutoMiningTask, merge_task_config as merge_mining_config
@@ -139,10 +140,17 @@ class EndlessWinterApp(tk.Tk):
         self._log_visible = False
         self._coord_ruler_window: CoordRulerWindow | None = None
         self._dream_memory_calibrator: DreamMemoryCalibratorWindow | None = None
-        self._mitm_runner = MitmProxyRunner()
+        self._dream_pk_calibrator: DreamMemoryCalibratorWindow | None = None
+        self._dream_widgets: DreamTabWidgets | None = None
+        self._dream_pk_widgets: DreamTabWidgets | None = None
         self._dream_memory_worker: threading.Thread | None = None
+        self._dream_pk_worker: threading.Thread | None = None
         self._dream_memory_stop_event = threading.Event()
+        self._dream_pk_stop_event = threading.Event()
         self._dream_memory_session: DreamMemorySession | None = None
+        self._dream_pk_session: DreamMemorySession | None = None
+        self._dream_preview_window: tk.Toplevel | None = None
+        self._dream_pk_preview_window: tk.Toplevel | None = None
 
         self._build_ui()
         self._poll_log_queue()
@@ -279,9 +287,16 @@ class EndlessWinterApp(tk.Tk):
                 dev["adb_host"] = host
                 dev["adb_port"] = int(port)
 
-        if hasattr(self, "var_dream_memory_map"):
+        if self._dream_widgets is not None:
             dm = cfg.setdefault("dream_memory", {})
-            dm["selected_map"] = self._get_selected_dream_map_id()
+            dm["selected_map"] = get_selected_map_id(self._dream_widgets)
+        if self._dream_pk_widgets is not None:
+            pk = cfg.setdefault("dream_memory_pk", {})
+            pk["selected_map"] = get_selected_map_id(self._dream_pk_widgets)
+            if self._dream_pk_widgets.var_item_filter is not None:
+                label = self._dream_pk_widgets.var_item_filter.get().strip()
+                reverse = {v: k for k, v in PK_ITEM_FILTER_LABELS.items()}
+                pk["pk_item_filter"] = reverse.get(label, normalize_pk_item_filter(label))
 
         with open(self.config_path, "w", encoding="utf-8") as f:
             yaml.dump(cfg, f, allow_unicode=True, sort_keys=False)
@@ -360,168 +375,36 @@ class EndlessWinterApp(tk.Tk):
             if col >= columns:
                 col = 0
 
-    def _rebuild_dream_memory_map_index(self, maps) -> None:
-        self._dream_memory_label_to_id = {format_map_choice(m): m.map_id for m in maps}
-        self._dream_memory_id_to_label = {m.map_id: format_map_choice(m) for m in maps}
+    def _dream_widgets_for(self, pk: bool) -> DreamTabWidgets:
+        widgets = self._dream_pk_widgets if pk else self._dream_widgets
+        if widgets is None:
+            raise RuntimeError("寻梦记忆 Tab 尚未初始化")
+        return widgets
 
-    def _get_selected_dream_map_id(self) -> str:
-        sel = self.var_dream_memory_map.get().strip()
-        label_to_id = getattr(self, "_dream_memory_label_to_id", {})
-        if sel in label_to_id:
-            return label_to_id[sel]
-        return sel
-
-    def _set_dream_memory_map_selection(self, map_id: str) -> None:
-        label = getattr(self, "_dream_memory_id_to_label", {}).get(map_id, map_id)
-        self.var_dream_memory_map.set(label)
-        self._update_dream_memory_summary()
-
-    def _update_dream_memory_summary(self) -> None:
-        if not hasattr(self, "lbl_dream_memory_summary"):
-            return
-        map_id = self._get_selected_dream_map_id()
-        if not map_id:
-            self.lbl_dream_memory_summary.configure(text="暂无地图")
-            return
-        try:
-            dm_cfg = load_dream_memory_config(self.config_path)
-            dream_map = load_map(map_id, maps_dir=dm_cfg.maps_dir)
-            self.lbl_dream_memory_summary.configure(
-                text=f"显示名：{dream_map.name} · 已标定 {len(dream_map.items)} 个物品"
-            )
-        except FileNotFoundError:
-            self.lbl_dream_memory_summary.configure(text=f"地图文件不存在: {map_id}")
-
-    def _build_dream_memory_tab(self, parent: ttk.Frame) -> None:
-        dm_cfg = load_dream_memory_config(self.config_path)
+    def _refresh_dream_maps(self, pk: bool = False) -> None:
+        widgets = self._dream_widgets_for(pk)
+        dm_cfg = load_dream_cfg(self, pk)
         maps = list_maps(dm_cfg.maps_dir)
-        self._rebuild_dream_memory_map_index(maps)
+        label_to_id, id_to_label = rebuild_map_index(maps)
+        widgets.label_to_id = label_to_id
+        widgets.id_to_label = id_to_label
         map_ids = [m.map_id for m in maps]
-        labels = list(self._dream_memory_label_to_id.keys())
-        saved = str(self.config.get("dream_memory", {}).get("selected_map") or "")
-        if saved not in map_ids and map_ids:
-            saved = map_ids[0]
-        saved_label = self._dream_memory_id_to_label.get(saved, saved)
-
-        self.var_dream_memory_map = tk.StringVar(value=saved_label)
-
-        row0 = ttk.Frame(parent)
-        row0.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(row0, text="地图").pack(side=tk.LEFT)
-        self.cmb_dream_memory_map = ttk.Combobox(
-            row0,
-            textvariable=self.var_dream_memory_map,
-            values=labels,
-            state="readonly" if labels else "disabled",
-            width=28,
-        )
-        self.cmb_dream_memory_map.pack(side=tk.LEFT, padx=(8, 8))
-        self.lbl_dream_memory_summary = ttk.Label(
-            parent,
-            text="",
-            foreground="#555",
-            wraplength=480,
-            justify=tk.LEFT,
-        )
-        self.lbl_dream_memory_summary.pack(anchor=tk.W, pady=(0, 6))
-        self._update_dream_memory_summary()
-        ttk.Button(row0, text="刷新", command=self._refresh_dream_memory_maps, width=6).pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
-        ttk.Button(row0, text="标定地图", command=self._open_dream_memory_calibrator, width=8).pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
-        ttk.Button(row0, text="重命名", command=self._rename_dream_memory_map, width=7).pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
-        ttk.Button(row0, text="删除地图", command=self._delete_dream_memory_map, width=8).pack(
-            side=tk.LEFT
-        )
-
-        ocr_engine = resolve_ocr_engine(dm_cfg.ocr_engine)
-        ocr_ok = ocr_engine_available(dm_cfg.ocr_engine)
-        if ocr_engine == "rapidocr":
-            ocr_text = "RapidOCR: 已就绪（推荐，中文游戏字体）" if ocr_ok else (
-                "RapidOCR: 未安装，请运行 pip install rapidocr-onnxruntime onnxruntime"
-            )
-        else:
-            ocr_text = (
-                f"Tesseract: 已就绪 ({dm_cfg.tesseract_cmd})"
-                if ocr_ok
-                else f"Tesseract: 未找到 ({dm_cfg.tesseract_cmd})"
-            )
-        self.lbl_dream_tesseract = ttk.Label(
-            parent,
-            text=ocr_text,
-            foreground="green" if ocr_ok else "red",
-            wraplength=480,
-            justify=tk.LEFT,
-        )
-        self.lbl_dream_tesseract.pack(anchor=tk.W, pady=(0, 6))
-        if ocr_engine == "rapidocr" and ocr_ok:
-            threading.Thread(
-                target=lambda: warmup_ocr(dm_cfg.ocr_engine),
-                daemon=True,
-            ).start()
-
-        ttk.Label(
-            parent,
-            text=(
-                "用法：模拟器内手动进入寻梦记忆关卡 → 本页选地图 → 点「开始游戏」"
-                " → 脚本 OCR 底栏并点击 → 关卡结束点「结束」。"
-            ),
-            wraplength=480,
-            justify=tk.LEFT,
-            foreground="gray",
-        ).pack(anchor=tk.W, pady=(0, 8))
-
-        btn_row = ttk.Frame(parent)
-        btn_row.pack(fill=tk.X)
-        self.btn_dream_start = ttk.Button(
-            btn_row, text="开始游戏", command=self._start_dream_memory, width=10
-        )
-        self.btn_dream_start.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_dream_stop = ttk.Button(
-            btn_row,
-            text="结束",
-            command=self._stop_dream_memory,
-            width=10,
-            state=tk.DISABLED,
-        )
-        self.btn_dream_stop.pack(side=tk.LEFT)
-
-        ttk.Label(
-            parent,
-            text="标定：选地图 → 点「标定地图」→ 模拟器截图 → 点击物品 → 填名称 → 写入地图",
-            font=("", 8),
-            foreground="gray",
-            wraplength=480,
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W, pady=(8, 0))
-
-        self.cmb_dream_memory_map.bind(
-            "<<ComboboxSelected>>",
-            lambda _e: (self._update_dream_memory_summary(), self._save_config()),
-        )
-
-    def _refresh_dream_memory_maps(self) -> None:
-        dm_cfg = load_dream_memory_config(self.config_path)
-        maps = list_maps(dm_cfg.maps_dir)
-        self._rebuild_dream_memory_map_index(maps)
-        map_ids = [m.map_id for m in maps]
-        labels = list(self._dream_memory_label_to_id.keys())
-        self.cmb_dream_memory_map.configure(
+        labels = list(label_to_id.keys())
+        widgets.cmb_map.configure(
             values=labels,
             state="readonly" if labels else "disabled",
         )
-        current_id = self._get_selected_dream_map_id()
+        current_id = get_selected_map_id(widgets)
         if current_id not in map_ids:
             current_id = map_ids[0] if map_ids else ""
         if current_id:
-            self._set_dream_memory_map_selection(current_id)
+            set_map_selection(widgets, current_id)
         else:
-            self.var_dream_memory_map.set("")
-            self._update_dream_memory_summary()
+            widgets.var_map.set("")
+        update_summary(self, widgets)
+
+        from core.dream_memory.ocr_engine import ocr_engine_available, resolve_ocr_engine
+
         ocr_engine = resolve_ocr_engine(dm_cfg.ocr_engine)
         ocr_ok = ocr_engine_available(dm_cfg.ocr_engine)
         if ocr_engine == "rapidocr":
@@ -534,17 +417,79 @@ class EndlessWinterApp(tk.Tk):
                 if ocr_ok
                 else f"Tesseract: 未找到 ({dm_cfg.tesseract_cmd})"
             )
-        self.lbl_dream_tesseract.configure(
+        widgets.lbl_ocr.configure(
             text=ocr_text,
             foreground="green" if ocr_ok else "red",
         )
         if not map_ids:
+            title = "寻梦记忆PK" if pk else "寻梦记忆"
             messagebox.showinfo(
-                "寻梦记忆",
+                title,
                 "暂无地图配置。\n"
-                "请运行:\n"
+                "请点「标定地图」新建，或运行:\n"
                 "  tools/calibrate_dream_memory_map.py --create 地图ID --name 显示名",
             )
+
+    def _build_dream_memory_tab(self, parent: ttk.Frame) -> None:
+        self._dream_widgets = build_dream_tab(
+            self,
+            parent,
+            pk=False,
+            on_map_changed=lambda: (update_summary(self, self._dream_widgets), self._save_config()),
+            on_start=lambda: self._start_dream_session(pk=False),
+            on_stop=lambda: self._stop_dream_session(pk=False),
+            on_refresh=lambda: self._refresh_dream_maps(pk=False),
+            on_calibrate=lambda: self._open_dream_calibrator(pk=False),
+            on_rename=lambda: self._rename_dream_map(pk=False),
+            on_delete=lambda: self._delete_dream_map(pk=False),
+        )
+        self.var_dream_memory_map = self._dream_widgets.var_map
+        self.btn_dream_start = self._dream_widgets.btn_start
+        self.btn_dream_stop = self._dream_widgets.btn_stop
+
+    def _schedule_dream_ocr_warmup(self) -> None:
+        """首次进入寻梦记忆相关 Tab 时后台加载 RapidOCR，避免 GUI 启动即占内存。"""
+        if getattr(self, "_dream_ocr_warmup_scheduled", False):
+            return
+        self._dream_ocr_warmup_scheduled = True
+        dm_cfg = load_dream_memory_config(self.config_path)
+        if resolve_ocr_engine(dm_cfg.ocr_engine) == "rapidocr" and ocr_engine_available(
+            dm_cfg.ocr_engine
+        ):
+            threading.Thread(
+                target=lambda: warmup_ocr(dm_cfg.ocr_engine),
+                daemon=True,
+                name="dream-ocr-warmup",
+            ).start()
+
+    def _build_dream_pk_tab(self, parent: ttk.Frame) -> None:
+        self._dream_pk_widgets = build_dream_tab(
+            self,
+            parent,
+            pk=True,
+            on_map_changed=lambda: (
+                update_summary(self, self._dream_pk_widgets),
+                self._save_config(),
+            ),
+            on_start=lambda: self._start_dream_session(pk=True),
+            on_stop=lambda: self._stop_dream_session(pk=True),
+            on_refresh=lambda: self._refresh_dream_maps(pk=True),
+            on_calibrate=lambda: self._open_dream_calibrator(pk=True),
+            on_rename=lambda: self._rename_dream_map(pk=True),
+            on_delete=lambda: self._delete_dream_map(pk=True),
+        )
+        self.btn_dream_pk_start = self._dream_pk_widgets.btn_start
+        self.btn_dream_pk_stop = self._dream_pk_widgets.btn_stop
+
+    def _on_task_tab_changed(self, _event=None) -> None:
+        if not hasattr(self, "_task_notebook"):
+            return
+        tab_text = self._task_notebook.tab(self._task_notebook.index("current"), "text")
+        if tab_text in ("寻梦记忆", "寻梦记忆PK"):
+            self._schedule_dream_ocr_warmup()
+
+    def _refresh_dream_memory_maps(self) -> None:
+        self._refresh_dream_maps(pk=False)
 
     def _build_ui(self) -> None:
         lighthouse_cfg = self.config.get("tasks", {}).get("auto_lighthouse", {})
@@ -923,6 +868,8 @@ class EndlessWinterApp(tk.Tk):
 
         task_notebook = ttk.Notebook(task_frame)
         task_notebook.pack(fill=tk.X)
+        self._task_notebook = task_notebook
+        task_notebook.bind("<<NotebookTabChanged>>", self._on_task_tab_changed)
 
         tab_loop = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_loop, text="循环任务")
@@ -958,50 +905,13 @@ class EndlessWinterApp(tk.Tk):
         )
         self.btn_stop_once.pack(side=tk.LEFT)
 
-        mitm_frame = ttk.LabelFrame(tab_once, text="HTTPS 抓包代理", padding=6)
-        mitm_frame.pack(fill=tk.X, pady=(12, 0))
-
-        mitm_btn_row = ttk.Frame(mitm_frame)
-        mitm_btn_row.pack(fill=tk.X)
-        mitm_start_state = tk.NORMAL if mitm_is_installed() else tk.DISABLED
-        self.btn_start_mitm = ttk.Button(
-            mitm_btn_row,
-            text="启动抓包",
-            command=self._start_mitm_proxy,
-            width=10,
-            state=mitm_start_state,
-        )
-        self.btn_start_mitm.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_stop_mitm = ttk.Button(
-            mitm_btn_row,
-            text="停止抓包",
-            command=self._stop_mitm_proxy,
-            width=10,
-            state=tk.DISABLED,
-        )
-        self.btn_stop_mitm.pack(side=tk.LEFT)
-
-        mitm_hint = (
-            f"流量面板 http://127.0.0.1:{MITMWEB_DEFAULT_PORT}，"
-            "抓包存 assets/captures/"
-        )
-        if not mitm_is_installed():
-            mitm_hint = (
-                "未安装 mitmproxy，请运行: "
-                ".venv\\Scripts\\pip.exe install -r requirements-network.txt"
-            )
-        self.lbl_mitm_status = ttk.Label(
-            mitm_frame,
-            text=f"抓包代理：未运行（{mitm_hint}）",
-            foreground="gray",
-            wraplength=420,
-            justify=tk.LEFT,
-        )
-        self.lbl_mitm_status.pack(anchor=tk.W, pady=(6, 0))
-
         tab_dream = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_dream, text="寻梦记忆")
         self._build_dream_memory_tab(tab_dream)
+
+        tab_dream_pk = ttk.Frame(task_notebook, padding=6)
+        task_notebook.add(tab_dream_pk, text="寻梦记忆PK")
+        self._build_dream_pk_tab(tab_dream_pk)
 
         self.lbl_status = ttk.Label(task_frame, text="状态：待命", foreground="gray")
         self.lbl_status.pack(anchor=tk.W, pady=(8, 0))
@@ -1223,21 +1133,22 @@ class EndlessWinterApp(tk.Tk):
             )
         self._coord_ruler_window.show_window()
 
-    def _on_dream_memory_map_saved(self, map_id: str | None = None) -> None:
-        self._refresh_dream_memory_maps()
+    def _on_dream_map_saved(self, map_id: str | None, *, pk: bool) -> None:
+        self._refresh_dream_maps(pk=pk)
         if map_id:
-            self._set_dream_memory_map_selection(map_id)
+            set_map_selection(self._dream_widgets_for(pk), map_id)
             try:
                 self._save_config()
             except ValueError:
                 pass
 
-    def _rename_dream_memory_map(self) -> None:
-        map_id = self._get_selected_dream_map_id()
+    def _rename_dream_map(self, pk: bool = False) -> None:
+        widgets = self._dream_widgets_for(pk)
+        map_id = get_selected_map_id(widgets)
         if not map_id:
             messagebox.showwarning("提示", "请先选择要重命名的地图")
             return
-        dm_cfg = load_dream_memory_config(self.config_path)
+        dm_cfg = load_dream_cfg(self, pk)
         try:
             dream_map = load_map(map_id, maps_dir=dm_cfg.maps_dir)
         except FileNotFoundError:
@@ -1255,16 +1166,17 @@ class EndlessWinterApp(tk.Tk):
         except (FileNotFoundError, ValueError) as exc:
             messagebox.showerror("重命名失败", str(exc))
             return
-        self._refresh_dream_memory_maps()
-        self._set_dream_memory_map_selection(map_id)
+        self._refresh_dream_maps(pk=pk)
+        set_map_selection(widgets, map_id)
         messagebox.showinfo("完成", f"已重命名为「{new_name.strip()}」")
 
-    def _delete_dream_memory_map(self) -> None:
-        map_id = self._get_selected_dream_map_id()
+    def _delete_dream_map(self, pk: bool = False) -> None:
+        widgets = self._dream_widgets_for(pk)
+        map_id = get_selected_map_id(widgets)
         if not map_id:
             messagebox.showwarning("提示", "请先选择要删除的地图")
             return
-        dm_cfg = load_dream_memory_config(self.config_path)
+        dm_cfg = load_dream_cfg(self, pk)
         try:
             dream_map = load_map(map_id, maps_dir=dm_cfg.maps_dir)
         except FileNotFoundError:
@@ -1277,33 +1189,39 @@ class EndlessWinterApp(tk.Tk):
         ):
             return
         try:
-            delete_map(map_id, maps_dir=dm_cfg.maps_dir)
+            delete_map(
+                map_id,
+                maps_dir=dm_cfg.maps_dir,
+                previews_dir=dm_cfg.previews_dir,
+            )
         except FileNotFoundError as exc:
             messagebox.showerror("删除失败", str(exc))
             return
-        self._refresh_dream_memory_maps()
+        self._refresh_dream_maps(pk=pk)
         messagebox.showinfo("已删除", f"地图「{dream_map.name}」已删除")
 
-    def _open_dream_memory_calibrator(self) -> None:
+    def _open_dream_calibrator(self, pk: bool = False) -> None:
         dev = self.config.get("device", {})
         touch_w = int(dev.get("touch_width", 720))
         touch_h = int(dev.get("touch_height", 1280))
-        if (
-            self._dream_memory_calibrator is None
-            or not self._dream_memory_calibrator.winfo_exists()
-        ):
-            self._dream_memory_calibrator = DreamMemoryCalibratorWindow(
+        widgets = self._dream_widgets_for(pk)
+        calibrator_attr = "_dream_pk_calibrator" if pk else "_dream_memory_calibrator"
+        calibrator = getattr(self, calibrator_attr)
+        if calibrator is None or not calibrator.winfo_exists():
+            calibrator = DreamMemoryCalibratorWindow(
                 self,
                 config_path=self.config_path,
-                get_map_id=self._get_selected_dream_map_id,
+                get_map_id=lambda: get_selected_map_id(widgets),
                 screenshot_cb=self._capture_for_coord_ruler,
-                on_saved=self._on_dream_memory_map_saved,
+                on_saved=lambda mid, p=pk: self._on_dream_map_saved(mid, pk=p),
                 touch_width=touch_w,
                 touch_height=touch_h,
+                pk_mode=pk,
             )
+            setattr(self, calibrator_attr, calibrator)
         else:
-            self._dream_memory_calibrator._reload_item_list()
-        self._dream_memory_calibrator.show_window()
+            calibrator._reload_item_list()
+        calibrator.show_window()
 
     def _build_task_instance(self, entry: TaskEntry):
         if not entry.available:
@@ -1479,31 +1397,58 @@ class EndlessWinterApp(tk.Tk):
             self._dream_memory_worker is not None and self._dream_memory_worker.is_alive()
         )
 
+    def _is_dream_pk_running(self) -> bool:
+        return self._dream_pk_worker is not None and self._dream_pk_worker.is_alive()
+
+    def _is_any_dream_running(self) -> bool:
+        return self._is_dream_memory_running() or self._is_dream_pk_running()
+
     def _is_any_running(self) -> bool:
         return (
             self._is_loop_running()
             or self._is_once_running()
-            or self._is_dream_memory_running()
+            or self._is_any_dream_running()
         )
 
     def _set_loop_buttons(self, running: bool) -> None:
         self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.btn_stop_loop.configure(state=tk.NORMAL if running else tk.DISABLED)
-        if not self._is_once_running() and not self._is_dream_memory_running():
+        if not self._is_once_running() and not self._is_any_dream_running():
             self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
 
     def _set_once_buttons(self, running: bool) -> None:
         self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.btn_stop_once.configure(state=tk.NORMAL if running else tk.DISABLED)
-        if not self._is_loop_running() and not self._is_dream_memory_running():
+        if not self._is_loop_running() and not self._is_any_dream_running():
             self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
 
-    def _set_dream_memory_buttons(self, running: bool) -> None:
-        self.btn_dream_start.configure(state=tk.DISABLED if running else tk.NORMAL)
-        self.btn_dream_stop.configure(state=tk.NORMAL if running else tk.DISABLED)
-        if not self._is_loop_running() and not self._is_once_running():
+    def _set_dream_buttons(self, running: bool, *, pk: bool) -> None:
+        widgets = self._dream_widgets_for(pk)
+        widgets.btn_start.configure(state=tk.DISABLED if running else tk.NORMAL)
+        widgets.btn_stop.configure(state=tk.NORMAL if running else tk.DISABLED)
+        other_running = (
+            self._is_loop_running()
+            or self._is_once_running()
+            or (
+                self._is_dream_pk_running() if not pk else self._is_dream_memory_running()
+            )
+        )
+        if not other_running:
             self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
             self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
+        other_widgets = self._dream_pk_widgets if not pk else self._dream_widgets
+        if other_widgets is not None and not (
+            self._is_dream_pk_running() if not pk else self._is_dream_memory_running()
+        ):
+            other_widgets.btn_start.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
+
+    def _set_dream_memory_buttons(self, running: bool) -> None:
+        self._set_dream_buttons(running, pk=False)
+
+    def _set_dream_pk_buttons(self, running: bool) -> None:
+        self._set_dream_buttons(running, pk=True)
 
     def _ensure_device(self) -> bool:
         adb = self._get_adb()
@@ -1520,7 +1465,7 @@ class EndlessWinterApp(tk.Tk):
         if self._is_once_running():
             messagebox.showwarning("提示", "一次性任务正在执行，请稍候或先停止")
             return
-        if self._is_dream_memory_running():
+        if self._is_any_dream_running():
             messagebox.showwarning("提示", "寻梦记忆正在运行，请先点「结束」")
             return
         if not self._any_loop_selected():
@@ -1564,7 +1509,7 @@ class EndlessWinterApp(tk.Tk):
         if self._is_loop_running():
             messagebox.showwarning("提示", "循环任务运行中，请先停止后再执行一次性任务")
             return
-        if self._is_dream_memory_running():
+        if self._is_any_dream_running():
             messagebox.showwarning("提示", "寻梦记忆正在运行，请先点「结束」")
             return
         if not self._any_once_selected():
@@ -1708,22 +1653,24 @@ class EndlessWinterApp(tk.Tk):
                 task.stop()
         self._on_status("正在停止一次性任务…")
 
-    def _start_dream_memory(self) -> None:
-        if self._is_dream_memory_running():
-            messagebox.showwarning("提示", "寻梦记忆已在运行")
+    def _start_dream_session(self, pk: bool = False) -> None:
+        if self._is_dream_memory_running() if not pk else self._is_dream_pk_running():
+            title = "寻梦记忆PK" if pk else "寻梦记忆"
+            messagebox.showwarning("提示", f"{title}已在运行")
             return
-        if self._is_loop_running() or self._is_once_running():
+        if self._is_loop_running() or self._is_once_running() or self._is_any_dream_running():
             messagebox.showwarning("提示", "请先停止其他任务")
             return
 
-        map_id = self._get_selected_dream_map_id()
+        widgets = self._dream_widgets_for(pk)
+        map_id = get_selected_map_id(widgets)
         if not map_id:
             messagebox.showwarning("提示", "请先选择或创建地图")
             return
 
         try:
             self._save_config()
-            dm_cfg = load_dream_memory_config(self.config_path)
+            dm_cfg = load_dream_cfg(self, pk)
             game_map = load_map(map_id, maps_dir=dm_cfg.maps_dir)
         except FileNotFoundError as exc:
             messagebox.showerror("地图错误", str(exc))
@@ -1738,130 +1685,74 @@ class EndlessWinterApp(tk.Tk):
                 messagebox.showerror(
                     "RapidOCR 未安装",
                     "请运行:\n"
-                    "  .venv\\Scripts\\pip.exe install rapidocr-onnxruntime onnxruntime\n\n"
-                    "或在 config.yaml 设置 dream_memory.ocr_engine: tesseract",
+                    "  .venv\\Scripts\\pip.exe install rapidocr-onnxruntime onnxruntime",
                 )
             else:
                 messagebox.showerror(
                     "Tesseract 未安装",
-                    f"未找到:\n{dm_cfg.tesseract_cmd}\n\n"
-                    "下载: https://github.com/UB-Mannheim/tesseract/wiki\n"
-                    "安装时勾选 Chinese (Simplified) chi_sim",
+                    f"未找到:\n{dm_cfg.tesseract_cmd}",
                 )
             return
 
-        self._dream_memory_stop_event.clear()
-        self._set_dream_memory_buttons(running=True)
-        self._on_status(f"寻梦记忆：{game_map.name}")
+        title = "寻梦记忆PK" if pk else "寻梦记忆"
+        self._set_dream_buttons(running=True, pk=pk)
+        self._on_status(f"{title}：{game_map.name}")
 
         def work():
-            warmup_thread = threading.Thread(
-                target=lambda: warmup_ocr(dm_cfg.ocr_engine),
-                daemon=True,
-            )
-            warmup_thread.start()
             try:
                 if not self._ensure_device():
                     return
-                warmup_thread.join(timeout=60)
                 session = DreamMemorySession(
                     self._get_adb(),
                     game_map,
                     config=dm_cfg,
                     on_status=self._on_status,
                 )
-                self._dream_memory_session = session
+                if pk:
+                    self._dream_pk_session = session
+                else:
+                    self._dream_memory_session = session
                 session.reset_stop()
                 session.run_until_stopped()
             except Exception as exc:
-                self._on_status(f"寻梦记忆异常：{exc}")
+                self._on_status(f"{title}异常：{exc}")
             finally:
-                self._dream_memory_session = None
-                self.after(0, self._on_dream_memory_worker_done)
+                if pk:
+                    self._dream_pk_session = None
+                    self.after(0, lambda: self._on_dream_session_done(pk=True))
+                else:
+                    self._dream_memory_session = None
+                    self.after(0, lambda: self._on_dream_session_done(pk=False))
 
-        self._dream_memory_worker = threading.Thread(target=work, daemon=True)
-        self._dream_memory_worker.start()
+        worker = threading.Thread(target=work, daemon=True)
+        if pk:
+            self._dream_pk_worker = worker
+        else:
+            self._dream_memory_worker = worker
+        worker.start()
+
+    def _stop_dream_session(self, pk: bool = False) -> None:
+        title = "寻梦记忆PK" if pk else "寻梦记忆"
+        session = self._dream_pk_session if pk else self._dream_memory_session
+        if session is not None:
+            session.stop()
+        self._on_status(f"正在结束{title}…")
+
+    def _on_dream_session_done(self, pk: bool) -> None:
+        self._set_dream_buttons(running=False, pk=pk)
+        if pk:
+            self._dream_pk_worker = None
+        else:
+            self._dream_memory_worker = None
+
+    def _start_dream_memory(self) -> None:
+        self._start_dream_session(pk=False)
 
     def _stop_dream_memory(self) -> None:
-        self._dream_memory_stop_event.set()
-        if self._dream_memory_session is not None:
-            self._dream_memory_session.stop()
-        self._on_status("正在结束寻梦记忆…")
+        self._stop_dream_session(pk=False)
 
     def _on_dream_memory_worker_done(self) -> None:
-        self._set_dream_memory_buttons(running=False)
-        self._dream_memory_worker = None
-
-    def _set_mitm_buttons(self, running: bool) -> None:
-        self.btn_start_mitm.configure(state=tk.DISABLED if running else tk.NORMAL)
-        self.btn_stop_mitm.configure(state=tk.NORMAL if running else tk.DISABLED)
-
-    def _update_mitm_status_label(self, *, running: bool, detail: str = "") -> None:
-        if running and detail:
-            text = f"抓包代理：运行中（{detail}）"
-            color = "green"
-        elif running:
-            text = "抓包代理：运行中"
-            color = "green"
-        else:
-            hint = (
-                f"流量面板 http://127.0.0.1:{MITMWEB_DEFAULT_PORT}，"
-                "抓包存 assets/captures/"
-            )
-            if not mitm_is_installed():
-                hint = (
-                    "未安装 mitmproxy，请运行: "
-                    ".venv\\Scripts\\pip.exe install -r requirements-network.txt"
-                )
-            suffix = f" — {detail}" if detail else ""
-            text = f"抓包代理：未运行（{hint}）{suffix}"
-            color = "gray"
-        self.lbl_mitm_status.configure(text=text, foreground=color)
-
-    def _start_mitm_proxy(self) -> None:
-        if self._mitm_runner.running:
-            messagebox.showinfo("提示", "抓包代理已在运行")
-            return
-        try:
-            status = self._mitm_runner.start(self.config_path, web=True)
-        except MitmNotInstalledError as exc:
-            messagebox.showerror("未安装 mitmproxy", str(exc))
-            return
-        except MitmAlreadyRunningError:
-            messagebox.showinfo("提示", "抓包代理已在运行")
-            return
-        except OSError as exc:
-            messagebox.showerror("启动失败", str(exc))
-            self._mitm_runner.stop()
-            return
-
-        detail = (
-            f"代理端口 {status.listen_port}，面板 {status.web_url}，"
-            f"目录 {status.capture_dir.name}/"
-        )
-        self._set_mitm_buttons(running=True)
-        self._update_mitm_status_label(running=True, detail=detail)
-        self._on_status(f"抓包代理已启动（{status.web_url}）")
-        self.after(500, self._poll_mitm_proxy)
-
-    def _stop_mitm_proxy(self) -> None:
-        if not self._mitm_runner.running:
-            self._set_mitm_buttons(running=False)
-            self._update_mitm_status_label(running=False)
-            return
-        self._mitm_runner.stop()
-        self._set_mitm_buttons(running=False)
-        self._update_mitm_status_label(running=False)
-        self._on_status("抓包代理已停止")
-
-    def _poll_mitm_proxy(self) -> None:
-        if self._mitm_runner.running:
-            self.after(1000, self._poll_mitm_proxy)
-            return
-        if str(self.btn_stop_mitm.cget("state")) == "normal":
-            self._set_mitm_buttons(running=False)
-            self._update_mitm_status_label(running=False, detail="进程已意外退出")
-            self._on_status("抓包代理已退出")
+        self._on_dream_session_done(pk=False)
 
     def _on_loop_worker_done(self) -> None:
         self._set_loop_buttons(running=False)
@@ -1874,19 +1765,12 @@ class EndlessWinterApp(tk.Tk):
         self._once_worker = None
 
     def _on_close(self) -> None:
-        mitm_running = self._mitm_runner.running
-        tasks_running = self._is_any_running()
-        if tasks_running or mitm_running:
-            prompt = "任务正在运行，确定停止并退出？"
-            if mitm_running and not tasks_running:
-                prompt = "抓包代理正在运行，确定停止并退出？"
-            elif mitm_running and tasks_running:
-                prompt = "任务与抓包代理正在运行，确定停止并退出？"
-            if messagebox.askokcancel("退出", prompt):
+        if self._is_any_running():
+            if messagebox.askokcancel("退出", "任务正在运行，确定停止并退出？"):
                 self._stop_loop()
                 self._stop_once()
                 self._stop_dream_memory()
-                self._stop_mitm_proxy()
+                self._stop_dream_session(pk=True)
                 self.destroy()
         else:
             try:

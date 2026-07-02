@@ -267,36 +267,45 @@ tasks:
       mission_confirm_1_beast:
       - 354
       - 886
-network:
-  capture_dir: assets/captures
-  session_file: assets/captures/session.json
-  proxy:
-    listen_host: 0.0.0.0
-    listen_port: 8080
-  capture:
-    include_hosts: []
-    exclude_hosts:
-      - google
-      - gstatic
-      - googleapis
-      - facebook
-      - crashlytics
-      - firebase
-    save_response: true
-    max_body_bytes: 1048576
-  client:
-    timeout: 30.0
-    verify_ssl: true
-    proxy_url: null
 dream_memory:
   tesseract_cmd: C:\Program Files\Tesseract-OCR\tesseract.exe
   selected_map: example_gazebo
   tap_delay: 1.2
-  tap_between_delay: 0.4
+  tap_between_delay: 0.55
+  tap_between_delay_min: 0.45
+  tap_between_delay_max: 0.7
+  tap_between_delay_mode: 0.55
   scan_interval: 0.35
+  enable_misclick: true
+  misclick_interval_min: 8
+  misclick_interval_max: 12
+  bar_refresh_min_wait: 0.4
+  bar_refresh_poll: 0.08
+  bar_refresh_timeout: 2.5
   chip_active_min_brightness: 95
   ocr_engine: rapidocr
   target_slots:
     - [38, 1140, 248, 1194]
     - [250, 1142, 462, 1196]
     - [468, 1136, 674, 1200]
+dream_memory_pk:
+  selected_map: ''
+  pk_item_filter: all
+  enable_misclick: false
+  tap_between_delay: 0.09
+  tap_between_delay_min: 0.09
+  tap_between_delay_max: 0.09
+  tap_between_delay_mode: 0.09
+  scan_interval: 0.2
+  bar_refresh_min_wait: 0
+  bar_refresh_poll: 0.05
+  bar_refresh_timeout: 0
+  ocr_engine: rapidocr
+  chip_fuzzy_min_ratio: 0.9
+  target_slots:
+    - [26, 1120, 236, 1178]
+    - [246, 1118, 472, 1180]
+    - [484, 1116, 698, 1182]
+    - [22, 1188, 226, 1256]
+    - [240, 1186, 464, 1256]
+    - [476, 1188, 688, 1254]

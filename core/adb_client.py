@@ -172,6 +172,10 @@ class AdbClient:
         return "connected" in output.lower() or self.address in self._run("devices").stdout
 
     def wait_for_device(self, retries: int = 30, interval: float = 2.0) -> bool:
+        quick = self._run("-s", self.address, "shell", "echo", "ok", timeout=5)
+        if quick.returncode == 0 and "ok" in quick.stdout:
+            logger.debug(f"设备已就绪(快速): {self.address}")
+            return True
         for attempt in range(1, retries + 1):
             if self.connect():
                 check = self._run("-s", self.address, "shell", "echo", "ok")
