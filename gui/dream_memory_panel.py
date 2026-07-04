@@ -9,10 +9,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from core.dream_memory.config import (
-    PK_ITEM_FILTER_LABELS,
+    TAP_INTERVAL_LABELS,
+    format_tap_interval_hint,
     load_dream_memory_config,
     load_dream_memory_pk_config,
-    normalize_pk_item_filter,
+    normalize_tap_between_interval,
 )
 from core.dream_memory.maps import (
     find_map_preview,
@@ -37,7 +38,8 @@ class DreamTabWidgets:
     lbl_ocr: ttk.Label
     btn_start: ttk.Button
     btn_stop: ttk.Button
-    var_item_filter: tk.StringVar | None = None
+    var_tap_interval: tk.StringVar | None = None
+    cmb_tap_interval: ttk.Combobox | None = None
     label_to_id: dict[str, str] = field(default_factory=dict)
     id_to_label: dict[str, str] = field(default_factory=dict)
 
@@ -61,6 +63,16 @@ def get_selected_map_id(widgets: DreamTabWidgets) -> str:
     return sel
 
 
+def get_tap_interval_mode(widgets: DreamTabWidgets) -> str:
+    if widgets.var_tap_interval is None:
+        return normalize_tap_between_interval(None)
+    label = widgets.var_tap_interval.get().strip()
+    for key, text in TAP_INTERVAL_LABELS.items():
+        if label == text:
+            return key
+    return normalize_tap_between_interval(label)
+
+
 def set_map_selection(widgets: DreamTabWidgets, map_id: str) -> None:
     label = widgets.id_to_label.get(map_id, map_id)
     widgets.var_map.set(label)
@@ -81,15 +93,10 @@ def update_summary(app: EndlessWinterApp, widgets: DreamTabWidgets) -> None:
             if has_map_preview(map_id, previews_dir=dm_cfg.previews_dir)
             else ""
         )
-        filter_hint = ""
-        if widgets.pk and widgets.var_item_filter is not None:
-            mode = normalize_pk_item_filter(widgets.var_item_filter.get())
-            if mode != "all":
-                filter_hint = f" · 分工 {PK_ITEM_FILTER_LABELS.get(mode, mode)}"
         widgets.lbl_summary.configure(
             text=(
                 f"显示名：{dream_map.name} · 已标定 {len(dream_map.items)} 个物品"
-                f" · 识别区 {slot_hint}{preview_hint}{filter_hint}"
+                f" · 识别区 {slot_hint}{preview_hint}"
             )
         )
     except FileNotFoundError:
@@ -257,6 +264,25 @@ def build_dream_tab(
     )
     lbl_summary.pack(anchor=tk.W, pady=(0, 4))
 
+    interval_key = normalize_tap_between_interval(dm_cfg.tap_between_interval)
+    var_tap_interval = tk.StringVar(value=TAP_INTERVAL_LABELS[interval_key])
+    row_interval = ttk.Frame(parent)
+    row_interval.pack(fill=tk.X, pady=(0, 6))
+    ttk.Label(row_interval, text="连点间隔").pack(side=tk.LEFT)
+    cmb_tap_interval = ttk.Combobox(
+        row_interval,
+        textvariable=var_tap_interval,
+        values=list(TAP_INTERVAL_LABELS.values()),
+        state="readonly",
+        width=8,
+    )
+    cmb_tap_interval.pack(side=tk.LEFT, padx=(8, 8))
+    ttk.Label(
+        row_interval,
+        text=f"固定=min({dm_cfg.tap_between_delay_min:g}s)，随机=min~max",
+        foreground="#555",
+    ).pack(side=tk.LEFT)
+
     preview_btn_frame = ttk.Frame(parent)
     preview_btn_frame.pack(anchor=tk.W, pady=(0, 6))
 
@@ -269,6 +295,8 @@ def build_dream_tab(
         lbl_ocr=ttk.Label(parent, text=""),
         btn_start=ttk.Button(parent, text="开始游戏"),
         btn_stop=ttk.Button(parent, text="结束"),
+        var_tap_interval=var_tap_interval,
+        cmb_tap_interval=cmb_tap_interval,
         label_to_id=label_to_id,
         id_to_label=id_to_label,
     )
@@ -309,41 +337,16 @@ def build_dream_tab(
     widgets.lbl_ocr.pack(anchor=tk.W, pady=(0, 6))
 
     if pk:
-        filter_row = ttk.Frame(parent)
-        filter_row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(filter_row, text="标定点分工").pack(side=tk.LEFT)
-        saved_filter = normalize_pk_item_filter(
-            str(app.config.get(section, {}).get("pk_item_filter") or "all")
-        )
-        var_item_filter = tk.StringVar(
-            value=PK_ITEM_FILTER_LABELS.get(saved_filter, "全部")
-        )
-        cmb_filter = ttk.Combobox(
-            filter_row,
-            textvariable=var_item_filter,
-            values=[PK_ITEM_FILTER_LABELS[k] for k in ("all", "odd", "even")],
-            state="readonly",
-            width=10,
-        )
-        cmb_filter.pack(side=tk.LEFT, padx=(8, 0))
-        cmb_filter.bind("<<ComboboxSelected>>", lambda _e: on_map_changed())
-        widgets.var_item_filter = var_item_filter
-        ttk.Label(
-            filter_row,
-            text="（按标定顺序：单数=第1/3/5…，双数=第2/4/6…，双开各选一项）",
-            foreground="gray",
-        ).pack(side=tk.LEFT, padx=(8, 0))
-
-    if pk:
         usage = (
-            "PK 模式：扫描与点击解耦。每个物品整局只入队一次；"
-            "双开时一个选「单数」、另一个选「双数」即可各点各的。"
+            "PK 模式：扫描与点击解耦。每个物品整局只入队一次，重复扫描不再入队；"
+            f"扫描间隔 {dm_cfg.scan_interval:g}s，{format_tap_interval_hint(dm_cfg)}。"
         )
     else:
         usage = (
             "用法：模拟器内手动进入寻梦记忆关卡 → 本页选地图 → 点「开始游戏」"
             " → 脚本 OCR 底栏并点击 → 关卡结束点「结束」。"
-            "约每 8–12 次正常点击会随机误点一次屏幕中心附近。"
+            f"支持模糊匹配；未匹配地图不点击。{format_tap_interval_hint(dm_cfg)}，"
+            f"扫描 {dm_cfg.scan_interval:g}s。"
         )
     ttk.Label(
         parent,

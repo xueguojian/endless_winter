@@ -40,41 +40,34 @@ DEFAULT_PK_TARGET_BAR: tuple[int, int, int, int] = (22, 1116, 698, 1256)
 DEFAULT_TESSERACT_CMD = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
 DEFAULT_OCR_ENGINE = "rapidocr"
 
-PK_ITEM_FILTER_ALL = "all"
-PK_ITEM_FILTER_ODD = "odd"
-PK_ITEM_FILTER_EVEN = "even"
-PK_ITEM_FILTER_CHOICES = (PK_ITEM_FILTER_ALL, PK_ITEM_FILTER_ODD, PK_ITEM_FILTER_EVEN)
-PK_ITEM_FILTER_LABELS: dict[str, str] = {
-    PK_ITEM_FILTER_ALL: "全部",
-    PK_ITEM_FILTER_ODD: "单数",
-    PK_ITEM_FILTER_EVEN: "双数",
+TAP_INTERVAL_FIXED = "fixed"
+TAP_INTERVAL_RANDOM = "random"
+TAP_INTERVAL_CHOICES = (TAP_INTERVAL_FIXED, TAP_INTERVAL_RANDOM)
+TAP_INTERVAL_LABELS: dict[str, str] = {
+    TAP_INTERVAL_FIXED: "固定",
+    TAP_INTERVAL_RANDOM: "随机",
 }
 
 
-def normalize_pk_item_filter(raw: str | None) -> str:
-    """PK 标定点分工：all=全部，odd=第1/3/5…个，even=第2/4/6…个（按 YAML 标定顺序）。"""
+def normalize_tap_between_interval(raw: str | None) -> str:
     if not raw:
-        return PK_ITEM_FILTER_ALL
+        return TAP_INTERVAL_FIXED
     text = str(raw).strip()
-    for key, label in PK_ITEM_FILTER_LABELS.items():
+    for key, label in TAP_INTERVAL_LABELS.items():
         if text == key or text == label:
             return key
     lowered = text.lower()
-    if lowered in PK_ITEM_FILTER_CHOICES:
+    if lowered in TAP_INTERVAL_CHOICES:
         return lowered
-    return PK_ITEM_FILTER_ALL
+    return TAP_INTERVAL_FIXED
 
 
-def pk_item_filter_matches(ordinal_1based: int, filter_mode: str) -> bool:
-    """ordinal_1based 为标定顺序（从 1 开始）。"""
-    mode = normalize_pk_item_filter(filter_mode)
-    if mode == PK_ITEM_FILTER_ALL:
-        return True
-    if mode == PK_ITEM_FILTER_ODD:
-        return ordinal_1based % 2 == 1
-    if mode == PK_ITEM_FILTER_EVEN:
-        return ordinal_1based % 2 == 0
-    return True
+def format_tap_interval_hint(cfg: "DreamMemoryConfig") -> str:
+    low = min(cfg.tap_between_delay_min, cfg.tap_between_delay_max)
+    high = max(cfg.tap_between_delay_min, cfg.tap_between_delay_max)
+    if normalize_tap_between_interval(cfg.tap_between_interval) == TAP_INTERVAL_FIXED:
+        return f"连点固定 {low:g}s"
+    return f"连点随机 {low:g}~{high:g}s"
 
 
 def default_pk_target_slots() -> tuple[tuple[int, int, int, int], ...]:
@@ -87,11 +80,12 @@ class DreamMemoryConfig:
     tesseract_cmd: Path = field(default_factory=lambda: DEFAULT_TESSERACT_CMD)
     selected_map: str = ""
     tap_delay: float = 1.2
-    tap_between_delay: float = 0.55
-    tap_between_delay_min: float = 0.45
-    tap_between_delay_max: float = 0.7
-    tap_between_delay_mode: float = 0.55
-    scan_interval: float = 0.35
+    tap_between_delay: float = 0.2
+    tap_between_delay_min: float = 0.2
+    tap_between_delay_max: float = 0.35
+    tap_between_delay_mode: float = 0.27
+    tap_between_interval: str = TAP_INTERVAL_FIXED
+    scan_interval: float = 0.3
     chip_active_min_brightness: float = 95.0
     target_bar: tuple[int, int, int, int] = DEFAULT_TARGET_BAR
     max_target_slots: int = 4
@@ -116,7 +110,6 @@ class DreamMemoryConfig:
     bar_refresh_poll: float = 0.08
     bar_refresh_timeout: float = 2.5
     bar_change_mean_delta: float = 8.0
-    pk_item_filter: str = PK_ITEM_FILTER_ALL
 
     def ensure_dirs(self) -> None:
         self.maps_dir.mkdir(parents=True, exist_ok=True)
@@ -154,10 +147,11 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
         default_maps = PK_MAPS_DIR
         default_previews = PK_PREVIEWS_DIR
         timing = dict(
-            tap_between_delay=0.1,
-            tap_between_delay_min=0.1,
-            tap_between_delay_max=0.1,
-            tap_between_delay_mode=0.1,
+            tap_between_delay=0.09,
+            tap_between_delay_min=0.09,
+            tap_between_delay_max=0.09,
+            tap_between_delay_mode=0.09,
+            tap_between_interval=TAP_INTERVAL_FIXED,
             scan_interval=0.3,
             bar_refresh_min_wait=0.0,
             bar_refresh_poll=0.05,
@@ -174,11 +168,12 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
         default_maps = MAPS_DIR
         default_previews = PREVIEWS_DIR
         timing = dict(
-            tap_between_delay=0.55,
-            tap_between_delay_min=0.45,
-            tap_between_delay_max=0.7,
-            tap_between_delay_mode=0.55,
-            scan_interval=0.35,
+            tap_between_delay=0.2,
+            tap_between_delay_min=0.2,
+            tap_between_delay_max=0.35,
+            tap_between_delay_mode=0.27,
+            tap_between_interval=TAP_INTERVAL_FIXED,
+            scan_interval=0.3,
             bar_refresh_min_wait=0.4,
             bar_refresh_poll=0.08,
             bar_refresh_timeout=2.5,
@@ -188,7 +183,7 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
             min_target_slots=3,
             target_slots=DEFAULT_TARGET_SLOTS,
         )
-        misclick_default = True
+        misclick_default = False
 
     fuzzy_default = 0.9 if pk else 0.72
 
@@ -208,6 +203,9 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
                 "tap_between_delay_mode",
                 raw.get("tap_between_delay", timing["tap_between_delay_mode"]),
             )
+        ),
+        tap_between_interval=normalize_tap_between_interval(
+            raw.get("tap_between_delay_interval", timing["tap_between_interval"])
         ),
         scan_interval=float(raw.get("scan_interval", timing["scan_interval"])),
         chip_active_min_brightness=float(raw.get("chip_active_min_brightness", 95.0)),
@@ -236,7 +234,6 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
             raw.get("bar_refresh_timeout", timing["bar_refresh_timeout"])
         ),
         bar_change_mean_delta=float(raw.get("bar_change_mean_delta", 8.0)),
-        pk_item_filter=normalize_pk_item_filter(raw.get("pk_item_filter")),
     )
     cfg.maps_dir = _parse_optional_path(raw.get("maps_dir"), default_maps)
     cfg.previews_dir = _parse_optional_path(raw.get("previews_dir"), default_previews)
@@ -263,11 +260,13 @@ def load_dream_memory_pk_config(config_path: str | Path | None = None) -> DreamM
 
 
 def sample_tap_between_delay(cfg: DreamMemoryConfig) -> float:
-    """同批内两次点击间隔：三角分布，众数约 mode，均值接近 mode。"""
+    """连点间隔：固定模式取 min；随机模式在 min~max 间三角分布。"""
     import random
 
     low = min(cfg.tap_between_delay_min, cfg.tap_between_delay_max)
     high = max(cfg.tap_between_delay_min, cfg.tap_between_delay_max)
+    if normalize_tap_between_interval(cfg.tap_between_interval) == TAP_INTERVAL_FIXED:
+        return low
     mode = min(max(cfg.tap_between_delay_mode, low), high)
     return random.triangular(low, high, mode)
 

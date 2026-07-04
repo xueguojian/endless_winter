@@ -121,13 +121,14 @@ def recognize_chip_label(
     template_min_score: float = 0.88,
     template_min_margin: float = 0.08,
     fuzzy_min_ratio: float = 0.72,
+    map_aliases: dict[str, str] | None = None,
+    strict: bool = False,
 ) -> tuple[str, str]:
-    """识别槽位文字：RapidOCR/Tesseract → 精确命中 → 模糊纠错。"""
+    """识别槽位文字，strict 时仅精确/别名/OCR 纠错命中地图名。"""
     if chip_bgr.size == 0:
         return "", ""
 
     ocr_text = ""
-    engine_name = ""
 
     try:
         from core.dream_memory.ocr_engine import resolve_ocr_engine
@@ -136,9 +137,8 @@ def recognize_chip_label(
             from core.dream_memory.ocr_rapid import ocr_chip_rapid_robust
 
             ocr_text = ocr_chip_rapid_robust(chip_bgr, map_keys)
-            engine_name = "rapidocr"
         else:
-            ocr_text, engine_name = ocr_chip_text(
+            ocr_text, _engine = ocr_chip_text(
                 chip_bgr,
                 engine=ocr_engine,
                 tesseract_cmd=tesseract_cmd,
@@ -146,11 +146,18 @@ def recognize_chip_label(
     except (FileNotFoundError, RuntimeError) as exc:
         logger.warning(f"OCR 失败: {exc}")
 
-    return _label_from_ocr_text(
+    from core.dream_memory.label_resolve import resolve_chip_label
+
+    return resolve_chip_label(
+        chip_bgr,
         ocr_text,
         map_keys,
-        engine_name,
+        map_aliases=map_aliases,
+        refs_dir=refs_dir,
         fuzzy_min_ratio=fuzzy_min_ratio,
+        template_min_score=min(template_min_score, 0.75),
+        template_min_margin=min(template_min_margin, 0.05),
+        strict=strict,
     )
 
 
@@ -341,20 +348,6 @@ def read_target_chips(
                     template_min_margin=min(template_min_margin, 0.05),
                     strict=pk_mode,
                 )
-                if name not in keys_set and ocr_text and not pk_mode:
-                    retry = ocr_chip_rapid_robust(patches[slot_index], map_keys)
-                    if retry and retry != ocr_text:
-                        name, method = resolve_chip_label(
-                            patches[slot_index],
-                            retry,
-                            map_keys,
-                            map_aliases=map_aliases,
-                            refs_dir=refs_dir,
-                            fuzzy_min_ratio=fuzzy_min_ratio,
-                            template_min_score=min(template_min_score, 0.75),
-                            template_min_margin=min(template_min_margin, 0.05),
-                            strict=pk_mode,
-                        )
                 if pk_mode and name not in keys_set:
                     name, method = "", ""
                 batch_labels[slot_index] = (name, method)
@@ -380,6 +373,8 @@ def read_target_chips(
                     template_min_score=template_min_score,
                     template_min_margin=template_min_margin,
                     fuzzy_min_ratio=fuzzy_min_ratio,
+                    map_aliases=map_aliases,
+                    strict=pk_mode,
                 )
                 if text and method:
                     logger.debug(f"槽位 {index + 1} {method} -> {text!r}")

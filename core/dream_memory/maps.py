@@ -156,16 +156,6 @@ class DreamMemoryMap:
                 return int(coord[0]), int(coord[1])
         return None
 
-    def item_ordinal_index(self, label: str) -> int | None:
-        """物品在地图 YAML 中的标定顺序（从 1 开始）。"""
-        resolved = self.resolve_label(label)
-        if not resolved or resolved not in self.items:
-            return None
-        for index, name in enumerate(self.items.keys(), start=1):
-            if name == resolved:
-                return index
-        return None
-
 
 def list_maps(maps_dir: Path | None = None) -> list[DreamMemoryMap]:
     root = maps_dir or MAPS_DIR

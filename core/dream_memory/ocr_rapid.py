@@ -120,7 +120,7 @@ def ocr_slots_batch(
                 logger.debug(f"RapidOCR rec scale={scale}: {text!r} ({total:.3f}s)")
             texts.append(text)
     elapsed = time.perf_counter() - t0
-    logger.debug(f"RapidOCR {len(patches)} 槽识别: {texts} ({elapsed:.2f}s)")
+    logger.info(f"RapidOCR {len(patches)} 槽识别: {texts} ({elapsed:.2f}s)")
     return texts
 
 
@@ -131,6 +131,9 @@ def ocr_chip_rapid_robust(
     """单槽复识：仅易混词或未命中地图名时高倍率再识一次。"""
     keys = set(map_keys or [])
     primary = ocr_chip_rapid(chip_bgr, scale=DEFAULT_SCALE)
+    if not primary:
+        retry = ocr_chip_rapid(chip_bgr, scale=RETRY_SCALE)
+        return retry
     if primary in keys and primary not in AMBIGUOUS_LABELS:
         return primary
     if primary in AMBIGUOUS_LABELS or (primary and primary not in keys):

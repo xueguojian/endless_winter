@@ -18,12 +18,7 @@ from core.config_path import (
     ensure_config_file,
     resolve_config_path,
 )
-from core.dream_memory.config import (
-    load_dream_memory_config,
-    load_dream_memory_pk_config,
-    normalize_pk_item_filter,
-    PK_ITEM_FILTER_LABELS,
-)
+from core.dream_memory.config import load_dream_memory_config, load_dream_memory_pk_config
 from core.dream_memory.maps import delete_map, list_maps, load_map, rename_map_name
 from core.dream_memory.ocr_engine import ocr_engine_available, resolve_ocr_engine, warmup_ocr
 from core.navigation import return_to_main_screen
@@ -33,6 +28,7 @@ from gui.dream_memory_panel import (
     DreamTabWidgets,
     build_dream_tab,
     get_selected_map_id,
+    get_tap_interval_mode,
     load_dream_cfg,
     rebuild_map_index,
     set_map_selection,
@@ -290,13 +286,11 @@ class EndlessWinterApp(tk.Tk):
         if self._dream_widgets is not None:
             dm = cfg.setdefault("dream_memory", {})
             dm["selected_map"] = get_selected_map_id(self._dream_widgets)
+            dm["tap_between_delay_interval"] = get_tap_interval_mode(self._dream_widgets)
         if self._dream_pk_widgets is not None:
             pk = cfg.setdefault("dream_memory_pk", {})
             pk["selected_map"] = get_selected_map_id(self._dream_pk_widgets)
-            if self._dream_pk_widgets.var_item_filter is not None:
-                label = self._dream_pk_widgets.var_item_filter.get().strip()
-                reverse = {v: k for k, v in PK_ITEM_FILTER_LABELS.items()}
-                pk["pk_item_filter"] = reverse.get(label, normalize_pk_item_filter(label))
+            pk["tap_between_delay_interval"] = get_tap_interval_mode(self._dream_pk_widgets)
 
         with open(self.config_path, "w", encoding="utf-8") as f:
             yaml.dump(cfg, f, allow_unicode=True, sort_keys=False)
@@ -446,12 +440,6 @@ class EndlessWinterApp(tk.Tk):
         self.var_dream_memory_map = self._dream_widgets.var_map
         self.btn_dream_start = self._dream_widgets.btn_start
         self.btn_dream_stop = self._dream_widgets.btn_stop
-
-    def _schedule_dream_ocr_warmup(self) -> None:
-        """首次进入寻梦记忆相关 Tab 时后台加载 RapidOCR，避免 GUI 启动即占内存。"""
-        if getattr(self, "_dream_ocr_warmup_scheduled", False):
-            return
-        self._dream_ocr_warmup_scheduled = True
         dm_cfg = load_dream_memory_config(self.config_path)
         if resolve_ocr_engine(dm_cfg.ocr_engine) == "rapidocr" and ocr_engine_available(
             dm_cfg.ocr_engine
@@ -459,7 +447,6 @@ class EndlessWinterApp(tk.Tk):
             threading.Thread(
                 target=lambda: warmup_ocr(dm_cfg.ocr_engine),
                 daemon=True,
-                name="dream-ocr-warmup",
             ).start()
 
     def _build_dream_pk_tab(self, parent: ttk.Frame) -> None:
@@ -480,13 +467,6 @@ class EndlessWinterApp(tk.Tk):
         )
         self.btn_dream_pk_start = self._dream_pk_widgets.btn_start
         self.btn_dream_pk_stop = self._dream_pk_widgets.btn_stop
-
-    def _on_task_tab_changed(self, _event=None) -> None:
-        if not hasattr(self, "_task_notebook"):
-            return
-        tab_text = self._task_notebook.tab(self._task_notebook.index("current"), "text")
-        if tab_text in ("寻梦记忆", "寻梦记忆PK"):
-            self._schedule_dream_ocr_warmup()
 
     def _refresh_dream_memory_maps(self) -> None:
         self._refresh_dream_maps(pk=False)
@@ -868,8 +848,6 @@ class EndlessWinterApp(tk.Tk):
 
         task_notebook = ttk.Notebook(task_frame)
         task_notebook.pack(fill=tk.X)
-        self._task_notebook = task_notebook
-        task_notebook.bind("<<NotebookTabChanged>>", self._on_task_tab_changed)
 
         tab_loop = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_loop, text="循环任务")

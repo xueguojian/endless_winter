@@ -271,14 +271,13 @@ dream_memory:
   tesseract_cmd: C:\Program Files\Tesseract-OCR\tesseract.exe
   selected_map: example_gazebo
   tap_delay: 1.2
-  tap_between_delay: 0.55
-  tap_between_delay_min: 0.45
-  tap_between_delay_max: 0.7
-  tap_between_delay_mode: 0.55
-  scan_interval: 0.35
-  enable_misclick: true
-  misclick_interval_min: 8
-  misclick_interval_max: 12
+  tap_between_delay: 0.2
+  tap_between_delay_min: 0.2
+  tap_between_delay_max: 0.35
+  tap_between_delay_mode: 0.27
+  tap_between_delay_interval: fixed
+  scan_interval: 0.3
+  enable_misclick: false
   bar_refresh_min_wait: 0.4
   bar_refresh_poll: 0.08
   bar_refresh_timeout: 2.5
@@ -290,12 +289,12 @@ dream_memory:
     - [468, 1136, 674, 1200]
 dream_memory_pk:
   selected_map: ''
-  pk_item_filter: all
   enable_misclick: false
-  tap_between_delay: 0.1
-  tap_between_delay_min: 0.1
-  tap_between_delay_max: 0.1
-  tap_between_delay_mode: 0.1
+  tap_between_delay: 0.09
+  tap_between_delay_min: 0.09
+  tap_between_delay_max: 0.09
+  tap_between_delay_mode: 0.09
+  tap_between_delay_interval: fixed
   scan_interval: 0.3
   bar_refresh_min_wait: 0
   bar_refresh_poll: 0.05

@@ -229,11 +229,11 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         except FileNotFoundError:
             self._redraw_markers()
             return
-        for index, (name, coord) in enumerate(dream_map.items.items(), start=1):
+        for name, coord in sorted(dream_map.items.items()):
             if len(coord) >= 2:
                 x, y = int(coord[0]), int(coord[1])
                 self._saved_markers[name] = (x, y)
-                self.list_items.insert(tk.END, f"{index}. {name}  ({x}, {y})")
+                self.list_items.insert(tk.END, f"{name}  ({x}, {y})")
         self._redraw_markers()
 
     def _create_map_dialog(self) -> None:
@@ -360,20 +360,13 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         if self._on_saved:
             self._on_saved(map_id)
 
-    def _item_name_from_list_line(self, line: str) -> str:
-        name = line.split("  (", 1)[0].strip()
-        prefix, sep, rest = name.partition(". ")
-        if sep and prefix.isdigit():
-            return rest
-        return name
-
     def _delete_selected_item(self) -> None:
         selection = self.list_items.curselection()
         if not selection:
             messagebox.showinfo("提示", "请先在列表中选择一项", parent=self)
             return
         line = self.list_items.get(selection[0])
-        name = self._item_name_from_list_line(line)
+        name = line.split("  (", 1)[0].strip()
         map_id = self._current_map_id()
         if not map_id:
             return
@@ -394,7 +387,7 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         if not selection:
             return
         line = self.list_items.get(selection[0])
-        name = self._item_name_from_list_line(line)
+        name = line.split("  (", 1)[0].strip()
         self.var_item_name.set(name)
         if name in self._saved_markers:
             x, y = self._saved_markers[name]

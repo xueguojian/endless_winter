@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -44,7 +43,6 @@ class AdbClient:
         self.adb = self._resolve_adb(adb_path)
         self.touch_width = touch_width
         self.touch_height = touch_height
-        self._io_lock = threading.Lock()
 
     @classmethod
     def resolve_adb_path(cls, adb_path: str = "") -> str:
@@ -202,25 +200,23 @@ class AdbClient:
 
     def screenshot(self) -> np.ndarray:
         """截取屏幕，返回 BGR 数组，shape=(height, width)，与 input tap 同一竖屏坐标系。"""
-        with self._io_lock:
-            proc = subprocess.run(
-                [self.adb, "-s", self.address, "exec-out", "screencap", "-p"],
-                capture_output=True,
-                timeout=15,
-                creationflags=_WIN_SUBPROCESS_FLAGS,
-            )
-            if proc.returncode != 0:
-                raise RuntimeError("截图失败，请确认模拟器已启动且 ADB 已连接")
+        proc = subprocess.run(
+            [self.adb, "-s", self.address, "exec-out", "screencap", "-p"],
+            capture_output=True,
+            timeout=15,
+            creationflags=_WIN_SUBPROCESS_FLAGS,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError("截图失败，请确认模拟器已启动且 ADB 已连接")
 
-            image = Image.open(io.BytesIO(proc.stdout)).convert("RGB")
-            rgb = np.array(image)
-            return rgb[:, :, ::-1].copy()
+        image = Image.open(io.BytesIO(proc.stdout)).convert("RGB")
+        rgb = np.array(image)
+        return rgb[:, :, ::-1].copy()
 
     def tap(self, x: int, y: int) -> None:
         x = max(0, min(x, self.touch_width - 1))
         y = max(0, min(y, self.touch_height - 1))
-        with self._io_lock:
-            self._run("-s", self.address, "shell", "input", "tap", str(x), str(y))
+        self._run("-s", self.address, "shell", "input", "tap", str(x), str(y))
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> None:
         self._run(

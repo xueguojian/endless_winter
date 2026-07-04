@@ -12,10 +12,8 @@ from loguru import logger
 from core.adb_client import AdbClient
 from core.dream_memory.config import (
     DreamMemoryConfig,
-    PK_ITEM_FILTER_LABELS,
+    format_tap_interval_hint,
     load_dream_memory_config,
-    normalize_pk_item_filter,
-    pk_item_filter_matches,
     sample_tap_between_delay,
 )
 from core.dream_memory.maps import DreamMemoryMap, load_map
@@ -166,7 +164,7 @@ class DreamMemorySession:
         for chip in sorted(chips, key=lambda c: c.slot_index):
             if not chip.active or not chip.text:
                 if self.config.pk_mode and chip.active and not chip.text:
-                    logger.debug(f"PK 槽位 {chip.slot_index + 1} 有内容但未识别，跳过")
+                    logger.debug(f"槽位 {chip.slot_index + 1} 有内容但未识别，跳过")
                 continue
             coord = self._lookup_coord(chip.text)
             if coord is None:
@@ -180,16 +178,6 @@ class DreamMemorySession:
                         f" — 未匹配地图，请标定"
                     )
                 continue
-            if self.config.pk_mode and self._pk_item_filter_active():
-                ordinal = self.game_map.item_ordinal_index(chip.text)
-                if ordinal is None or not pk_item_filter_matches(
-                    ordinal, self.config.pk_item_filter
-                ):
-                    logger.debug(
-                        f"PK 物品「{chip.text}」为第 {ordinal} 个标定点，"
-                        f"分工={PK_ITEM_FILTER_LABELS.get(normalize_pk_item_filter(self.config.pk_item_filter), '全部')}，跳过"
-                    )
-                    continue
             x, y = coord
             batch.append(_BatchTap(chip.slot_index, chip.text, x, y))
         return batch
@@ -289,9 +277,6 @@ class DreamMemorySession:
             fresh.append(item)
         return fresh
 
-    def _pk_item_filter_active(self) -> bool:
-        return normalize_pk_item_filter(self.config.pk_item_filter) != "all"
-
     def _pk_scan_loop(self, queue: _PKTapQueue, seen: set[str]) -> None:
         """PK 扫描线程：定时 OCR，仅首次见到的物品入队。"""
         while not self._interrupted():
@@ -311,6 +296,10 @@ class DreamMemorySession:
                         f"PK 扫描入队 +{added}（新 {len(fresh)}/{len(batch)}，"
                         f"已见 {len(seen)}，队列 {len(queue)}）"
                     )
+
+            # 首帧未识别到任何物品时不等待 scan_interval，连续重扫直到底栏就绪
+            if not seen:
+                continue
 
             interval = max(0.0, self.config.scan_interval)
             if interval > 0:
@@ -369,19 +358,15 @@ class DreamMemorySession:
         engine = resolve_ocr_engine(self.config.ocr_engine)
         warmup_ocr(self.config.ocr_engine)
         mode_hint = "PK·队列" if self.config.pk_mode else "普通"
+        tap_hint = format_tap_interval_hint(self.config)
         misclick_hint = "·含误点" if self.config.enable_misclick else ""
         pk_hint = (
-            f"·扫描/点击解耦（扫描 {self.config.scan_interval}s，连点 {self.config.tap_between_delay}s）"
+            f"·扫描/点击解耦（扫描 {self.config.scan_interval:g}s，{tap_hint}）"
             if self.config.pk_mode
-            else ""
+            else f"·{tap_hint}·扫描 {self.config.scan_interval:g}s"
         )
-        filter_hint = ""
-        if self.config.pk_mode:
-            filter_mode = normalize_pk_item_filter(self.config.pk_item_filter)
-            if filter_mode != "all":
-                filter_hint = f"·分工={PK_ITEM_FILTER_LABELS.get(filter_mode, filter_mode)}"
         self._emit(
-            f"开始({mode_hint}{misclick_hint}{pk_hint}{filter_hint}) — 地图「{self.game_map.name}」"
+            f"开始({mode_hint}{misclick_hint}{pk_hint}) — 地图「{self.game_map.name}」"
             f"（{len(self.game_map.items)} 个标定物品，"
             f"识别区 {len(self.config.target_slots)} 槽，OCR={engine}）"
         )
