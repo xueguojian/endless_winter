@@ -267,6 +267,22 @@ tasks:
       mission_confirm_1_beast:
       - 354
       - 886
+alliance_mobilization:
+  target_types:
+  - train
+  score_threshold: 500
+  scan_interval: 360
+  step_delay: 1.0
+  match_threshold: 0.58
+  countdown_threshold: 0.62
+  ocr_engine: auto
+  coords:
+    refresh_tap:
+    - 196
+    - 824
+    refresh_confirm:
+    - 512
+    - 776
 dream_memory:
   tesseract_cmd: C:\Program Files\Tesseract-OCR\tesseract.exe
   selected_map: example_gazebo
