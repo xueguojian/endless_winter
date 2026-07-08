@@ -11,8 +11,6 @@ from typing import Callable
 
 from loguru import logger
 
-import cv2
-
 from core.adb_client import AdbClient
 from core.navigation import WildernessNavigator
 from core.vision import MatchResult, Vision
@@ -355,12 +353,6 @@ class AutoMiningTask:
             f"匹配度 {result.confidence:.2f}"
         )
         if not result.found:
-            debug_dir = TEMPLATE_DIR.parent / "debug"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(
-                str(debug_dir / f"mining_{resource.resource_id}_mismatch_roi.png"),
-                roi,
-            )
             raise MiningHeroMismatchError(
                 f"{resource.label}首位英雄不匹配（{result.confidence:.2f}）"
             )

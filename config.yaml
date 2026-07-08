@@ -273,7 +273,7 @@ alliance_mobilization:
   score_threshold: 500
   scan_interval: 360
   step_delay: 1.0
-  match_threshold: 0.58
+  match_threshold: 0.6
   countdown_threshold: 0.62
   ocr_engine: auto
   coords:
@@ -283,6 +283,101 @@ alliance_mobilization:
     refresh_confirm:
     - 512
     - 776
+alliance_mobilization_admin:
+  target_types:
+  - train
+  score_threshold: 400
+  scan_interval: 360
+  step_delay: 1.0
+  match_threshold: 0.66
+  countdown_threshold: 0.62
+  ocr_engine: auto
+  list_roi:
+  - 44
+  - 906
+  - 714
+  - 1264
+  exclude_top_px: 72
+  column_count: 3
+  detail_refresh_btn_roi:
+  - 46
+  - 778
+  - 316
+  - 850
+  detail_icon_roi:
+  - 64
+  - 500
+  - 200
+  - 632
+  detail_score_roi:
+  - 304
+  - 724
+  - 456
+  - 762
+  detail_title_roi:
+  - 268
+  - 418
+  - 452
+  - 478
+  detail_close_btn_roi:
+  - 634
+  - 406
+  - 698
+  - 446
+  detail_match_threshold: 0.55
+  use_score_ocr: false
+  # GUI「保留橙色类型」多选会写入 keep_orange_types
+  # 全部可选 ID：train / beast / speedup / tech / orange_shard / gem /
+  # fire_crystal / small_monster / gift_pack / building / diamond /
+  # energy_stone / resource
+  keep_orange_types:
+  - train
+  available_task_types:
+  - train
+  - beast
+  - speedup
+  - tech
+  - orange_shard
+  - gem
+  - fire_crystal
+  - small_monster
+  - gift_pack
+  - building
+  - diamond
+  - energy_stone
+  - resource
+  coords:
+    refresh_tap:
+    - 181
+    - 814
+    refresh_confirm:
+    - 512
+    - 776
+    detail_close:
+    - 666
+    - 426
+    detail_mask_tap:
+    - 374
+    - 368
+  scroll:
+    swipe_ms: 900
+    swipe_x: 379
+    swipe_up_y1: 1240
+    swipe_up_y2: 1100
+    swipe_down_y1: 1160
+    swipe_down_y2: 1240
+    swipe_small_y1: 1240
+    swipe_small_y2: 1105
+    swipe_small_ms: 1200
+    swipe_medium_y1: 1240
+    swipe_medium_y2: 1065
+    swipe_medium_ms: 1100
+    partial_pre_delay: 0.55
+    partial_settle_delay: 1.35
+    max_swipes_per_pass: 40
+    settle_delay: 1.0
+    screen_delay: 0.35
+    scroll_to_top_max: 10
 dream_memory:
   tesseract_cmd: C:\Program Files\Tesseract-OCR\tesseract.exe
   selected_map: example_gazebo

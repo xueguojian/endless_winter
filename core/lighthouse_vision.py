@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ import cv2
 import numpy as np
 
 from core.coords import PORTRAIT_HEIGHT, PORTRAIT_WIDTH
+from core.dream_memory.ocr_engine import ocr_chip_text
 from loguru import logger
 
 from core.vision import MatchResult, Vision
@@ -92,12 +94,11 @@ BOUNTY_SUBTITLE_MAX_MATCH_X_RATIO = 0.35
 BOUNTY_SUBTITLE_SCALES = (0.82, 0.90, 0.96, 1.0, 1.06, 1.14, 1.22)
 MONSTER_KEYWORD_LEVEL = "lighthouse/monster_keyword_level.png"
 BEAST_KEYWORD_HAO = "lighthouse/beast_keyword_hao.png"
-MONSTER_LEVEL_SUBTITLE_MIN = 0.55
-MONSTER_LEVEL_MAX_MATCH_X_RATIO = 0.12
+MONSTER_LEVEL_SUBTITLE_MIN = 0.48
+MONSTER_LEVEL_MAX_MATCH_X_RATIO = 0.18
 BEAST_HAO_SUBTITLE_MIN = 0.70
 BEAST_HAO_SEARCH_WIDTH_RATIO = 0.58
 BEAST_HAO_MIN_MATCH_X_RATIO = 0.55
-BEAST_HAO_SOFT_MIN = 0.65
 LEVEL_OVERRIDE_HAO_MIN = 0.55
 BEAST_PIN_TEMPLATE = "lighthouse/small_monster_beast.png"
 BEAST_PIN_MATCH_MIN = 0.48
@@ -112,6 +113,13 @@ MISSION_DETAIL_COLOR_STRONG_MIN_TEMPLATE = 0.30
 MISSION_DETAIL_BTN_SCALES = (0.88, 0.94, 1.0, 1.06, 1.12)
 MISSION_DETAIL_COLOR_MIN_RATIO = 0.14
 MISSION_DETAIL_COLOR_MIN_MARGIN = 0.04
+MISSION_DETAIL_ACTION_OCR_CONF = 0.90
+# 详情页行动按钮文字 → 任务类型
+DETAIL_ACTION_TEXT_KINDS: tuple[tuple[str, str, str], ...] = (
+    ("营救", "tent", "营救"),
+    ("探险", "hero_journey", "探险"),
+    ("出征", "small_monster", "出征"),
+)
 
 _ACTION_BTN_TEMPLATE_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
@@ -869,84 +877,6 @@ def _match_action_button_in_screen_roi(
     )
 
 
-def _match_template_in_screen_roi(
-    screen: np.ndarray,
-    template_name: str,
-    roi: tuple[int, int, int, int],
-    *,
-    template_dir: Path = TEMPLATE_DIR,
-    threshold: float = MISSION_DETAIL_BTN_THRESHOLD,
-    scales: tuple[float, ...] = MISSION_DETAIL_BTN_SCALES,
-) -> MatchResult:
-    """在屏幕固定 ROI 内做多尺度模板匹配（灰度 + 彩色取较高分）。"""
-    patch, (ox, oy) = _detail_action_roi_patch(screen, roi)
-    if patch.size == 0:
-        return MatchResult(found=False)
-
-    template_path = template_dir / template_name
-    if not template_path.is_file():
-        logger.warning(f"灯塔详情模板缺失: {template_name}")
-        return MatchResult(found=False)
-
-    template = cv2.imread(str(template_path))
-    if template is None:
-        return MatchResult(found=False)
-
-    patch_gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-    tpl_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-    best_conf = 0.0
-    best_loc: tuple[int, int, int, int] | None = None
-
-    for scale in scales:
-        scaled_gray = cv2.resize(
-            tpl_gray,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
-        )
-        scaled_bgr = cv2.resize(
-            template,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
-        )
-        th, tw = scaled_gray.shape[:2]
-        if th > patch_gray.shape[0] or tw > patch_gray.shape[1]:
-            continue
-
-        gray_result = cv2.matchTemplate(patch_gray, scaled_gray, cv2.TM_CCOEFF_NORMED)
-        color_result = cv2.matchTemplate(patch, scaled_bgr, cv2.TM_CCOEFF_NORMED)
-        gray_score = float(gray_result.max())
-        color_score = float(color_result.max())
-        if color_score >= gray_score:
-            max_val = color_score
-            _, _, _, max_loc = cv2.minMaxLoc(color_result)
-        else:
-            max_val = gray_score
-            _, _, _, max_loc = cv2.minMaxLoc(gray_result)
-        if max_val <= best_conf:
-            continue
-        x, y = max_loc
-        best_conf = max_val
-        best_loc = (x, y, tw, th)
-
-    if best_loc is None:
-        return MatchResult(found=False, confidence=0.0)
-
-    x, y, tw, th = best_loc
-    center = (ox + x + tw // 2, oy + y + th // 2)
-    found = best_conf >= threshold
-    return MatchResult(
-        found=found,
-        confidence=best_conf,
-        center=center,
-        top_left=(ox + x, oy + y),
-        size=(tw, th),
-    )
-
-
 def _classify_detail_action_by_color(
     screen: np.ndarray,
     action_roi: tuple[int, int, int, int],
@@ -1066,22 +996,6 @@ def _detail_action_center_fallback(
     return ((action_roi[0] + action_roi[2]) // 2, (action_roi[1] + action_roi[3]) // 2)
 
 
-def save_mission_detail_debug(
-    screen: np.ndarray,
-    *,
-    action_roi: tuple[int, int, int, int] = MISSION_DETAIL_ACTION_ROI,
-    subtitle_roi: tuple[int, int, int, int] = MISSION_DETAIL_SUBTITLE_ROI,
-) -> None:
-    """识别失败时保存详情页 ROI 便于调模板。"""
-    screen = _normalize_screen_for_scan(screen)
-    debug_dir = TEMPLATE_DIR.parent / "debug"
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    ax1, ay1, ax2, ay2 = action_roi
-    sx1, sy1, sx2, sy2 = subtitle_roi
-    cv2.imwrite(str(debug_dir / "lighthouse_detail_action_roi.png"), screen[ay1:ay2, ax1:ax2])
-    cv2.imwrite(str(debug_dir / "lighthouse_detail_subtitle_roi.png"), screen[sy1:sy2, sx1:sx2])
-
-
 def _match_subtitle_template(
     screen: np.ndarray,
     template_name: str,
@@ -1181,110 +1095,177 @@ def _match_subtitle_template(
     )
 
 
-def _subtitle_is_bounty(
+def _normalize_subtitle_ocr(raw: str) -> str:
+    text = (raw or "").replace(" ", "").replace("\n", "").replace("　", "")
+    text = text.replace("：", ":").replace(":", "")
+    for wrong, right in (
+        ("等缓", "等级"),
+        ("等经", "等级"),
+        ("等缓", "等级"),
+        ("大师悬赏", "大师悬赏"),
+        ("宗师悬赏", "宗师悬赏"),
+        ("悬赏", "悬赏"),
+    ):
+        text = text.replace(wrong, right)
+    return text
+
+
+def _prepare_subtitle_ocr_patch(patch: np.ndarray) -> np.ndarray:
+    if patch.size == 0:
+        return patch
+    scaled = cv2.resize(patch, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+    norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    return cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
+
+
+def _ocr_subtitle_text(
     screen: np.ndarray,
-    *,
-    subtitle_roi: tuple[int, int, int, int] = MISSION_DETAIL_SUBTITLE_ROI,
-    template_dir: Path = TEMPLATE_DIR,
-) -> tuple[bool, str, float]:
-    """副标题含「大师悬赏」或「宗师悬赏」（须匹配专属关键词，非单独「悬赏：」）。
-
-    返回 (是否悬赏, 命中模板名, 置信度)。
-    """
-    x1, _y1, x2, _y2 = subtitle_roi
-    roi_width = x2 - x1
-    max_match_x = int(roi_width * BOUNTY_SUBTITLE_MAX_MATCH_X_RATIO)
-
-    best_name = ""
-    best_conf = 0.0
-    for template_name, min_conf in BOUNTY_SUBTITLE_TEMPLATES:
-        result = _match_subtitle_template(
-            screen,
-            template_name,
-            subtitle_roi,
-            template_dir=template_dir,
-            threshold=0.0,
-            scales=BOUNTY_SUBTITLE_SCALES,
-        )
-        rel_x = result.top_left[0] - x1 if result.top_left != (0, 0) else max_match_x + 1
-        accepted = (
-            result.confidence >= min_conf
-            and rel_x <= max_match_x
-        )
-        logger.debug(
-            f"悬赏副标题 {template_name} conf={result.confidence:.2f} "
-            f"rel_x={rel_x} min={min_conf} accepted={accepted}"
-        )
-        if accepted and result.confidence > best_conf:
-            best_conf = result.confidence
-            best_name = template_name
-    if best_name:
-        return True, best_name, best_conf
-    return False, "", best_conf
+    subtitle_roi: tuple[int, int, int, int],
+) -> str:
+    patch, _origin = _detail_action_roi_patch(screen, subtitle_roi)
+    if patch.size == 0:
+        return ""
+    best = ""
+    variants = (
+        _prepare_subtitle_ocr_patch(patch),
+        cv2.resize(patch, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC),
+    )
+    for variant in variants:
+        if variant.size == 0:
+            continue
+        text, _engine = ocr_chip_text(variant)
+        cleaned = _normalize_subtitle_ocr(text)
+        if len(cleaned) > len(best):
+            best = cleaned
+        if best:
+            break
+    return best
 
 
-def _subtitle_is_beast_number(
+def _normalize_action_button_ocr(raw: str) -> str:
+    text = (raw or "").replace(" ", "").replace("\n", "").replace("　", "")
+    text = re.sub(r"\d+", "", text)
+    if re.fullmatch(r"出[征前证径无开成]?", text):
+        return "出征"
+    for wrong, right in (
+        ("出证", "出征"),
+        ("出前", "出征"),
+        ("出无", "出征"),
+        ("出径", "出征"),
+        ("出成", "出征"),
+        ("出开", "出征"),
+        ("探检", "探险"),
+        ("探除", "探险"),
+        ("探验", "探险"),
+        ("营教", "营救"),
+        ("救营", "营救"),
+        ("营求", "营救"),
+    ):
+        text = text.replace(wrong, right)
+    return text
+
+
+def _parse_action_button_ocr(text: str) -> tuple[str, str] | None:
+    """从 OCR 文本解析行动按钮类型。"""
+    normalized = _normalize_action_button_ocr(text)
+    if not normalized:
+        return None
+    for keyword, kind, label in DETAIL_ACTION_TEXT_KINDS:
+        if keyword in normalized:
+            return kind, label
+    if normalized.startswith("出") and len(normalized) <= 3:
+        if any(ch in normalized for ch in "征前证径"):
+            return "small_monster", "出征"
+    return None
+
+
+def _prepare_action_button_ocr_patch(patch: np.ndarray) -> np.ndarray:
+    """裁掉体力图标行，增强对比度后供 OCR。"""
+    if patch.size == 0:
+        return patch
+    h, w = patch.shape[:2]
+    text_area = patch[: max(1, int(h * 0.58)), :]
+    scaled = cv2.resize(
+        text_area, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC
+    )
+    gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+    norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    return cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
+
+
+def _action_button_ocr_variants(patch: np.ndarray) -> list[np.ndarray]:
+    """行动按钮 OCR 多路预处理。"""
+    if patch.size == 0:
+        return []
+
+    variants: list[np.ndarray] = [_prepare_action_button_ocr_patch(patch)]
+    full_scaled = cv2.resize(patch, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    variants.append(full_scaled)
+
+    top = patch[: max(1, int(patch.shape[0] * 0.58)), :]
+    top_scaled = cv2.resize(top, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(top_scaled, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(top_scaled, cv2.COLOR_BGR2HSV)
+    white = (gray > 175) & (hsv[:, :, 1] < 90)
+    isolated = np.zeros_like(top_scaled)
+    isolated[white] = (255, 255, 255)
+    variants.append(isolated)
+    return variants
+
+
+def _classify_detail_action_by_text(
     screen: np.ndarray,
-    *,
-    subtitle_roi: tuple[int, int, int, int] = MISSION_DETAIL_SUBTITLE_ROI,
-    template_dir: Path = TEMPLATE_DIR,
-) -> tuple[bool, float, bool]:
-    """副标题右侧含「号」（如 …1号）→ 特殊大怪。
+    action_roi: tuple[int, int, int, int],
+) -> tuple[str, str, float, tuple[int, int]] | None:
+    """OCR 识别行动按钮主文字（出征 / 探险 / 营救）。"""
+    patch, _origin = _detail_action_roi_patch(screen, action_roi)
+    if patch.size == 0:
+        return None
 
-    返回 (accepted, confidence, position_ok)。
-    """
-    if not (template_dir / BEAST_KEYWORD_HAO).is_file():
-        return False, 0.0, False
-
-    x1, _y1, x2, _y2 = subtitle_roi
-    roi_width = x2 - x1
-    min_match_x = int(roi_width * BEAST_HAO_MIN_MATCH_X_RATIO)
-    result = _match_subtitle_template(
-        screen,
-        BEAST_KEYWORD_HAO,
-        subtitle_roi,
-        template_dir=template_dir,
-        threshold=0.0,
-        scales=BOUNTY_SUBTITLE_SCALES,
-        search_side="right",
-        search_width_ratio=BEAST_HAO_SEARCH_WIDTH_RATIO,
-    )
-    rel_x = result.top_left[0] - x1 if result.top_left != (0, 0) else 0
-    position_ok = rel_x >= min_match_x
-    accepted = result.confidence >= BEAST_HAO_SUBTITLE_MIN and position_ok
-    logger.debug(
-        f"大怪副标题 {BEAST_KEYWORD_HAO} conf={result.confidence:.2f} "
-        f"rel_x={rel_x} min_x={min_match_x} accepted={accepted}"
-    )
-    return accepted, result.confidence, position_ok
+    variants = _action_button_ocr_variants(patch)
+    for variant in variants:
+        if variant.size == 0:
+            continue
+        text, _engine = ocr_chip_text(variant)
+        parsed = _parse_action_button_ocr(text)
+        if parsed is None:
+            continue
+        kind, label = parsed
+        action_center = _detail_action_center_fallback(action_roi)
+        color_hit = _classify_detail_action_by_color(screen, action_roi)
+        if color_hit is not None and color_hit[0] == kind:
+            action_center = color_hit[3]
+        return kind, label, MISSION_DETAIL_ACTION_OCR_CONF, action_center
+    return None
 
 
-def _subtitle_is_level_monster(
-    screen: np.ndarray,
-    *,
-    subtitle_roi: tuple[int, int, int, int] = MISSION_DETAIL_SUBTITLE_ROI,
-    template_dir: Path = TEMPLATE_DIR,
-) -> tuple[bool, float]:
-    """副标题以「等级」开头 → 普通灯塔小怪（非大怪/悬赏）。"""
-    x1, _y1, x2, _y2 = subtitle_roi
-    max_match_x = int((x2 - x1) * MONSTER_LEVEL_MAX_MATCH_X_RATIO)
-    result = _match_subtitle_template(
-        screen,
-        MONSTER_KEYWORD_LEVEL,
-        subtitle_roi,
-        template_dir=template_dir,
-        threshold=0.0,
-        scales=BOUNTY_SUBTITLE_SCALES,
-    )
-    rel_x = result.top_left[0] - x1 if result.top_left != (0, 0) else max_match_x + 1
-    accepted = (
-        result.confidence >= MONSTER_LEVEL_SUBTITLE_MIN and rel_x <= max_match_x
-    )
-    logger.debug(
-        f"等级副标题 {MONSTER_KEYWORD_LEVEL} conf={result.confidence:.2f} "
-        f"rel_x={rel_x} max_x={max_match_x} accepted={accepted}"
-    )
-    return accepted, result.confidence
+def _classify_march_subtitle_from_text(
+    text: str,
+) -> MissionDetailClassification | None:
+    """出征任务：根据副标题 OCR 文本区分悬赏 / 灯塔小怪 / 特殊大怪。"""
+    if not text:
+        return None
+
+    if "大师悬赏" in text or "宗师悬赏" in text:
+        return MissionDetailClassification(
+            kind="bounty_skip",
+            label="大师/宗师悬赏",
+            confidence=MISSION_DETAIL_ACTION_OCR_CONF,
+        )
+
+    if text.startswith("等级") or re.match(r"^等[级经缓]", text):
+        return None
+
+    if re.search(r"\d+号", text):
+        return MissionDetailClassification(
+            kind="beast_skip",
+            label="特殊大怪",
+            confidence=MISSION_DETAIL_ACTION_OCR_CONF,
+            beast_explicit=True,
+        )
+
+    return None
 
 
 def _classify_march_subtitle(
@@ -1292,72 +1273,11 @@ def _classify_march_subtitle(
     *,
     subtitle_roi: tuple[int, int, int, int] = MISSION_DETAIL_SUBTITLE_ROI,
     template_dir: Path = TEMPLATE_DIR,
-    base_confidence: float = 0.0,
 ) -> MissionDetailClassification | None:
-    """出征按钮已确认后，仅根据副标题区分悬赏 / 小怪 / 特殊大怪。"""
-    is_bounty, _bounty_tpl, bounty_conf = _subtitle_is_bounty(
-        screen, subtitle_roi=subtitle_roi, template_dir=template_dir
-    )
-    if is_bounty:
-        return MissionDetailClassification(
-            kind="bounty_skip",
-            label="大师/宗师悬赏",
-            confidence=bounty_conf,
-        )
-
-    is_level, level_conf = _subtitle_is_level_monster(
-        screen, subtitle_roi=subtitle_roi, template_dir=template_dir
-    )
-    if is_level:
-        return None
-
-    is_hao, hao_conf, hao_pos_ok = _subtitle_is_beast_number(
-        screen, subtitle_roi=subtitle_roi, template_dir=template_dir
-    )
-    # 「等级」靠左且匹配足够强时，忽略右侧「号」误匹配（如 大角鹿）
-    if is_hao and level_conf >= LEVEL_OVERRIDE_HAO_MIN:
-        x1, _y1, x2, _y2 = subtitle_roi
-        level_left = _match_subtitle_template(
-            screen,
-            MONSTER_KEYWORD_LEVEL,
-            subtitle_roi,
-            template_dir=template_dir,
-            threshold=0.0,
-            scales=BOUNTY_SUBTITLE_SCALES,
-            search_side="left",
-        )
-        rel_x = (
-            level_left.top_left[0] - x1 if level_left.top_left != (0, 0) else 999
-        )
-        max_left_x = int((x2 - x1) * MONSTER_LEVEL_MAX_MATCH_X_RATIO)
-        if rel_x <= max_left_x:
-            logger.info(
-                f"左侧已有「等级」匹配（conf={level_conf:.2f} rel_x={rel_x}），"
-                f"忽略右侧「号」误匹配 conf={hao_conf:.2f}"
-            )
-            return None
-
-    if is_hao or (hao_pos_ok and hao_conf >= BEAST_HAO_SOFT_MIN):
-        logger.info(
-            f"副标题右侧含「号」，识别为特殊大怪（conf={hao_conf:.2f}）"
-        )
-        return MissionDetailClassification(
-            kind="beast_skip",
-            label="特殊大怪",
-            confidence=max(base_confidence, hao_conf),
-            beast_explicit=is_hao,
-        )
-
-    logger.info(
-        f"出征副标题非悬赏、无「等级」、无「号」（bounty={bounty_conf:.2f} "
-        f"level={level_conf:.2f} hao={hao_conf:.2f}），视为特殊大怪"
-    )
-    return MissionDetailClassification(
-        kind="beast_skip",
-        label="特殊大怪",
-        confidence=max(base_confidence, level_conf, bounty_conf, hao_conf),
-        beast_explicit=False,
-    )
+    """出征任务：OCR 副标题区分悬赏 / 灯塔小怪 / 特殊大怪。"""
+    _ = template_dir
+    text = _ocr_subtitle_text(screen, subtitle_roi)
+    return _classify_march_subtitle_from_text(text)
 
 
 def classify_mission_detail_screen(
@@ -1367,133 +1287,36 @@ def classify_mission_detail_screen(
     action_roi: tuple[int, int, int, int] = MISSION_DETAIL_ACTION_ROI,
     subtitle_roi: tuple[int, int, int, int] = MISSION_DETAIL_SUBTITLE_ROI,
 ) -> MissionDetailClassification:
-    """详情页底部行动按钮识别任务类型；出征需再判悬赏/等级怪。"""
-    candidates: tuple[tuple[str, str, str], ...] = (
-        ("small_monster", "出征", MISSION_BTN_MARCH),
-        ("hero_journey", "探险", MISSION_BTN_ADVENTURE),
-        ("tent", "营救", MISSION_BTN_RESCUE),
-    )
-
-    scored: list[tuple[str, str, str, MatchResult]] = []
-    for kind, label, template_name in candidates:
-        result = _match_action_button_in_screen_roi(
-            screen,
-            template_name,
-            action_roi,
-            template_dir=template_dir,
-        )
-        logger.debug(
-            f"详情行动按钮 {label} ({template_name}) conf={result.confidence:.2f}"
-        )
-        scored.append((kind, label, template_name, result))
-
-    scored.sort(key=lambda item: item[3].confidence, reverse=True)
-    best_kind, best_label, _best_tpl, best_result = scored[0]
-    second_conf = scored[1][3].confidence if len(scored) > 1 else 0.0
-    margin = best_result.confidence - second_conf
-
-    score_summary = "，".join(
-        f"{label}={res.confidence:.2f}" for _, label, _, res in scored
-    )
-    logger.info(
-        f"详情行动按钮得分: {score_summary}（最高 {best_label} "
-        f"{best_result.confidence:.2f} margin={margin:.2f}）"
-    )
-
-    resolved_kind: str | None = None
-    resolved_label = best_label
-    resolved_conf = best_result.confidence
-    action_center = best_result.center if best_result.center != (0, 0) else None
-
-    # 仅当掩膜匹配真正达标（>=0.65）且领先第二名时才采纳模板结果
-    if best_result.found and margin >= MISSION_DETAIL_BTN_MIN_MARGIN:
-        resolved_kind = best_kind
-    else:
-        color_hit = _classify_detail_action_by_color(screen, action_roi)
-        if color_hit is not None:
-            c_kind, c_label, c_ratio, c_center = color_hit
-            kind_tpl_conf = next(
-                (res.confidence for k, _, _, res in scored if k == c_kind),
-                0.0,
-            )
-            color_ok = c_ratio >= MISSION_DETAIL_COLOR_MIN_RATIO and (
-                (
-                    c_kind == best_kind
-                    and kind_tpl_conf >= MISSION_DETAIL_COLOR_BACKUP_MIN_TEMPLATE
-                )
-                or (
-                    c_ratio >= MISSION_DETAIL_COLOR_STRONG_RATIO
-                    and kind_tpl_conf >= MISSION_DETAIL_COLOR_STRONG_MIN_TEMPLATE
-                )
-            )
-            if color_ok:
-                logger.info(
-                    f"详情按钮模板未达标 (best={best_result.confidence:.2f})，"
-                    f"颜色确认 {c_label} ratio={c_ratio:.2f} tpl={kind_tpl_conf:.2f}"
-                )
-                resolved_kind = c_kind
-                resolved_label = c_label
-                resolved_conf = max(best_result.confidence, c_ratio, kind_tpl_conf)
-                action_center = c_center
-
-    if resolved_kind is None or resolved_conf < MISSION_DETAIL_ABSOLUTE_MIN:
-        is_bounty, bounty_tpl, bounty_conf = _subtitle_is_bounty(
-            screen, subtitle_roi=subtitle_roi, template_dir=template_dir
-        )
-        if is_bounty:
-            logger.info(
-                f"行动按钮未达标（最高 {best_result.confidence:.2f}）但副标题识别为悬赏 "
-                f"conf={bounty_conf:.2f} tpl={bounty_tpl}"
-            )
-            return MissionDetailClassification(
-                kind="bounty_skip",
-                label="大师/宗师悬赏",
-                confidence=bounty_conf,
-            )
-        march_sub = _classify_march_subtitle(
-            screen,
-            subtitle_roi=subtitle_roi,
-            template_dir=template_dir,
-            base_confidence=best_result.confidence,
-        )
-        if march_sub is not None and march_sub.kind == "beast_skip":
-            return march_sub
-        logger.info(
-            f"详情页识别不足（最高 {best_result.confidence:.2f} < "
-            f"{MISSION_DETAIL_ABSOLUTE_MIN}），视为未识别"
-        )
+    """详情页：OCR 识别行动按钮与副标题。"""
+    _ = template_dir
+    ocr_hit = _classify_detail_action_by_text(screen, action_roi)
+    if ocr_hit is None:
+        logger.info("详情识别: 未识别（按钮文字 OCR 未命中）")
         return MissionDetailClassification(
             kind="unknown",
             label="未识别",
-            confidence=best_result.confidence,
+            confidence=0.0,
         )
 
+    resolved_kind, resolved_label, resolved_conf, action_center = ocr_hit
     if action_center is None:
         action_center = _detail_action_center_fallback(action_roi)
 
-    resolved_kind, resolved_label, resolved_conf, action_center = (
-        _refine_action_with_button_color(
-            resolved_kind,
-            resolved_label,
-            resolved_conf,
-            action_center,
-            scored,
-            screen,
-            action_roi,
-        )
-    )
-
     if resolved_kind == "small_monster":
-        march_sub = _classify_march_subtitle(
-            screen,
-            subtitle_roi=subtitle_roi,
-            template_dir=template_dir,
-            base_confidence=resolved_conf,
-        )
+        subtitle = _ocr_subtitle_text(screen, subtitle_roi)
+        march_sub = _classify_march_subtitle_from_text(subtitle)
         if march_sub is not None:
-            if march_sub.kind == "beast_skip":
-                save_mission_detail_debug(screen)
-            return march_sub
+            logger.info(
+                f"详情识别: 出征 + 副标题「{subtitle}」→ {march_sub.label}"
+            )
+            return MissionDetailClassification(
+                kind=march_sub.kind,
+                label=march_sub.label,
+                confidence=march_sub.confidence,
+                action_center=action_center,
+                beast_explicit=march_sub.beast_explicit,
+            )
+        logger.info(f"详情识别: 出征 + 副标题「{subtitle}」→ 灯塔小怪")
         return MissionDetailClassification(
             kind="small_monster",
             label="灯塔小怪",
@@ -1501,12 +1324,15 @@ def classify_mission_detail_screen(
             action_center=action_center,
         )
 
+    logger.info(f"详情识别: {resolved_label}")
     return MissionDetailClassification(
         kind=resolved_kind,
         label=resolved_label,
         confidence=resolved_conf,
         action_center=action_center,
     )
+
+
 def configure_lighthouse_scan(*, event_period: bool = False) -> str:
     """按是否活动期间切换差分背景图，切换时清空缓存。"""
     global _active_map_bg_name, _MAP_BG_SCREEN, _MAP_BG_ROI, _event_period

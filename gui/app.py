@@ -36,9 +36,15 @@ from gui.dream_memory_panel import (
 )
 from gui.task_registry import TaskEntry, loop_tasks, once_tasks
 from tasks.alliance_mobilization import (
+    ADMIN_TARGET_TYPES,
     TASK_TYPE_LABELS,
     AllianceMobilizationSession,
     merge_task_config as merge_alliance_config,
+)
+from tasks.alliance_mobilization_admin import (
+    AllianceMobilizationAdminSession,
+    CALIBRATED_DETAIL_MASK_TAP,
+    merge_task_config as merge_alliance_admin_config,
 )
 from tasks.auto_lighthouse import AutoLighthouseTask, merge_task_config as merge_lighthouse_config
 from tasks.auto_mining import AutoMiningTask, merge_task_config as merge_mining_config
@@ -154,6 +160,8 @@ class EndlessWinterApp(tk.Tk):
         self._dream_pk_preview_window: tk.Toplevel | None = None
         self._alliance_worker: threading.Thread | None = None
         self._alliance_session: AllianceMobilizationSession | None = None
+        self._alliance_admin_worker: threading.Thread | None = None
+        self._alliance_admin_session: AllianceMobilizationAdminSession | None = None
         self._alliance_type_vars: dict[str, tk.BooleanVar] = {}
 
         self._build_ui()
@@ -310,8 +318,6 @@ class EndlessWinterApp(tk.Tk):
             selected_types = ["train"]
             self._alliance_type_vars["train"].set(True)
         alliance["target_types"] = selected_types
-        if hasattr(self, "var_alliance_score_threshold"):
-            alliance["score_threshold"] = int(self.var_alliance_score_threshold.get())
         merged_alliance = merge_alliance_config(alliance)
         alliance["scan_interval"] = merged_alliance["scan_interval"]
         alliance["step_delay"] = merged_alliance["step_delay"]
@@ -321,6 +327,37 @@ class EndlessWinterApp(tk.Tk):
         alliance["coords"] = merged_alliance["coords"]
         # slots 使用代码默认值，不写入配置，避免 yaml 序列化 Python 对象
         alliance.pop("slots", None)
+        # 分数阈值不再由 GUI 配置，保留文件内已有值或默认
+
+        alliance_admin = cfg.setdefault("alliance_mobilization_admin", {})
+        alliance_admin["target_types"] = list(selected_types)
+        alliance_admin["keep_orange_types"] = list(selected_types)
+        merged_admin = merge_alliance_admin_config(alliance_admin)
+        alliance_admin["scan_interval"] = merged_admin["scan_interval"]
+        alliance_admin["step_delay"] = merged_admin["step_delay"]
+        alliance_admin["match_threshold"] = merged_admin["match_threshold"]
+        alliance_admin["countdown_threshold"] = merged_admin["countdown_threshold"]
+        alliance_admin["ocr_engine"] = merged_admin["ocr_engine"]
+        alliance_admin["coords"] = merged_admin["coords"]
+        alliance_admin["list_roi"] = list(merged_admin["list_roi"])
+        alliance_admin["exclude_top_px"] = merged_admin["exclude_top_px"]
+        alliance_admin["column_count"] = merged_admin["column_count"]
+        alliance_admin["scroll"] = merged_admin["scroll"]
+        alliance_admin["detail_refresh_btn_roi"] = list(
+            merged_admin["detail_refresh_btn_roi"]
+        )
+        alliance_admin["detail_icon_roi"] = list(merged_admin["detail_icon_roi"])
+        alliance_admin["detail_score_roi"] = list(merged_admin["detail_score_roi"])
+        alliance_admin["detail_title_roi"] = list(merged_admin["detail_title_roi"])
+        alliance_admin["detail_close_btn_roi"] = list(
+            merged_admin["detail_close_btn_roi"]
+        )
+        alliance_admin["detail_match_threshold"] = merged_admin[
+            "detail_match_threshold"
+        ]
+        alliance_admin["keep_orange_types"] = list(merged_admin["keep_orange_types"])
+        alliance_admin["use_score_ocr"] = False
+        alliance_admin["target_types"] = list(merged_admin.get("target_types") or selected_types)
 
         with open(self.config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
@@ -869,11 +906,15 @@ class EndlessWinterApp(tk.Tk):
 
         alliance_cfg = self.config.get("alliance_mobilization", {})
         alliance_merged = merge_alliance_config(alliance_cfg)
-        self.var_alliance_score_threshold = tk.IntVar(
-            value=int(alliance_merged["score_threshold"])
+        admin_cfg = self.config.get("alliance_mobilization_admin", {})
+        admin_merged = merge_alliance_admin_config(admin_cfg)
+        # 勾选态优先用管理员 keep_orange_types，否则用普通模式 target_types
+        selected_alliance_types = set(
+            admin_merged.get("keep_orange_types")
+            or alliance_merged.get("target_types")
+            or ["train"]
         )
-        selected_alliance_types = set(alliance_merged["target_types"])
-        for type_id in TASK_TYPE_LABELS:
+        for type_id in ADMIN_TARGET_TYPES:
             self._alliance_type_vars[type_id] = tk.BooleanVar(
                 value=type_id in selected_alliance_types
             )
@@ -885,34 +926,29 @@ class EndlessWinterApp(tk.Tk):
         _configure_param_tab_grid(tab_alliance)
 
         row = 0
-        ttk.Label(tab_alliance, text="目标任务（可多选）").grid(
+        ttk.Label(tab_alliance, text="保留橙色类型（可多选）").grid(
             row=row, column=0, sticky=tk.NW, pady=2
         )
-        type_row = ttk.Frame(tab_alliance)
-        type_row.grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=FORM_INPUT_PADX)
-        for type_id, label in TASK_TYPE_LABELS.items():
+        type_wrap = ttk.Frame(tab_alliance)
+        type_wrap.grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=FORM_INPUT_PADX)
+        # 多行排布，避免类型太多挤成一行
+        per_row = 5
+        type_ids = list(ADMIN_TARGET_TYPES)
+        for index, type_id in enumerate(type_ids):
+            r, c = divmod(index, per_row)
             ttk.Checkbutton(
-                type_row,
-                text=label,
+                type_wrap,
+                text=TASK_TYPE_LABELS[type_id],
                 variable=self._alliance_type_vars[type_id],
                 command=self._save_config,
-            ).pack(side=tk.LEFT, padx=(0, 12))
+            ).grid(row=r, column=c, sticky=tk.W, padx=(0, 10), pady=2)
         row += 1
-
-        ttk.Label(tab_alliance, text="目标分数").grid(row=row, column=0, sticky=tk.W, pady=2)
-        ttk.Spinbox(
-            tab_alliance,
-            from_=1,
-            to=9999,
-            textvariable=self.var_alliance_score_threshold,
-            width=8,
-        ).grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
         ttk.Label(
             tab_alliance,
-            text="≥ 此分数保留；每 6 分钟扫描一次",
+            text="管理员：仅保留「橙色 + 勾选类型」；紫/蓝底一律刷新。普通模式沿用同一勾选。",
             font=("", 8),
             foreground="gray",
-        ).grid(row=row, column=2, sticky=tk.W, padx=6)
+        ).grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=FORM_INPUT_PADX, pady=(0, 4))
 
         tab_more = ttk.Frame(notebook, padding=12)
         notebook.add(tab_more, text="更多")
@@ -985,6 +1021,32 @@ class EndlessWinterApp(tk.Tk):
             state=tk.DISABLED,
         )
         self.btn_alliance_stop.pack(side=tk.LEFT)
+
+        tab_alliance_admin_run = ttk.Frame(task_notebook, padding=6)
+        task_notebook.add(tab_alliance_admin_run, text="联盟管理员刷新")
+        ttk.Label(
+            tab_alliance_admin_run,
+            text="进入管理员任务列表后点开始。保留：橙色 +「功能参数→联盟总动员」勾选类型；紫/蓝刷新。",
+            foreground="gray",
+            font=("", 8),
+        ).pack(anchor=tk.W)
+        admin_btn_row = ttk.Frame(tab_alliance_admin_run)
+        admin_btn_row.pack(fill=tk.X, pady=(8, 0))
+        self.btn_alliance_admin_start = ttk.Button(
+            admin_btn_row,
+            text="开始",
+            command=self._start_alliance_admin,
+            width=10,
+        )
+        self.btn_alliance_admin_start.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_alliance_admin_stop = ttk.Button(
+            admin_btn_row,
+            text="结束",
+            command=self._stop_alliance_admin,
+            width=10,
+            state=tk.DISABLED,
+        )
+        self.btn_alliance_admin_stop.pack(side=tk.LEFT)
 
         tab_dream = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_dream, text="寻梦记忆")
@@ -1484,8 +1546,17 @@ class EndlessWinterApp(tk.Tk):
     def _is_any_dream_running(self) -> bool:
         return self._is_dream_memory_running() or self._is_dream_pk_running()
 
-    def _is_alliance_running(self) -> bool:
+    def _is_alliance_regular_running(self) -> bool:
         return self._alliance_worker is not None and self._alliance_worker.is_alive()
+
+    def _is_alliance_admin_running(self) -> bool:
+        return (
+            self._alliance_admin_worker is not None
+            and self._alliance_admin_worker.is_alive()
+        )
+
+    def _is_alliance_running(self) -> bool:
+        return self._is_alliance_regular_running() or self._is_alliance_admin_running()
 
     def _is_any_running(self) -> bool:
         return (
@@ -1505,6 +1576,9 @@ class EndlessWinterApp(tk.Tk):
         ):
             self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
             self.btn_alliance_start.configure(state=tk.DISABLED if running else tk.NORMAL)
+            self.btn_alliance_admin_start.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
 
     def _set_once_buttons(self, running: bool) -> None:
         self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
@@ -1516,10 +1590,45 @@ class EndlessWinterApp(tk.Tk):
         ):
             self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
             self.btn_alliance_start.configure(state=tk.DISABLED if running else tk.NORMAL)
+            self.btn_alliance_admin_start.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
 
     def _set_alliance_buttons(self, running: bool) -> None:
         self.btn_alliance_start.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.btn_alliance_stop.configure(state=tk.NORMAL if running else tk.DISABLED)
+        if not running and not self._is_alliance_admin_running():
+            self.btn_alliance_admin_start.configure(state=tk.NORMAL)
+        elif running:
+            self.btn_alliance_admin_start.configure(state=tk.DISABLED)
+        other_running = (
+            self._is_loop_running()
+            or self._is_once_running()
+            or self._is_any_dream_running()
+        )
+        if not other_running:
+            self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
+            self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
+        if self._dream_widgets is not None and not self._is_dream_memory_running():
+            self._dream_widgets.btn_start.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
+        if self._dream_pk_widgets is not None and not self._is_dream_pk_running():
+            self._dream_pk_widgets.btn_start.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
+
+    def _set_alliance_admin_buttons(self, running: bool) -> None:
+        self.btn_alliance_admin_start.configure(
+            state=tk.DISABLED if running else tk.NORMAL
+        )
+        self.btn_alliance_admin_stop.configure(
+            state=tk.NORMAL if running else tk.DISABLED
+        )
+        if not running and not self._is_alliance_regular_running():
+            self.btn_alliance_start.configure(state=tk.NORMAL)
+        elif running:
+            self.btn_alliance_start.configure(state=tk.DISABLED)
         other_running = (
             self._is_loop_running()
             or self._is_once_running()
@@ -1553,6 +1662,9 @@ class EndlessWinterApp(tk.Tk):
             self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
             self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
             self.btn_alliance_start.configure(state=tk.DISABLED if running else tk.NORMAL)
+            self.btn_alliance_admin_start.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
         other_widgets = self._dream_pk_widgets if not pk else self._dream_widgets
         if other_widgets is not None and not (
             self._is_dream_pk_running() if not pk else self._is_dream_memory_running()
@@ -1916,7 +2028,7 @@ class EndlessWinterApp(tk.Tk):
         labels = "、".join(TASK_TYPE_LABELS[t] for t in selected_types)
         self._set_alliance_buttons(running=True)
         self._on_status(
-            f"联盟总动员自动刷新：目标 {labels}，分数 ≥ {alliance_cfg['score_threshold']}"
+            f"联盟总动员自动刷新：目标 {labels}"
         )
 
         def work():
@@ -1957,6 +2069,83 @@ class EndlessWinterApp(tk.Tk):
         self._set_alliance_buttons(running=False)
         self._alliance_worker = None
 
+    def _start_alliance_admin(self) -> None:
+        if self._is_alliance_running():
+            messagebox.showwarning("提示", "联盟总动员已在运行")
+            return
+        if (
+            self._is_loop_running()
+            or self._is_once_running()
+            or self._is_any_dream_running()
+        ):
+            messagebox.showwarning("提示", "请先停止其他任务")
+            return
+
+        selected_types = [
+            type_id
+            for type_id, var in self._alliance_type_vars.items()
+            if bool(var.get())
+        ]
+        if not selected_types:
+            messagebox.showwarning("提示", "请先在「功能参数 → 联盟总动员」勾选目标任务")
+            return
+
+        try:
+            # 先从磁盘重载，避免内存里旧的 coords 覆盖 config.yaml
+            self.config = self._load_config()
+            self._save_config()
+            self.config = self._load_config()
+            admin_cfg = merge_alliance_admin_config(
+                self.config.get("alliance_mobilization_admin", {})
+            )
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+
+        labels = "、".join(TASK_TYPE_LABELS[t] for t in selected_types)
+        self._set_alliance_admin_buttons(running=True)
+        mask_xy = admin_cfg["coords"].get(
+            "detail_mask_tap", list(CALIBRATED_DETAIL_MASK_TAP)
+        )
+        self._on_status(
+            f"联盟管理员刷新：保留橙色[{labels}]，紫/蓝刷新，"
+            f"遮罩 ({mask_xy[0]},{mask_xy[1]})"
+        )
+
+        def work():
+            try:
+                if not self._ensure_device():
+                    return
+                run_cfg = dict(admin_cfg)
+                run_cfg["target_types"] = selected_types
+                run_cfg["keep_orange_types"] = selected_types
+                run_cfg["use_score_ocr"] = False
+                session = AllianceMobilizationAdminSession(
+                    self._get_adb(),
+                    admin_cfg=run_cfg,
+                    on_status=self._on_status,
+                )
+                self._alliance_admin_session = session
+                session.run_until_stopped()
+            except Exception as exc:
+                self._on_status(f"联盟管理员刷新异常：{exc}")
+            finally:
+                self._alliance_admin_session = None
+                self.after(0, self._on_alliance_admin_worker_done)
+
+        self._alliance_admin_worker = threading.Thread(target=work, daemon=True)
+        self._alliance_admin_worker.start()
+
+    def _stop_alliance_admin(self) -> None:
+        session = self._alliance_admin_session
+        if session is not None:
+            session.stop()
+        self._on_status("正在结束联盟管理员刷新…")
+
+    def _on_alliance_admin_worker_done(self) -> None:
+        self._set_alliance_admin_buttons(running=False)
+        self._alliance_admin_worker = None
+
     def _on_loop_worker_done(self) -> None:
         self._set_loop_buttons(running=False)
         self._loop_tasks.clear()
@@ -1975,6 +2164,7 @@ class EndlessWinterApp(tk.Tk):
                 self._stop_dream_memory()
                 self._stop_dream_session(pk=True)
                 self._stop_alliance_mobilization()
+                self._stop_alliance_admin()
                 self.destroy()
         else:
             try:

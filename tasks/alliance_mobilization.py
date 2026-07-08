@@ -24,14 +24,80 @@ TEMPLATE_DIR = ROOT / "assets" / "templates"
 ASSET_SUBDIR = "alliance_mobilization"
 
 TRAIN_ICON_TEMPLATE = f"{ASSET_SUBDIR}/train_icon.png"
+TRAIN_ICON_ADMIN_TEMPLATE = f"{ASSET_SUBDIR}/train_icon_admin.png"
 COUNTDOWN_TEMPLATE = f"{ASSET_SUBDIR}/countdown.png"
 
 TASK_TYPE_TRAIN = "train"
+TASK_TYPE_BEAST = "beast"
+TASK_TYPE_SPEEDUP = "speedup"
+TASK_TYPE_TECH = "tech"
+TASK_TYPE_ORANGE_SHARD = "orange_shard"
+TASK_TYPE_GEM = "gem"
+TASK_TYPE_SMALL_MONSTER = "small_monster"
+TASK_TYPE_GIFT_PACK = "gift_pack"
+TASK_TYPE_BUILDING = "building"
+TASK_TYPE_DIAMOND = "diamond"
+TASK_TYPE_FIRE_CRYSTAL = "fire_crystal"
+TASK_TYPE_ENERGY_STONE = "energy_stone"
+TASK_TYPE_RESOURCE = "resource"
+
+# 详情弹窗图标分类 / GUI 多选顺序
+ADMIN_DETAIL_TYPE_ORDER: tuple[str, ...] = (
+    TASK_TYPE_TRAIN,
+    TASK_TYPE_BEAST,
+    TASK_TYPE_SPEEDUP,
+    TASK_TYPE_TECH,
+    TASK_TYPE_ORANGE_SHARD,
+    TASK_TYPE_GEM,
+    TASK_TYPE_FIRE_CRYSTAL,
+    TASK_TYPE_SMALL_MONSTER,
+    TASK_TYPE_GIFT_PACK,
+    TASK_TYPE_BUILDING,
+    TASK_TYPE_DIAMOND,
+    TASK_TYPE_ENERGY_STONE,
+    TASK_TYPE_RESOURCE,
+)
+
 TASK_TYPE_LABELS: dict[str, str] = {
     TASK_TYPE_TRAIN: "练兵",
+    TASK_TYPE_BEAST: "巨兽",
+    TASK_TYPE_SPEEDUP: "加速",
+    TASK_TYPE_TECH: "科技",
+    TASK_TYPE_ORANGE_SHARD: "橙碎",
+    TASK_TYPE_GEM: "宝石",
+    TASK_TYPE_FIRE_CRYSTAL: "火晶",
+    TASK_TYPE_SMALL_MONSTER: "小怪",
+    TASK_TYPE_GIFT_PACK: "礼包",
+    TASK_TYPE_BUILDING: "建造",
+    TASK_TYPE_DIAMOND: "钻石",
+    TASK_TYPE_ENERGY_STONE: "能源石",
+    TASK_TYPE_RESOURCE: "资源",
 }
+
+# GUI / 配置可多选的全部类型
+ADMIN_TARGET_TYPES: tuple[str, ...] = ADMIN_DETAIL_TYPE_ORDER
+
 TASK_TYPE_TEMPLATES: dict[str, str] = {
     TASK_TYPE_TRAIN: TRAIN_ICON_TEMPLATE,
+}
+TASK_TYPE_ADMIN_TEMPLATES: dict[str, str] = {
+    TASK_TYPE_TRAIN: TRAIN_ICON_ADMIN_TEMPLATE,
+    TASK_TYPE_BEAST: f"{ASSET_SUBDIR}/beast_icon_admin.png",
+    TASK_TYPE_SPEEDUP: f"{ASSET_SUBDIR}/speedup_icon_admin.png",
+    TASK_TYPE_TECH: f"{ASSET_SUBDIR}/tech_icon_admin.png",
+    TASK_TYPE_ORANGE_SHARD: f"{ASSET_SUBDIR}/orange_shard_icon_admin.png",
+    TASK_TYPE_GEM: f"{ASSET_SUBDIR}/gem_icon_admin.png",
+    TASK_TYPE_FIRE_CRYSTAL: f"{ASSET_SUBDIR}/fire_crystal_icon_admin.png",
+    TASK_TYPE_SMALL_MONSTER: f"{ASSET_SUBDIR}/small_monster_icon_admin.png",
+    TASK_TYPE_GIFT_PACK: f"{ASSET_SUBDIR}/gift_pack_icon_admin.png",
+    TASK_TYPE_BUILDING: f"{ASSET_SUBDIR}/building_icon_admin.png",
+    TASK_TYPE_DIAMOND: f"{ASSET_SUBDIR}/diamond_icon_admin.png",
+    TASK_TYPE_ENERGY_STONE: f"{ASSET_SUBDIR}/energy_stone_icon_admin.png",
+    TASK_TYPE_RESOURCE: f"{ASSET_SUBDIR}/resource_icon_admin.png",
+}
+# 详情弹窗优先用 *_detail / *_tight（从弹窗裁的模板底色更接近）
+TASK_TYPE_ADMIN_DETAIL_TEMPLATES: dict[str, str] = {
+    TASK_TYPE_TRAIN: f"{ASSET_SUBDIR}/train_icon_admin_detail.png",
 }
 
 DEFAULT_SLOTS: list[dict] = [
@@ -55,10 +121,12 @@ DEFAULT_COORDS: dict[str, list[int]] = {
 DEFAULT_SCAN_INTERVAL = 6 * 60
 DEFAULT_SCORE_THRESHOLD = 500
 DEFAULT_STEP_DELAY = 1.0
-# 练兵图标小且背景会变，阈值过高会漏检并误刷新
-DEFAULT_MATCH_THRESHOLD = 0.58
+# 仅匹配练兵模板；装备等其它类型靠「未命中」来刷新，不做装备排除（易与练兵混淆）
+DEFAULT_MATCH_THRESHOLD = 0.6
 DEFAULT_COUNTDOWN_THRESHOLD = 0.62
 DEFAULT_TARGET_TYPES: list[str] = [TASK_TYPE_TRAIN]
+# 实机练兵图标比模板 PNG 大约大 35%~45%，仅搜到 1.2 会把真练兵压在 ~0.55
+TRAIN_MATCH_SCALES: tuple[float, ...] = tuple(round(i / 100, 2) for i in range(85, 156, 5))
 
 
 @dataclass(frozen=True)
@@ -69,7 +137,7 @@ class SlotConfig:
 
 
 def available_task_types() -> list[tuple[str, str]]:
-    return [(key, TASK_TYPE_LABELS[key]) for key in TASK_TYPE_LABELS]
+    return [(key, TASK_TYPE_LABELS[key]) for key in ADMIN_TARGET_TYPES]
 
 
 def merge_task_config(cfg: dict | None) -> dict:
@@ -77,7 +145,7 @@ def merge_task_config(cfg: dict | None) -> dict:
     selected = [
         str(item).strip()
         for item in (raw.get("target_types") or DEFAULT_TARGET_TYPES)
-        if str(item).strip() in TASK_TYPE_LABELS
+        if str(item).strip() in ADMIN_TARGET_TYPES
     ]
     if not selected:
         selected = list(DEFAULT_TARGET_TYPES)
@@ -175,30 +243,6 @@ def _parse_score(text: str) -> int | None:
 
 def _looks_like_countdown_text(text: str) -> bool:
     return bool(re.search(r"\d{1,2}:\d{2}:\d{2}", text or ""))
-
-
-def _is_gray_countdown_patch(patch: np.ndarray) -> bool:
-    """倒计时卡：大片褐灰色背景，饱和度低、亮度偏中。"""
-    if patch.size == 0:
-        return False
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-    sat = hsv[:, :, 1]
-    val = hsv[:, :, 2]
-    low_sat_ratio = float(np.mean(sat < 60))
-    mid_val_ratio = float(np.mean((val > 70) & (val < 190)))
-    return low_sat_ratio >= 0.55 and mid_val_ratio >= 0.45
-
-
-def _looks_like_train_icon(patch: np.ndarray) -> bool:
-    """练兵图标兜底：橙底 + 右下绿色上箭头。"""
-    if patch.size == 0:
-        return False
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-    orange = cv2.inRange(hsv, (5, 70, 70), (28, 255, 255))
-    green = cv2.inRange(hsv, (35, 90, 70), (95, 255, 255))
-    orange_ratio = float(np.mean(orange > 0))
-    green_ratio = float(np.mean(green > 0))
-    return orange_ratio >= 0.08 and green_ratio >= 0.01
 
 
 def _prepare_score_patch(patch: np.ndarray, *, crop_left_ratio: float = 0.30) -> np.ndarray:
@@ -309,7 +353,7 @@ class AllianceMobilizationSession:
             result = self.vision.match_template_multiscale(
                 patch,
                 template_name,
-                scales=(0.75, 0.85, 0.95, 1.0, 1.1, 1.2),
+                scales=TRAIN_MATCH_SCALES,
             )
         finally:
             self.vision.threshold = old
@@ -331,6 +375,7 @@ class AllianceMobilizationSession:
     def _match_target_type(self, screen: np.ndarray, slot: SlotConfig) -> str | None:
         best_type = None
         best_conf = 0.0
+        raw_conf = 0.0
         for task_type in self.target_types:
             template = TASK_TYPE_TEMPLATES.get(task_type)
             if not template:
@@ -338,17 +383,25 @@ class AllianceMobilizationSession:
             conf = self._match_in_roi(
                 screen, slot.icon_roi, template, self.match_threshold
             )
+            if task_type == TASK_TYPE_TRAIN:
+                raw_conf = conf
             logger.debug(
                 f"[{self.name}] {slot.name} 类型匹配 {task_type} conf={conf:.3f}"
             )
             if conf >= self.match_threshold and conf > best_conf:
                 best_type = task_type
                 best_conf = conf
+
         if best_type is None and TASK_TYPE_TRAIN in self.target_types:
-            icon = _crop(screen, slot.icon_roi)
-            if _looks_like_train_icon(icon):
-                logger.info(f"[{self.name}] {slot.name} 模板未命中，颜色兜底为练兵")
-                return TASK_TYPE_TRAIN
+            logger.info(
+                f"[{self.name}] {slot.name} 练兵模板 conf={raw_conf:.2f} "
+                f"< {self.match_threshold:.2f}，视为非练兵"
+            )
+        elif best_type == TASK_TYPE_TRAIN:
+            logger.info(
+                f"[{self.name}] {slot.name} 识别为练兵（conf={best_conf:.2f}）"
+            )
+
         return best_type
 
     def _read_score(self, screen: np.ndarray, slot: SlotConfig) -> int | None:

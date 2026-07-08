@@ -252,10 +252,6 @@ class AutoTrainTroopsTask:
             screen = self.adb.screenshot()
             ready = self._find_train_ready(screen)
             if ready is None:
-                debug_dir = TEMPLATE_DIR.parent / "debug"
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                x1, y1, x2, y2 = TRAIN_SCAN_ROI
-                cv2.imwrite(str(debug_dir / "train_scan_fail_roi.png"), screen[y1:y2, x1:x2])
                 self._emit("没有可练兵项目，扫描结束")
                 self._back(1)
                 break

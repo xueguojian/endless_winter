@@ -11,17 +11,16 @@ from loguru import logger
 
 from core.adb_client import AdbClient
 from core.deploy_march import DeployMarchHelper, StaminaInsufficientError
-import cv2
 
 from core.lighthouse_vision import (
     LIGHTHOUSE_SCAN_ROI,
+    MISSION_DETAIL_ABSOLUTE_MIN,
     LighthouseMission,
     MissionDetailClassification,
     SKIP_MISSION_KINDS,
     classify_mission_detail_screen,
     configure_lighthouse_scan,
     is_lighthouse_intel_screen,
-    save_mission_detail_debug,
     scan_mission_icons,
     tag_scanned_missions,
 )
@@ -47,6 +46,10 @@ DEFAULT_MONSTER_COOLDOWN = 120.0
 MISSION_SCAN_SETTLE_SEC = 0.5
 SCAN_EMPTY_RETRY_WAIT_SEC = 1.0
 SCAN_REOPEN_WAIT_SEC = 1.2
+# 详情页 OCR 多帧采样：首帧等界面稳定，识别成功则不再重试
+DETAIL_CLASSIFY_FIRST_WAIT_SEC = 1.2
+DETAIL_CLASSIFY_RETRY_WAIT_SEC = 0.9
+DETAIL_CLASSIFY_MAX_ATTEMPTS = 2
 MISSION_SLOT_MAX_ATTEMPTS = 3
 MISSION_SLOT_TRACK_RADIUS = 28
 MAX_LIGHTHOUSE_CYCLE_ITERATIONS = 100
@@ -72,6 +75,34 @@ def merge_task_config(cfg: dict) -> dict:
         "monster_cooldown": float(cfg.get("monster_cooldown", DEFAULT_MONSTER_COOLDOWN)),
         "event_period": bool(cfg.get("event_period", False)),
     }
+
+
+def _prefer_detail_classification(
+    current: MissionDetailClassification,
+    previous: MissionDetailClassification,
+) -> bool:
+    """多帧采样：低置信度可执行类型不能覆盖 unknown/跳过类结果。"""
+    actionable = frozenset({"small_monster", "tent", "hero_journey"})
+
+    def _actionable_reliable(detail: MissionDetailClassification) -> bool:
+        return (
+            detail.kind not in actionable
+            or detail.confidence >= MISSION_DETAIL_ABSOLUTE_MIN
+        )
+
+    if current.kind in actionable and not _actionable_reliable(current):
+        return False
+    if previous.kind in actionable and not _actionable_reliable(previous):
+        return True
+    if current.kind in actionable and previous.kind not in actionable:
+        return _actionable_reliable(current)
+    if previous.kind in actionable and current.kind not in actionable:
+        return False
+    if current.kind == "beast_skip" and not current.beast_explicit:
+        return False
+    if previous.kind == "beast_skip" and not previous.beast_explicit:
+        return True
+    return current.confidence > previous.confidence
 
 
 class AutoLighthouseTask:
@@ -423,10 +454,6 @@ class AutoLighthouseTask:
         return screen, result, mission
 
     def _log_scan_miss(self, result, screen) -> None:
-        x1, y1, x2, y2 = LIGHTHOUSE_SCAN_ROI
-        debug_dir = TEMPLATE_DIR.parent / "debug"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(debug_dir / "lighthouse_scan_fail_roi.png"), screen[y1:y2, x1:x2])
         if result.candidate_locations > 0:
             self._emit(
                 f"发现 {result.candidate_locations} 个颜色图钉候选，"
@@ -478,32 +505,43 @@ class AutoLighthouseTask:
     def _classify_mission_detail(self) -> MissionDetailClassification:
         """详情页底部行动按钮 + 副标题分类（多帧采样，避免 Toast 遮挡误判）。"""
         detail: MissionDetailClassification | None = None
-        for attempt in range(3):
-            time.sleep(0.55 if attempt == 0 else 0.35)
+        actionable = frozenset({"small_monster", "tent", "hero_journey"})
+        for attempt in range(DETAIL_CLASSIFY_MAX_ATTEMPTS):
+            wait = (
+                DETAIL_CLASSIFY_FIRST_WAIT_SEC
+                if attempt == 0
+                else DETAIL_CLASSIFY_RETRY_WAIT_SEC
+            )
+            time.sleep(wait)
             screen = self.adb.screenshot()
             current = classify_mission_detail_screen(screen)
-            logger.debug(
-                f"详情页第 {attempt + 1} 帧: {current.label} "
-                f"({current.kind}, conf={current.confidence:.2f})"
-            )
-            if current.kind == "beast_skip":
+            if current.kind == "beast_skip" and current.beast_explicit:
                 detail = current
                 break
             if current.kind == "bounty_skip":
                 detail = current
                 break
-            if detail is None or current.confidence > detail.confidence:
+            if detail is None or _prefer_detail_classification(current, detail):
                 detail = current
+            if (
+                current.kind in actionable
+                and current.confidence >= MISSION_DETAIL_ABSOLUTE_MIN
+            ):
+                break
         assert detail is not None
+        if (
+            detail.kind in actionable
+            and detail.confidence < MISSION_DETAIL_ABSOLUTE_MIN
+        ):
+            detail = MissionDetailClassification(
+                kind="unknown",
+                label="未识别",
+                confidence=detail.confidence,
+            )
         self._emit(
             f"详情页识别为：{detail.label}（{detail.kind}，"
             f"置信度 {detail.confidence:.2f}）"
         )
-        if detail.kind == "unknown":
-            save_mission_detail_debug(screen)
-            self._emit(
-                "已保存详情页调试图 assets/debug/lighthouse_detail_*.png"
-            )
         return detail
 
     def _execute_detail_action(self, detail: MissionDetailClassification) -> None:
@@ -612,7 +650,10 @@ class AutoLighthouseTask:
                 self._back_from_detail_page()
                 continue
 
-            if detail.kind == "beast_skip" or tap_target.kind in SKIP_MISSION_KINDS:
+            if (
+                detail.kind == "beast_skip"
+                and detail.beast_explicit
+            ) or tap_target.kind in SKIP_MISSION_KINDS:
                 self._emit("特殊大怪，跳过不打")
                 self._mark_skipped_center(tap_target.center)
                 self._back_from_detail_page()
