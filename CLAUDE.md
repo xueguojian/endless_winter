@@ -77,8 +77,10 @@ scripts/        标定脚本
 
 ### 配置文件
 
-- `config.yaml` 是模板配置，`config_5555.yaml` / `config_5557.yaml` 等是多开实例配置
-- 实例配置文件不存在时会从 `config.yaml` 自动复制并根据文件名推断端口
+- `config.example.yaml` 是仓库里的配置模板（Git 跟踪）
+- `config.yaml` 是本机配置（**不提交 Git**），首次从 example 复制，各机器只改 `device.adb_path` 等本地项
+- `config_5555.yaml` / `config_5557.yaml` 等多开实例同样不提交 Git，不存在时从 `config.yaml` 自动复制
+- pull 后若代码新增了配置项，运行：`.venv\Scripts\python.exe tools\sync_config_from_example.py`（只补缺失键，不覆盖已有值）
 - `device.adb_port` 决定连接哪个模拟器实例
 - `tasks.<name>.coords` 的各坐标点对应游戏界面的触控位置
 

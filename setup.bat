@@ -28,6 +28,17 @@ echo [2/2] Installing packages (may take a few minutes)...
 ".venv\Scripts\pip.exe" install -r requirements.txt
 if errorlevel 1 goto :pip_fail
 
+echo [3/3] Sync config from template (if config.yaml exists)...
+if exist "config.yaml" (
+  ".venv\Scripts\python.exe" tools\sync_config_from_example.py
+) else if exist "config.example.yaml" (
+  echo Creating config.yaml from config.example.yaml ...
+  copy /Y config.example.yaml config.yaml >nul
+  echo   Please edit config.yaml - set device.adb_path to your LDPlayer adb.exe
+) else (
+  echo [WARN] config.example.yaml not found, skip config setup
+)
+
 echo.
 echo ========================================
 echo   Setup complete
@@ -36,8 +47,9 @@ echo.
 echo Next steps:
 echo   1. Edit config.yaml - set device.adb_path to your LDPlayer adb.exe
 echo   2. Set device.adb_port (default 5555)
-echo   3. Start emulator and game
-echo   4. Double-click run_gui.vbs
+echo   3. After git pull, run: .venv\Scripts\python.exe tools\sync_config_from_example.py
+echo   4. Start emulator and game
+echo   5. Double-click run_gui.vbs
 echo.
 pause
 exit /b 0

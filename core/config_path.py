@@ -11,6 +11,17 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = ROOT / "config.yaml"
+EXAMPLE_CONFIG_PATH = ROOT / "config.example.yaml"
+
+
+def _config_template_path() -> Path:
+    if EXAMPLE_CONFIG_PATH.is_file():
+        return EXAMPLE_CONFIG_PATH
+    if DEFAULT_CONFIG_PATH.is_file():
+        return DEFAULT_CONFIG_PATH
+    raise FileNotFoundError(
+        f"缺少配置模板：{EXAMPLE_CONFIG_PATH.name} 或 {DEFAULT_CONFIG_PATH.name}"
+    )
 
 
 def resolve_config_path(raw: str | Path | None) -> Path:
@@ -48,15 +59,15 @@ def default_instance_name(cfg: dict, config_path: Path) -> str:
 
 
 def ensure_config_file(path: Path) -> Path:
-    """配置文件不存在时，从 config.yaml 复制；文件名含端口则自动写入 device.adb_port。"""
+    """配置文件不存在时，从 config.example.yaml（或 config.yaml）复制；文件名含端口则自动写入 device.adb_port。"""
     if path.is_file():
         return path
+    template = _config_template_path()
     if path == DEFAULT_CONFIG_PATH:
-        raise FileNotFoundError(f"缺少默认配置文件：{DEFAULT_CONFIG_PATH}")
+        shutil.copy2(template, path)
+        return path
     if not DEFAULT_CONFIG_PATH.is_file():
-        raise FileNotFoundError(
-            f"无法创建 {path.name}：缺少模板 {DEFAULT_CONFIG_PATH.name}"
-        )
+        shutil.copy2(template, DEFAULT_CONFIG_PATH)
 
     shutil.copy2(DEFAULT_CONFIG_PATH, path)
 

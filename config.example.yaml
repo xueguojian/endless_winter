@@ -1,7 +1,7 @@
 device:
   adb_host: 127.0.0.1
   adb_port: 5555
-  adb_path: D:\leidian\LDPlayer9\adb.exe
+  adb_path: ''  # 本机雷电 adb.exe，如 C:\leidian\LDPlayer9\adb.exe
   touch_width: 720
   touch_height: 1280
 emulator:
