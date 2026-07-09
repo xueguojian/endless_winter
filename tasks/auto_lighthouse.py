@@ -21,6 +21,7 @@ from core.lighthouse_vision import (
     classify_mission_detail_screen,
     configure_lighthouse_scan,
     is_lighthouse_intel_screen,
+    mission_detail_action_ready,
     scan_mission_icons,
     tag_scanned_missions,
 )
@@ -46,10 +47,13 @@ DEFAULT_MONSTER_COOLDOWN = 120.0
 MISSION_SCAN_SETTLE_SEC = 0.5
 SCAN_EMPTY_RETRY_WAIT_SEC = 1.0
 SCAN_REOPEN_WAIT_SEC = 1.2
-# 详情页 OCR 多帧采样：首帧等界面稳定，识别成功则不再重试
-DETAIL_CLASSIFY_FIRST_WAIT_SEC = 1.2
-DETAIL_CLASSIFY_RETRY_WAIT_SEC = 0.9
-DETAIL_CLASSIFY_MAX_ATTEMPTS = 2
+# 详情页：先轮询底部按钮出现，再多帧 OCR 采样
+DETAIL_PAGE_READY_MAX_WAIT_SEC = 4.5
+DETAIL_PAGE_READY_POLL_SEC = 0.45
+DETAIL_CLASSIFY_FIRST_WAIT_SEC = 0.6
+DETAIL_CLASSIFY_RETRY_WAIT_SEC = 0.8
+DETAIL_CLASSIFY_MAX_ATTEMPTS = 4
+MISSION_DETAIL_VIEW_SETTLE_SEC = 2.0
 MISSION_SLOT_MAX_ATTEMPTS = 3
 MISSION_SLOT_TRACK_RADIUS = 28
 MAX_LIGHTHOUSE_CYCLE_ITERATIONS = 100
@@ -403,6 +407,14 @@ class AutoLighthouseTask:
         result = self._scan_missions(screen)
         if result.missions:
             missions = tag_scanned_missions(screen, result.missions)
+            self._emit(
+                f"扫描到 {len(missions)} 个图钉候选"
+                + (
+                    f"（最高置信度 {result.best_confidence:.2f}）"
+                    if result.best_confidence > 0
+                    else ""
+                )
+            )
             if any(m.kind in SKIP_MISSION_KINDS for m in missions):
                 beast_count = sum(
                     1 for m in missions if m.kind in SKIP_MISSION_KINDS
@@ -495,15 +507,37 @@ class AutoLighthouseTask:
         time.sleep(MISSION_CONFIRM_PRE_WAIT_SEC)
         x, y = self.coords["view_immediately"]
         self._emit(f"点击立即查看 @ ({x},{y})")
-        self._tap_xy(x, y, delay=1.5)
+        self._tap_xy(x, y, delay=MISSION_DETAIL_VIEW_SETTLE_SEC)
         screen = self.adb.screenshot()
         if self._is_on_lighthouse_intel_page(screen):
             self._emit("点击后仍在情报页，疑为误点空地")
             return False
         return True
 
+    def _wait_mission_detail_ready(self) -> None:
+        """轮询直到详情页底部按钮可识别，避免弹窗动画未结束就截图。"""
+        deadline = time.time() + DETAIL_PAGE_READY_MAX_WAIT_SEC
+        polls = 0
+        while time.time() < deadline:
+            if self._interrupted():
+                raise InterruptedError("任务已停止")
+            screen = self.adb.screenshot()
+            if mission_detail_action_ready(screen):
+                if polls > 0:
+                    self._emit(
+                        f"详情页已就绪（等待 {polls * DETAIL_PAGE_READY_POLL_SEC:.1f}s）"
+                    )
+                return
+            polls += 1
+            time.sleep(DETAIL_PAGE_READY_POLL_SEC)
+        self._emit(
+            f"详情页 {DETAIL_PAGE_READY_MAX_WAIT_SEC:.0f}s 内未检测到行动按钮，"
+            f"继续尝试识别"
+        )
+
     def _classify_mission_detail(self) -> MissionDetailClassification:
         """详情页底部行动按钮 + 副标题分类（多帧采样，避免 Toast 遮挡误判）。"""
+        self._wait_mission_detail_ready()
         detail: MissionDetailClassification | None = None
         actionable = frozenset({"small_monster", "tent", "hero_journey"})
         for attempt in range(DETAIL_CLASSIFY_MAX_ATTEMPTS):
@@ -613,9 +647,18 @@ class AutoLighthouseTask:
                             f"剩余 {len(result.missions)} 个候选坐标均已尝试 "
                             f"{MISSION_SLOT_MAX_ATTEMPTS} 次，结束本轮"
                         )
+                elif result.missions:
+                    self._emit(
+                        f"有 {len(result.missions)} 个图钉候选但均不可执行，"
+                        f"结束本轮"
+                    )
                 else:
                     self._log_scan_miss(result, screen)
-                    self._emit("页面上没有可处理的灯塔任务，扫描结束")
+                    self._emit(
+                        "页面上没有可处理的灯塔任务，扫描结束。"
+                        "若肉眼可见图钉，请重裁 assets/templates/lighthouse/"
+                        "lighthouse_map_bg.png（无任务时的情报页全屏截图）"
+                    )
                 self._after_mission_completed()
                 break
 
@@ -660,8 +703,18 @@ class AutoLighthouseTask:
                 continue
 
             if detail.kind == "unknown":
-                self._emit("详情页未能识别任务类型，跳过此坐标")
-                self._mark_skipped_center(tap_target.center)
+                if self._is_slot_exhausted(tap_target.center):
+                    self._emit(
+                        f"详情页 {MISSION_SLOT_MAX_ATTEMPTS} 次仍未能识别，"
+                        f"跳过此坐标"
+                    )
+                    self._mark_skipped_center(tap_target.center)
+                else:
+                    self._emit(
+                        "详情页未能识别任务类型，"
+                        f"稍后重试（{self._slot_attempt_count(tap_target.center)}"
+                        f"/{MISSION_SLOT_MAX_ATTEMPTS}）"
+                    )
                 self._back_from_detail_page()
                 continue
 

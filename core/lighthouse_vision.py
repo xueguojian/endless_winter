@@ -33,6 +33,9 @@ BG_DIFF_THRESHOLD = 28
 BG_DIFF_VIVID_MIN = 0.10
 BG_DIFF_PIN_SUPPORT_MIN = 0.15
 BG_MAX_PINS_PER_DIFF_BLOB = 2
+BG_LARGE_BLOB_AREA = 3500
+BG_LARGE_BLOB_PIN_SPACING = 24
+BG_PEAK_MIN_DISTANCE = 4.0
 BG_PIN_AREA_MIN = 60
 BG_PIN_AREA_MAX = 1800
 BG_DIFF_BLOB_MIN_AREA = 800
@@ -63,7 +66,7 @@ MISSION_PIN_MAX_EXTENT = 0.85
 MISSION_PIN_MIN_ASPECT = 0.9
 MISSION_PIN_MAX_ASPECT = 2.2
 MISSION_PIN_MERGE_DISTANCE = 18
-MAP_PIN_MIN_SCREEN_Y = 390
+MAP_PIN_MIN_SCREEN_Y = 250
 MAP_PIN_MAX_SCREEN_Y = 980
 MAP_PIN_MIN_SCREEN_X = 50
 MAP_PIN_MAX_SCREEN_X = 670
@@ -120,6 +123,18 @@ DETAIL_ACTION_TEXT_KINDS: tuple[tuple[str, str, str], ...] = (
     ("探险", "hero_journey", "探险"),
     ("出征", "small_monster", "出征"),
 )
+DETAIL_ACTION_BUTTON_TEMPLATES: tuple[tuple[str, str, str], ...] = (
+    ("small_monster", "出征", MISSION_BTN_MARCH),
+    ("hero_journey", "探险", MISSION_BTN_ADVENTURE),
+    ("tent", "营救", MISSION_BTN_RESCUE),
+)
+# 主 ROI 未命中时，在更大底部区域再试一次（部分机型/任务弹窗略有偏移）
+DETAIL_ACTION_ROI_FALLBACK = (200, 560, 520, 690)
+# 灯塔小怪详情弹窗按钮可能更靠下/偏宽，再扫一遍屏幕下沿
+DETAIL_ACTION_BOTTOM_BAND = (140, 520, 580, 740)
+DETAIL_ACTION_RELAXED_ACCEPT_SCORE = 0.50
+DETAIL_ACTION_RELAXED_MIN_MARGIN = 0.05
+DETAIL_ORANGE_ONLY_MIN_RATIO = 0.16
 
 _ACTION_BTN_TEMPLATE_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
@@ -1273,11 +1288,217 @@ def _classify_march_subtitle(
     *,
     subtitle_roi: tuple[int, int, int, int] = MISSION_DETAIL_SUBTITLE_ROI,
     template_dir: Path = TEMPLATE_DIR,
-) -> MissionDetailClassification | None:
-    """出征任务：OCR 副标题区分悬赏 / 灯塔小怪 / 特殊大怪。"""
+) -> tuple[MissionDetailClassification | None, str]:
+    """出征任务副标题：仅 OCR 文本（悬赏 / 大怪 / 等级怪）。"""
     _ = template_dir
     text = _ocr_subtitle_text(screen, subtitle_roi)
-    return _classify_march_subtitle_from_text(text)
+    return _classify_march_subtitle_from_text(text), text
+
+
+def _score_detail_action_templates(
+    screen: np.ndarray,
+    action_roi: tuple[int, int, int, int],
+    *,
+    template_dir: Path = TEMPLATE_DIR,
+) -> list[tuple[str, str, str, MatchResult]]:
+    scored: list[tuple[str, str, str, MatchResult]] = []
+    for kind, label, template_name in DETAIL_ACTION_BUTTON_TEMPLATES:
+        result = _match_action_button_in_screen_roi(
+            screen,
+            template_name,
+            action_roi,
+            template_dir=template_dir,
+        )
+        scored.append((kind, label, template_name, result))
+    scored.sort(key=lambda item: item[3].confidence, reverse=True)
+    return scored
+
+
+def _pick_detail_action_template(
+    scored: list[tuple[str, str, str, MatchResult]],
+    action_roi: tuple[int, int, int, int],
+) -> tuple[str, str, float, tuple[int, int]] | None:
+    if not scored:
+        return None
+    best_kind, best_label, _template_name, best_result = scored[0]
+    if best_result.confidence < MISSION_DETAIL_BTN_ACCEPT_SCORE:
+        return None
+    second_conf = scored[1][3].confidence if len(scored) > 1 else 0.0
+    if best_result.confidence < second_conf + MISSION_DETAIL_BTN_MIN_MARGIN:
+        return None
+    center = best_result.center or _detail_action_center_fallback(action_roi)
+    return best_kind, best_label, best_result.confidence, center
+
+
+def _pick_detail_action_template_relaxed(
+    scored: list[tuple[str, str, str, MatchResult]],
+    action_roi: tuple[int, int, int, int],
+) -> tuple[str, str, float, tuple[int, int]] | None:
+    """放宽阈值：弹窗布局略有偏差时仍接受明显领先的模板。"""
+    if not scored:
+        return None
+    best_kind, best_label, _template_name, best_result = scored[0]
+    if best_result.confidence < DETAIL_ACTION_RELAXED_ACCEPT_SCORE:
+        return None
+    second_conf = scored[1][3].confidence if len(scored) > 1 else 0.0
+    if best_result.confidence < second_conf + DETAIL_ACTION_RELAXED_MIN_MARGIN:
+        return None
+    center = best_result.center or _detail_action_center_fallback(action_roi)
+    return best_kind, best_label, best_result.confidence, center
+
+
+def _resolve_detail_action(
+    screen: np.ndarray,
+    *,
+    template_dir: Path = TEMPLATE_DIR,
+    action_roi: tuple[int, int, int, int] = MISSION_DETAIL_ACTION_ROI,
+) -> tuple[str, str, float, tuple[int, int]] | None:
+    """行动按钮：OCR → 模板 → 颜色，逐级兜底。"""
+    rois = (action_roi, DETAIL_ACTION_ROI_FALLBACK, DETAIL_ACTION_BOTTOM_BAND)
+    unique_rois: list[tuple[int, int, int, int]] = []
+    for roi in rois:
+        if roi not in unique_rois:
+            unique_rois.append(roi)
+
+    scored: list[tuple[str, str, str, MatchResult]] = []
+    for roi in unique_rois:
+        ocr_hit = _classify_detail_action_by_text(screen, roi)
+        scored = _score_detail_action_templates(screen, roi, template_dir=template_dir)
+        tpl_hit = _pick_detail_action_template(scored, roi)
+
+        if ocr_hit is not None:
+            kind, label, conf, center = ocr_hit
+            if scored:
+                kind, label, conf, center = _refine_action_with_button_color(
+                    kind, label, conf, center, scored, screen, roi
+                )
+            logger.info(f"详情识别: 行动按钮 OCR → {label}({conf:.2f})")
+            return kind, label, conf, center
+
+        if tpl_hit is not None:
+            kind, label, conf, center = tpl_hit
+            if scored:
+                kind, label, conf, center = _refine_action_with_button_color(
+                    kind, label, conf, center, scored, screen, roi
+                )
+            logger.info(f"详情识别: 行动按钮模板 → {label}({conf:.2f})")
+            return kind, label, max(conf, MISSION_DETAIL_BTN_ACCEPT_SCORE), center
+
+        color_hit = _classify_detail_action_by_color(screen, roi)
+        if color_hit is not None:
+            c_kind, c_label, c_ratio, c_center = color_hit
+            tpl_conf = _template_conf_for_kind(scored, c_kind)
+            strong = c_ratio >= MISSION_DETAIL_COLOR_STRONG_RATIO and tpl_conf >= (
+                MISSION_DETAIL_COLOR_STRONG_MIN_TEMPLATE
+            )
+            soft = (
+                c_ratio >= MISSION_DETAIL_COLOR_MIN_RATIO
+                and tpl_conf >= MISSION_DETAIL_COLOR_BACKUP_MIN_TEMPLATE
+            )
+            if strong or soft:
+                conf = max(c_ratio, tpl_conf, MISSION_DETAIL_BTN_ACCEPT_SCORE)
+                logger.info(
+                    f"详情识别: 行动按钮颜色 → {c_label} "
+                    f"(color={c_ratio:.2f} tpl={tpl_conf:.2f})"
+                )
+                return c_kind, c_label, conf, c_center
+
+        relaxed_hit = _pick_detail_action_template_relaxed(scored, roi)
+        if relaxed_hit is not None:
+            kind, label, conf, center = relaxed_hit
+            logger.info(f"详情识别: 行动按钮模板(放宽) → {label}({conf:.2f})")
+            return kind, label, max(conf, MISSION_DETAIL_BTN_ACCEPT_SCORE), center
+
+        if roi != unique_rois[-1]:
+            logger.debug(
+                "详情行动按钮 ROI 未命中，尝试下一档区域 "
+                f"({roi[0]},{roi[1]})-({roi[2]},{roi[3]})"
+            )
+
+    if scored:
+        best_kind, best_label, _tpl, best_result = scored[0]
+        color_hit = _classify_detail_action_by_color(
+            screen, unique_rois[-1]
+        )
+        if (
+            color_hit is not None
+            and color_hit[0] == "small_monster"
+            and color_hit[2] >= DETAIL_ORANGE_ONLY_MIN_RATIO
+            and best_kind == "small_monster"
+            and best_result.confidence >= 0.28
+        ):
+            conf = max(
+                color_hit[2],
+                best_result.confidence,
+                MISSION_DETAIL_BTN_ACCEPT_SCORE,
+            )
+            logger.info(
+                f"详情识别: 底部橙色出征兜底 "
+                f"(color={color_hit[2]:.2f} tpl={best_result.confidence:.2f})"
+            )
+            return "small_monster", "出征", conf, color_hit[3]
+
+        logger.info(
+            "详情识别: 行动按钮模板得分 "
+            + ", ".join(
+                f"{label}={result.confidence:.2f}"
+                for _kind, label, _tpl, result in scored
+            )
+        )
+    return None
+
+
+def _classify_detail_from_subtitle_first(
+    screen: np.ndarray,
+    *,
+    subtitle_roi: tuple[int, int, int, int] = MISSION_DETAIL_SUBTITLE_ROI,
+    action_roi: tuple[int, int, int, int] = MISSION_DETAIL_ACTION_ROI,
+    template_dir: Path = TEMPLATE_DIR,
+) -> MissionDetailClassification | None:
+    """行动按钮未命中时：仅 OCR 副标题文字兜底（悬赏 / 大怪）。"""
+    march_sub, subtitle = _classify_march_subtitle(
+        screen,
+        subtitle_roi=subtitle_roi,
+        template_dir=template_dir,
+    )
+    if march_sub is None:
+        return None
+    if march_sub.kind in ("bounty_skip", "beast_skip"):
+        logger.info(f"详情识别: 副标题 OCR → {march_sub.label}（{subtitle}）")
+        return MissionDetailClassification(
+            kind=march_sub.kind,
+            label=march_sub.label,
+            confidence=march_sub.confidence,
+            action_center=_detail_action_center_fallback(action_roi),
+            beast_explicit=march_sub.beast_explicit,
+        )
+    return None
+
+
+def mission_detail_action_ready(
+    screen: np.ndarray,
+    *,
+    action_roi: tuple[int, int, int, int] = MISSION_DETAIL_ACTION_ROI,
+    template_dir: Path = TEMPLATE_DIR,
+) -> bool:
+    """详情页是否可分类（行动按钮或强副标题特征）。"""
+    if (
+        _resolve_detail_action(
+            screen,
+            template_dir=template_dir,
+            action_roi=action_roi,
+        )
+        is not None
+    ):
+        return True
+    return (
+        _classify_detail_from_subtitle_first(
+            screen,
+            action_roi=action_roi,
+            template_dir=template_dir,
+        )
+        is not None
+    )
 
 
 def classify_mission_detail_screen(
@@ -1287,36 +1508,50 @@ def classify_mission_detail_screen(
     action_roi: tuple[int, int, int, int] = MISSION_DETAIL_ACTION_ROI,
     subtitle_roi: tuple[int, int, int, int] = MISSION_DETAIL_SUBTITLE_ROI,
 ) -> MissionDetailClassification:
-    """详情页：OCR 识别行动按钮与副标题。"""
-    _ = template_dir
-    ocr_hit = _classify_detail_action_by_text(screen, action_roi)
-    if ocr_hit is None:
-        logger.info("详情识别: 未识别（按钮文字 OCR 未命中）")
+    """详情页：行动按钮 OCR/模板/颜色；副标题仅 OCR 文字。"""
+    action_hit = _resolve_detail_action(
+        screen,
+        template_dir=template_dir,
+        action_roi=action_roi,
+    )
+    if action_hit is None:
+        subtitle_first = _classify_detail_from_subtitle_first(
+            screen,
+            subtitle_roi=subtitle_roi,
+            action_roi=action_roi,
+            template_dir=template_dir,
+        )
+        if subtitle_first is not None:
+            return subtitle_first
+        logger.info("详情识别: 未识别（行动按钮与副标题均未命中）")
         return MissionDetailClassification(
             kind="unknown",
             label="未识别",
             confidence=0.0,
         )
 
-    resolved_kind, resolved_label, resolved_conf, action_center = ocr_hit
+    resolved_kind, resolved_label, resolved_conf, action_center = action_hit
     if action_center is None:
         action_center = _detail_action_center_fallback(action_roi)
 
     if resolved_kind == "small_monster":
-        subtitle = _ocr_subtitle_text(screen, subtitle_roi)
-        march_sub = _classify_march_subtitle_from_text(subtitle)
+        march_sub, subtitle = _classify_march_subtitle(
+            screen,
+            subtitle_roi=subtitle_roi,
+            template_dir=template_dir,
+        )
         if march_sub is not None:
             logger.info(
-                f"详情识别: 出征 + 副标题「{subtitle}」→ {march_sub.label}"
+                f"详情识别: 出征 + 副标题 OCR「{subtitle}」→ {march_sub.label}"
             )
             return MissionDetailClassification(
                 kind=march_sub.kind,
                 label=march_sub.label,
-                confidence=march_sub.confidence,
+                confidence=max(resolved_conf, march_sub.confidence),
                 action_center=action_center,
                 beast_explicit=march_sub.beast_explicit,
             )
-        logger.info(f"详情识别: 出征 + 副标题「{subtitle}」→ 灯塔小怪")
+        logger.info(f"详情识别: 出征 + 副标题 OCR「{subtitle}」→ 灯塔小怪")
         return MissionDetailClassification(
             kind="small_monster",
             label="灯塔小怪",
@@ -1627,7 +1862,75 @@ def _accept_pin_candidate(
         return None
     if _is_plane_point(refined):
         return None
+    if not _screen_center_in_map(refined):
+        return None
     return refined, float(max(confidence, vivid, diff_ratio))
+
+
+def _max_pins_for_diff_blob(blob_area: float) -> int:
+    if blob_area < BG_LARGE_BLOB_AREA:
+        return BG_MAX_PINS_PER_DIFF_BLOB
+    return min(8, max(BG_MAX_PINS_PER_DIFF_BLOB, int(blob_area / 1800)))
+
+
+def _extract_vivid_peaks_from_blob(
+    blob_contour: np.ndarray,
+    search_mask: np.ndarray,
+    hsv: np.ndarray,
+    roi: np.ndarray,
+    roi_offset: tuple[int, int],
+    diff_mask: np.ndarray,
+) -> list[tuple[tuple[int, int], float]]:
+    """大片差分块：距离变换 + 峰值抑制，拆分重叠图钉。"""
+    blob_area = cv2.contourArea(blob_contour)
+    if blob_area < BG_LARGE_BLOB_AREA:
+        return []
+
+    bx, by, bw, bh = cv2.boundingRect(blob_contour)
+    pad = 6
+    lx = max(0, bx - pad)
+    ly = max(0, by - pad)
+    rx = min(search_mask.shape[1], bx + bw + pad)
+    ry = min(search_mask.shape[0], by + pad + bh)
+    local_search = search_mask[ly:ry, lx:rx]
+    if local_search.size == 0 or cv2.countNonZero(local_search) < 80:
+        return []
+
+    dist = cv2.distanceTransform(local_search, cv2.DIST_L2, 5)
+    work = dist.copy()
+    limit = _max_pins_for_diff_blob(blob_area)
+    found: list[tuple[tuple[int, int], float]] = []
+    spacing = BG_LARGE_BLOB_PIN_SPACING
+
+    for _ in range(limit):
+        _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(work)
+        if max_val < BG_PEAK_MIN_DISTANCE:
+            break
+        px, py = max_loc
+        center = (roi_offset[0] + lx + px, roi_offset[1] + ly + py)
+        vivid = _patch_vivid_ratio(
+            hsv,
+            (center[0] - roi_offset[0], center[1] - roi_offset[1]),
+        )
+        accepted = _accept_pin_candidate(
+            center,
+            vivid,
+            roi,
+            hsv,
+            roi_offset,
+            diff_mask,
+            blob_area=blob_area,
+            blob_width=bw,
+            blob_height=bh,
+        )
+        if accepted is not None:
+            found.append(accepted)
+            cv2.circle(work, max_loc, spacing, 0, -1)
+            continue
+        # 峰值落在无效区域时仍抑制，避免反复选中同一点
+        cv2.circle(work, max_loc, max(8, spacing // 2), 0, -1)
+
+    return found
 
 
 def _extract_pins_from_diff_blob(
@@ -1706,7 +2009,26 @@ def _extract_pins_from_diff_blob(
                 continue
             seen.add(key)
             found.append(accepted)
-    return _merge_nearby_pin_candidates(found)[:BG_MAX_PINS_PER_DIFF_BLOB]
+
+    peak_found = _extract_vivid_peaks_from_blob(
+        blob_contour, search_mask, hsv, roi, roi_offset, diff_mask
+    )
+    for item in peak_found:
+        key = (item[0][0] // 8, item[0][1] // 8)
+        if key in seen:
+            continue
+        if any(
+            abs(item[0][0] - existing[0]) < MISSION_PIN_MERGE_DISTANCE
+            and abs(item[0][1] - existing[1]) < MISSION_PIN_MERGE_DISTANCE
+            for existing, _ in found
+        ):
+            continue
+        seen.add(key)
+        found.append(item)
+
+    return _merge_nearby_pin_candidates(found)[
+        : _max_pins_for_diff_blob(blob_area)
+    ]
 
 
 def _find_mission_pins_bg_diff(
