@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.adb_client import AdbClient
+from core.config_path import PRIMARY_CONFIG_PATH, ensure_config_file, resolve_config_path
 from core.vision import Vision
 from tasks.alliance_mobilization import (
     TEMPLATE_DIR,
@@ -34,7 +35,7 @@ SCALES = tuple(round(i / 100, 2) for i in range(45, 121, 5))
 
 
 def main() -> None:
-    cfg_path = ROOT / "config.yaml"
+    cfg_path = ensure_config_file(resolve_config_path(PRIMARY_CONFIG_PATH))
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     cfg = merge_task_config(raw.get("alliance_mobilization_admin", {}))
     port = int((raw.get("device") or {}).get("adb_port", 5555))

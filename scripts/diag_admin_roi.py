@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core.adb_client import AdbClient
-from core.config_path import ensure_config_file, resolve_config_path
+from core.config_path import PRIMARY_CONFIG_PATH, ensure_config_file, resolve_config_path
 from core.vision import Vision
 from tasks.alliance_mobilization import (
     TRAIN_ICON_ADMIN_TEMPLATE,
@@ -33,7 +33,7 @@ from tasks.alliance_mobilization_admin import (
 from core.dream_memory.ocr_engine import ocr_chip_text
 
 OUT = ROOT / "assets" / "debug"
-DEFAULT_CONFIG = ROOT / "config.yaml"
+DEFAULT_CONFIG = PRIMARY_CONFIG_PATH
 
 
 def draw_roi_overlay(

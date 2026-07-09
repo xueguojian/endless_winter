@@ -1,3 +1,8 @@
 @echo off
 cd /d "%~dp0"
-call run_gui.bat --config config_5555.yaml
+if not exist ".venv\Scripts\python.exe" (
+    echo [ERROR] Virtual env not found. Run setup.bat first.
+    pause
+    exit /b 1
+)
+".venv\Scripts\python.exe" launch_gui.py --config config_5555.yaml

@@ -19,6 +19,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core.adb_client import AdbClient
+from core.config_path import PRIMARY_CONFIG_PATH, ensure_config_file, resolve_config_path
 from core.coords import PORTRAIT_HEIGHT, PORTRAIT_WIDTH, crop_center
 
 
@@ -30,7 +31,8 @@ def main() -> None:
     name = sys.argv[1]
     cx, cy, w, h = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
 
-    with open(ROOT / "config.yaml", encoding="utf-8") as f:
+    config_path = ensure_config_file(resolve_config_path(PRIMARY_CONFIG_PATH))
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     dev = cfg["device"]

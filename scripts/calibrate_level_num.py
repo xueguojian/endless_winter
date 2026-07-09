@@ -25,6 +25,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core.adb_client import AdbClient
+from core.config_path import PRIMARY_CONFIG_PATH, ensure_config_file, resolve_config_path
 from tasks.hunt_ice_beast import HuntIceBeastTask, LEVEL_NUM_ROI
 
 NUM_DIR = ROOT / "assets" / "templates" / "level_num"
@@ -45,7 +46,8 @@ def _crop_digit_only(patch: np.ndarray) -> np.ndarray:
 
 
 def main() -> None:
-    with open(ROOT / "config.yaml", encoding="utf-8") as f:
+    config_path = ensure_config_file(resolve_config_path(PRIMARY_CONFIG_PATH))
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     dev = cfg["device"]

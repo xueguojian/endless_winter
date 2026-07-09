@@ -1,4 +1,4 @@
-"""根据 config.yaml 中的 gui.show_console 决定如何启动 GUI。"""
+"""根据实例 config 的 gui.show_console 决定如何启动 GUI。"""
 
 from __future__ import annotations
 

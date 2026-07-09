@@ -30,7 +30,7 @@ DEFAULT_DONATE_CLICK_DELAY = 0.35
 
 
 def merge_task_config(cfg: dict) -> dict:
-    # 代码默认坐标优先，避免 config.yaml 中陈旧坐标覆盖修复后的值
+    # 代码默认坐标优先，避免实例 yaml 中陈旧坐标覆盖修复后的值
     coords = {**cfg.get("coords", {}), **DEFAULT_COORDS}
     return {
         "step_delay": cfg.get("step_delay", DEFAULT_STEP_DELAY),

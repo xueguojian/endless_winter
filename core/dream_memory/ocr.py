@@ -84,7 +84,7 @@ def ocr_chip(
         )
     except pytesseract.TesseractNotFoundError as exc:
         raise FileNotFoundError(
-            "未找到 tesseract.exe，请在 config.yaml dream_memory.tesseract_cmd 配置路径"
+            "未找到 tesseract.exe，请在 config_555x.yaml dream_memory.tesseract_cmd 配置路径"
         ) from exc
 
     text = clean_ocr_text(raw)

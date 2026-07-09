@@ -18,10 +18,10 @@ assets/debug_patches/
 assets/debug_roi/
 assets/flow/*.png
 
-# 多开实例配置（首次启动从 config.yaml 自动复制生成）
+# 本机实例配置（首次启动从 config.example.yaml 自动生成）
 config_555*.yaml
 
-# 本机配置（从 config.example.yaml 复制，各机器自行维护 device.adb_path 等）
+# 已废弃的旧单文件配置
 config.yaml
 
 # 系统文件

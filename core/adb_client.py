@@ -55,7 +55,7 @@ class AdbClient:
                 return candidate
 
         raise FileNotFoundError(
-            "未找到 adb.exe。请在 config.yaml 的 device.adb_path 中填写雷电安装目录下的 adb.exe 路径。"
+            "未找到 adb.exe。请在实例 config_555x.yaml 的 device.adb_path 中填写雷电 adb.exe 路径。"
         )
 
     @staticmethod

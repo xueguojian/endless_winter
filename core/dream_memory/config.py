@@ -1,4 +1,4 @@
-"""寻梦记忆配置（config.yaml dream_memory / dream_memory_pk 段）。"""
+"""寻梦记忆配置（config_555x.yaml 的 dream_memory / dream_memory_pk 段）。"""
 
 from __future__ import annotations
 

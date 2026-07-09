@@ -13,7 +13,6 @@ import yaml
 
 from core.adb_client import AdbClient
 from core.config_path import (
-    DEFAULT_CONFIG_PATH,
     default_instance_name,
     ensure_config_file,
     resolve_config_path,
@@ -44,6 +43,9 @@ from tasks.alliance_mobilization import (
 from tasks.alliance_mobilization_admin import (
     AllianceMobilizationAdminSession,
     CALIBRATED_DETAIL_MASK_TAP,
+    CARD_BG_LABELS,
+    DEFAULT_KEEP_BG_COLORS,
+    KEEP_BG_COLOR_ORDER,
     merge_task_config as merge_alliance_admin_config,
 )
 from tasks.auto_lighthouse import AutoLighthouseTask, merge_task_config as merge_lighthouse_config
@@ -163,6 +165,7 @@ class EndlessWinterApp(tk.Tk):
         self._alliance_admin_worker: threading.Thread | None = None
         self._alliance_admin_session: AllianceMobilizationAdminSession | None = None
         self._alliance_type_vars: dict[str, tk.BooleanVar] = {}
+        self._alliance_bg_color_vars: dict[str, tk.BooleanVar] = {}
 
         self._build_ui()
         self._poll_log_queue()
@@ -332,6 +335,16 @@ class EndlessWinterApp(tk.Tk):
         alliance_admin = cfg.setdefault("alliance_mobilization_admin", {})
         alliance_admin["target_types"] = list(selected_types)
         alliance_admin["keep_orange_types"] = list(selected_types)
+        keep_bg_colors = [
+            color_id
+            for color_id in KEEP_BG_COLOR_ORDER
+            if hasattr(self, "_alliance_bg_color_vars")
+            and self._alliance_bg_color_vars.get(color_id)
+            and bool(self._alliance_bg_color_vars[color_id].get())
+        ]
+        if not keep_bg_colors:
+            keep_bg_colors = list(DEFAULT_KEEP_BG_COLORS)
+        alliance_admin["keep_bg_colors"] = keep_bg_colors
         merged_admin = merge_alliance_admin_config(alliance_admin)
         alliance_admin["scan_interval"] = merged_admin["scan_interval"]
         alliance_admin["step_delay"] = merged_admin["step_delay"]
@@ -356,6 +369,7 @@ class EndlessWinterApp(tk.Tk):
             "detail_match_threshold"
         ]
         alliance_admin["keep_orange_types"] = list(merged_admin["keep_orange_types"])
+        alliance_admin["keep_bg_colors"] = list(merged_admin["keep_bg_colors"])
         alliance_admin["use_score_ocr"] = False
         alliance_admin["target_types"] = list(merged_admin.get("target_types") or selected_types)
 
@@ -921,12 +935,36 @@ class EndlessWinterApp(tk.Tk):
         if not any(var.get() for var in self._alliance_type_vars.values()):
             self._alliance_type_vars["train"].set(True)
 
+        selected_bg_colors = set(
+            admin_merged.get("keep_bg_colors") or list(DEFAULT_KEEP_BG_COLORS)
+        )
+        for color_id in KEEP_BG_COLOR_ORDER:
+            self._alliance_bg_color_vars[color_id] = tk.BooleanVar(
+                value=color_id in selected_bg_colors
+            )
+        if not any(var.get() for var in self._alliance_bg_color_vars.values()):
+            self._alliance_bg_color_vars["orange"].set(True)
+
         tab_alliance = ttk.Frame(notebook, padding=6)
         notebook.add(tab_alliance, text="联盟总动员")
         _configure_param_tab_grid(tab_alliance)
 
         row = 0
-        ttk.Label(tab_alliance, text="保留橙色类型（可多选）").grid(
+        ttk.Label(tab_alliance, text="保留底色（可多选）").grid(
+            row=row, column=0, sticky=tk.NW, pady=2
+        )
+        bg_wrap = ttk.Frame(tab_alliance)
+        bg_wrap.grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=FORM_INPUT_PADX)
+        for index, color_id in enumerate(KEEP_BG_COLOR_ORDER):
+            ttk.Checkbutton(
+                bg_wrap,
+                text=CARD_BG_LABELS[color_id],
+                variable=self._alliance_bg_color_vars[color_id],
+                command=self._save_config,
+            ).grid(row=0, column=index, sticky=tk.W, padx=(0, 12), pady=2)
+        row += 1
+
+        ttk.Label(tab_alliance, text="保留任务类型（可多选）").grid(
             row=row, column=0, sticky=tk.NW, pady=2
         )
         type_wrap = ttk.Frame(tab_alliance)
@@ -945,7 +983,7 @@ class EndlessWinterApp(tk.Tk):
         row += 1
         ttk.Label(
             tab_alliance,
-            text="管理员：仅保留「橙色 + 勾选类型」；紫/蓝底一律刷新。普通模式沿用同一勾选。",
+            text="管理员：仅保留「勾选底色 + 勾选类型」；未勾选的底色或类型一律刷新。",
             font=("", 8),
             foreground="gray",
         ).grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=FORM_INPUT_PADX, pady=(0, 4))
@@ -1026,7 +1064,7 @@ class EndlessWinterApp(tk.Tk):
         task_notebook.add(tab_alliance_admin_run, text="联盟管理员刷新")
         ttk.Label(
             tab_alliance_admin_run,
-            text="进入管理员任务列表后点开始。保留：橙色 +「功能参数→联盟总动员」勾选类型；紫/蓝刷新。",
+            text="进入管理员任务列表后点开始。保留：勾选底色 + 勾选任务类型；未勾选则刷新。",
             foreground="gray",
             font=("", 8),
         ).pack(anchor=tk.W)
@@ -2091,7 +2129,7 @@ class EndlessWinterApp(tk.Tk):
             return
 
         try:
-            # 先从磁盘重载，避免内存里旧的 coords 覆盖 config.yaml
+            # 先从磁盘重载，避免内存里旧的 coords 覆盖实例配置文件
             self.config = self._load_config()
             self._save_config()
             self.config = self._load_config()
@@ -2103,12 +2141,17 @@ class EndlessWinterApp(tk.Tk):
             return
 
         labels = "、".join(TASK_TYPE_LABELS[t] for t in selected_types)
+        bg_labels = "、".join(
+            CARD_BG_LABELS[c]
+            for c in KEEP_BG_COLOR_ORDER
+            if self._alliance_bg_color_vars[c].get()
+        )
         self._set_alliance_admin_buttons(running=True)
         mask_xy = admin_cfg["coords"].get(
             "detail_mask_tap", list(CALIBRATED_DETAIL_MASK_TAP)
         )
         self._on_status(
-            f"联盟管理员刷新：保留橙色[{labels}]，紫/蓝刷新，"
+            f"联盟管理员刷新：保留底色[{bg_labels}]，类型[{labels}]，"
             f"遮罩 ({mask_xy[0]},{mask_xy[1]})"
         )
 
@@ -2116,9 +2159,17 @@ class EndlessWinterApp(tk.Tk):
             try:
                 if not self._ensure_device():
                     return
+                keep_bg_colors = [
+                    c
+                    for c in KEEP_BG_COLOR_ORDER
+                    if self._alliance_bg_color_vars[c].get()
+                ]
+                if not keep_bg_colors:
+                    keep_bg_colors = list(DEFAULT_KEEP_BG_COLORS)
                 run_cfg = dict(admin_cfg)
                 run_cfg["target_types"] = selected_types
                 run_cfg["keep_orange_types"] = selected_types
+                run_cfg["keep_bg_colors"] = keep_bg_colors
                 run_cfg["use_score_ocr"] = False
                 session = AllianceMobilizationAdminSession(
                     self._get_adb(),

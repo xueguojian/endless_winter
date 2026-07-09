@@ -16,6 +16,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core.adb_client import AdbClient
+from core.config_path import PRIMARY_CONFIG_PATH, ensure_config_file, resolve_config_path
 from core.vision import Vision
 from tasks.hunt_ice_beast import (
     STAMINA_GET_MORE_TITLE,
@@ -26,12 +27,12 @@ from tasks.hunt_ice_beast import (
     TEMPLATE_DIR,
 )
 
-CONFIG_PATH = ROOT / "config.yaml"
 OUT_DIR = ROOT / "assets" / "flow"
 
 
 def main() -> None:
-    with open(CONFIG_PATH, encoding="utf-8") as f:
+    config_path = ensure_config_file(resolve_config_path(PRIMARY_CONFIG_PATH))
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     dev = cfg["device"]
     adb = AdbClient(

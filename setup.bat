@@ -14,7 +14,7 @@ python --version
 echo.
 
 if exist ".venv\Scripts\python.exe" goto :has_venv
-echo [1/2] Creating virtual env .venv ...
+echo [1/3] Creating virtual env .venv ...
 python -m venv .venv
 if errorlevel 1 goto :venv_fail
 goto :install_deps
@@ -23,21 +23,14 @@ goto :install_deps
 echo .venv exists, updating dependencies...
 
 :install_deps
-echo [2/2] Installing packages (may take a few minutes)...
+echo [2/3] Installing packages (may take a few minutes)...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
 ".venv\Scripts\pip.exe" install -r requirements.txt
 if errorlevel 1 goto :pip_fail
 
-echo [3/3] Sync config from template (if config.yaml exists)...
-if exist "config.yaml" (
-  ".venv\Scripts\python.exe" tools\sync_config_from_example.py
-) else if exist "config.example.yaml" (
-  echo Creating config.yaml from config.example.yaml ...
-  copy /Y config.example.yaml config.yaml >nul
-  echo   Please edit config.yaml - set device.adb_path to your LDPlayer adb.exe
-) else (
-  echo [WARN] config.example.yaml not found, skip config setup
-)
+echo [3/3] Preparing instance config config_5555.yaml ...
+".venv\Scripts\python.exe" -c "from core.config_path import ensure_config_file, PRIMARY_CONFIG_PATH; ensure_config_file(PRIMARY_CONFIG_PATH)"
+".venv\Scripts\python.exe" tools\sync_config_from_example.py -c config_5555.yaml
 
 echo.
 echo ========================================
@@ -45,11 +38,11 @@ echo   Setup complete
 echo ========================================
 echo.
 echo Next steps:
-echo   1. Edit config.yaml - set device.adb_path to your LDPlayer adb.exe
-echo   2. Set device.adb_port (default 5555)
-echo   3. After git pull, run: .venv\Scripts\python.exe tools\sync_config_from_example.py
+echo   1. Edit config_5555.yaml - set device.adb_path to your LDPlayer adb.exe
+echo   2. Multi-instance: copy or run run_gui_5557.bat to create config_5557.yaml
+echo   3. After git pull: .venv\Scripts\python.exe tools\sync_config_from_example.py --all
 echo   4. Start emulator and game
-echo   5. Double-click run_gui.vbs
+echo   5. Double-click run_gui_5555.bat or run_gui_5557.bat
 echo.
 pause
 exit /b 0

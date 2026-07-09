@@ -28,6 +28,7 @@ TRAIN_ICON_ADMIN_TEMPLATE = f"{ASSET_SUBDIR}/train_icon_admin.png"
 COUNTDOWN_TEMPLATE = f"{ASSET_SUBDIR}/countdown.png"
 
 TASK_TYPE_TRAIN = "train"
+TASK_TYPE_TRAINING = "training"
 TASK_TYPE_BEAST = "beast"
 TASK_TYPE_SPEEDUP = "speedup"
 TASK_TYPE_TECH = "tech"
@@ -44,6 +45,7 @@ TASK_TYPE_RESOURCE = "resource"
 # 详情弹窗图标分类 / GUI 多选顺序
 ADMIN_DETAIL_TYPE_ORDER: tuple[str, ...] = (
     TASK_TYPE_TRAIN,
+    TASK_TYPE_TRAINING,
     TASK_TYPE_BEAST,
     TASK_TYPE_SPEEDUP,
     TASK_TYPE_TECH,
@@ -60,6 +62,7 @@ ADMIN_DETAIL_TYPE_ORDER: tuple[str, ...] = (
 
 TASK_TYPE_LABELS: dict[str, str] = {
     TASK_TYPE_TRAIN: "练兵",
+    TASK_TYPE_TRAINING: "训练",
     TASK_TYPE_BEAST: "巨兽",
     TASK_TYPE_SPEEDUP: "加速",
     TASK_TYPE_TECH: "科技",
@@ -82,6 +85,7 @@ TASK_TYPE_TEMPLATES: dict[str, str] = {
 }
 TASK_TYPE_ADMIN_TEMPLATES: dict[str, str] = {
     TASK_TYPE_TRAIN: TRAIN_ICON_ADMIN_TEMPLATE,
+    TASK_TYPE_TRAINING: f"{ASSET_SUBDIR}/training_icon_admin.png",
     TASK_TYPE_BEAST: f"{ASSET_SUBDIR}/beast_icon_admin.png",
     TASK_TYPE_SPEEDUP: f"{ASSET_SUBDIR}/speedup_icon_admin.png",
     TASK_TYPE_TECH: f"{ASSET_SUBDIR}/tech_icon_admin.png",

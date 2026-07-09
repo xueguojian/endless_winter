@@ -1,4 +1,4 @@
-"""将 config.example.yaml 中新增的配置项合并进本机 config.yaml，不覆盖已有值。"""
+"""将 config.example.yaml 中新增的配置项合并进实例 config_555x.yaml，不覆盖已有值。"""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLE_PATH = ROOT / "config.example.yaml"
-LOCAL_PATH = ROOT / "config.yaml"
+sys.path.insert(0, str(ROOT))
+
+from core.config_path import EXAMPLE_CONFIG_PATH, PRIMARY_CONFIG_PATH, list_instance_config_paths
 
 
 def deep_merge_missing(local: dict, example: dict) -> dict:
@@ -25,15 +26,16 @@ def deep_merge_missing(local: dict, example: dict) -> dict:
 
 
 def sync_config(
-    local_path: Path = LOCAL_PATH,
-    example_path: Path = EXAMPLE_PATH,
+    local_path: Path,
+    example_path: Path = EXAMPLE_CONFIG_PATH,
     dry_run: bool = False,
 ) -> list[str]:
     if not example_path.is_file():
         raise FileNotFoundError(f"缺少模板：{example_path}")
     if not local_path.is_file():
         raise FileNotFoundError(
-            f"缺少 {local_path.name}，请先复制：copy config.example.yaml config.yaml"
+            f"缺少 {local_path.name}，请先运行对应 run_gui_555x.bat 自动生成，"
+            f"或 copy config.example.yaml {local_path.name}"
         )
 
     with open(example_path, encoding="utf-8") as f:
@@ -70,18 +72,23 @@ def sync_config(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="从 config.example.yaml 合并新增配置项到 config.yaml（不覆盖已有值）"
+        description="从 config.example.yaml 合并新增配置项到实例 yaml（不覆盖已有值）"
     )
     parser.add_argument(
         "-c",
         "--config",
-        default=str(LOCAL_PATH),
-        help="本机配置文件路径（默认 config.yaml）",
+        default=None,
+        help=f"实例配置文件（默认 {PRIMARY_CONFIG_PATH.name}）",
     )
     parser.add_argument(
         "--example",
-        default=str(EXAMPLE_PATH),
+        default=str(EXAMPLE_CONFIG_PATH),
         help="模板配置文件路径（默认 config.example.yaml）",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="合并本机全部 config_555*.yaml",
     )
     parser.add_argument(
         "-n",
@@ -91,27 +98,42 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    try:
-        added = sync_config(
-            Path(args.config),
-            Path(args.example),
-            dry_run=args.dry_run,
-        )
-    except FileNotFoundError as exc:
-        print(exc, file=sys.stderr)
-        return 1
+    if args.all:
+        targets = list_instance_config_paths()
+        if not targets:
+            print("未找到 config_555*.yaml，请先运行 run_gui_5555.bat 等生成。", file=sys.stderr)
+            return 1
+    else:
+        config = args.config or str(PRIMARY_CONFIG_PATH)
+        targets = [Path(config)]
 
-    if not added:
-        print("配置已是最新，无需合并。")
-        return 0
+    exit_code = 0
+    for target in targets:
+        try:
+            added = sync_config(
+                target,
+                Path(args.example),
+                dry_run=args.dry_run,
+            )
+        except FileNotFoundError as exc:
+            print(exc, file=sys.stderr)
+            exit_code = 1
+            continue
 
-    action = "将新增" if args.dry_run else "已新增"
-    print(f"{action} {len(added)} 项：")
-    for key in added:
-        print(f"  + {key}")
-    if args.dry_run:
-        print("（dry-run，未写入文件）")
-    return 0
+        if args.all:
+            print(f"--- {target.name} ---")
+        if not added:
+            print("配置已是最新，无需合并。")
+            continue
+
+        action = "将新增" if args.dry_run else "已新增"
+        print(f"{action} {len(added)} 项：")
+        for key in added:
+            print(f"  + {key}")
+        if args.dry_run:
+            print("（dry-run，未写入文件）")
+
+    return exit_code
 
 
 if __name__ == "__main__":

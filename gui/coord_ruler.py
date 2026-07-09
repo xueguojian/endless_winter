@@ -110,7 +110,7 @@ class CoordRulerWindow(tk.Toplevel):
 
         ttk.Label(
             self,
-            text="坐标为模拟器触控坐标（与 config.yaml 中 coords 一致）。点击图片即复制，标记仅显示红点。",
+            text="坐标为模拟器触控坐标（与实例 config_555x.yaml 中 coords 一致）。点击图片即复制，标记仅显示红点。",
             font=("", 8),
             foreground="gray",
             wraplength=CANVAS_MAX_W + RULER_MARGIN * 2,
