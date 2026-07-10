@@ -30,6 +30,7 @@ COUNTDOWN_TEMPLATE = f"{ASSET_SUBDIR}/countdown.png"
 TASK_TYPE_TRAIN = "train"
 TASK_TYPE_TRAINING = "training"
 TASK_TYPE_BEAST = "beast"
+TASK_TYPE_EQUIPMENT = "equipment"
 TASK_TYPE_SPEEDUP = "speedup"
 TASK_TYPE_TECH = "tech"
 TASK_TYPE_ORANGE_SHARD = "orange_shard"
@@ -47,6 +48,7 @@ ADMIN_DETAIL_TYPE_ORDER: tuple[str, ...] = (
     TASK_TYPE_TRAIN,
     TASK_TYPE_TRAINING,
     TASK_TYPE_BEAST,
+    TASK_TYPE_EQUIPMENT,
     TASK_TYPE_SPEEDUP,
     TASK_TYPE_TECH,
     TASK_TYPE_ORANGE_SHARD,
@@ -60,10 +62,30 @@ ADMIN_DETAIL_TYPE_ORDER: tuple[str, ...] = (
     TASK_TYPE_RESOURCE,
 )
 
+# GUI 展示顺序（常用类型靠前）
+GUI_ALLIANCE_TYPE_ORDER: tuple[str, ...] = (
+    TASK_TYPE_TRAIN,
+    TASK_TYPE_BEAST,
+    TASK_TYPE_DIAMOND,
+    TASK_TYPE_RESOURCE,
+    TASK_TYPE_EQUIPMENT,
+    TASK_TYPE_ENERGY_STONE,
+    TASK_TYPE_GEM,
+    TASK_TYPE_TRAINING,
+    TASK_TYPE_SPEEDUP,
+    TASK_TYPE_TECH,
+    TASK_TYPE_ORANGE_SHARD,
+    TASK_TYPE_FIRE_CRYSTAL,
+    TASK_TYPE_SMALL_MONSTER,
+    TASK_TYPE_GIFT_PACK,
+    TASK_TYPE_BUILDING,
+)
+
 TASK_TYPE_LABELS: dict[str, str] = {
     TASK_TYPE_TRAIN: "练兵",
     TASK_TYPE_TRAINING: "训练",
     TASK_TYPE_BEAST: "巨兽",
+    TASK_TYPE_EQUIPMENT: "装备",
     TASK_TYPE_SPEEDUP: "加速",
     TASK_TYPE_TECH: "科技",
     TASK_TYPE_ORANGE_SHARD: "橙碎",
@@ -74,7 +96,7 @@ TASK_TYPE_LABELS: dict[str, str] = {
     TASK_TYPE_BUILDING: "建造",
     TASK_TYPE_DIAMOND: "钻石",
     TASK_TYPE_ENERGY_STONE: "能源石",
-    TASK_TYPE_RESOURCE: "资源",
+    TASK_TYPE_RESOURCE: "采集",
 }
 
 # GUI / 配置可多选的全部类型
@@ -87,6 +109,7 @@ TASK_TYPE_ADMIN_TEMPLATES: dict[str, str] = {
     TASK_TYPE_TRAIN: TRAIN_ICON_ADMIN_TEMPLATE,
     TASK_TYPE_TRAINING: f"{ASSET_SUBDIR}/training_icon_admin.png",
     TASK_TYPE_BEAST: f"{ASSET_SUBDIR}/beast_icon_admin.png",
+    TASK_TYPE_EQUIPMENT: f"{ASSET_SUBDIR}/equipment_icon_admin.png",
     TASK_TYPE_SPEEDUP: f"{ASSET_SUBDIR}/speedup_icon_admin.png",
     TASK_TYPE_TECH: f"{ASSET_SUBDIR}/tech_icon_admin.png",
     TASK_TYPE_ORANGE_SHARD: f"{ASSET_SUBDIR}/orange_shard_icon_admin.png",
@@ -129,6 +152,28 @@ DEFAULT_STEP_DELAY = 1.0
 DEFAULT_MATCH_THRESHOLD = 0.6
 DEFAULT_COUNTDOWN_THRESHOLD = 0.62
 DEFAULT_TARGET_TYPES: list[str] = [TASK_TYPE_TRAIN]
+
+# 各类型默认保留底色（仅橙/紫；蓝色一律刷新）
+CARD_BG_ORANGE = "orange"
+CARD_BG_PURPLE = "purple"
+CARD_BG_BLUE = "blue"
+CARD_BG_LABELS = {
+    CARD_BG_ORANGE: "橙色",
+    CARD_BG_PURPLE: "紫色",
+    CARD_BG_BLUE: "蓝色",
+}
+CARD_BG_UNKNOWN = "unknown"
+KEEP_BG_COLOR_ORDER: tuple[str, ...] = (
+    CARD_BG_ORANGE,
+    CARD_BG_PURPLE,
+    CARD_BG_BLUE,
+)
+KEEPABLE_BG_COLORS: tuple[str, ...] = (CARD_BG_ORANGE, CARD_BG_PURPLE)
+DEFAULT_TYPE_KEEP_BG: dict[str, tuple[str, ...]] = {
+    TASK_TYPE_TRAIN: (CARD_BG_ORANGE, CARD_BG_PURPLE),
+    TASK_TYPE_BEAST: (CARD_BG_ORANGE,),
+    TASK_TYPE_DIAMOND: (CARD_BG_ORANGE,),
+}
 # 实机练兵图标比模板 PNG 大约大 35%~45%，仅搜到 1.2 会把真练兵压在 ~0.55
 TRAIN_MATCH_SCALES: tuple[float, ...] = tuple(round(i / 100, 2) for i in range(85, 156, 5))
 
@@ -144,15 +189,72 @@ def available_task_types() -> list[tuple[str, str]]:
     return [(key, TASK_TYPE_LABELS[key]) for key in ADMIN_TARGET_TYPES]
 
 
-def merge_task_config(cfg: dict | None) -> dict:
-    raw = cfg or {}
-    selected = [
+def available_task_types() -> list[tuple[str, str]]:
+    return [(key, TASK_TYPE_LABELS[key]) for key in GUI_ALLIANCE_TYPE_ORDER]
+
+
+def normalize_type_keep_rules(raw: dict | None) -> dict[str, list[str]]:
+    """解析各类型保留底色；兼容旧 keep_orange_types + keep_bg_colors。"""
+    raw = raw or {}
+    rules_raw = raw.get("type_keep_rules")
+    if isinstance(rules_raw, dict) and rules_raw:
+        normalized: dict[str, list[str]] = {}
+        for type_id, entry in rules_raw.items():
+            tid = str(type_id).strip()
+            if tid not in ADMIN_TARGET_TYPES:
+                continue
+            if isinstance(entry, dict):
+                colors = entry.get("bg_colors") or entry.get("colors") or []
+            elif isinstance(entry, (list, tuple)):
+                colors = entry
+            else:
+                continue
+            picked = [
+                str(c).strip()
+                for c in colors
+                if str(c).strip() in KEEPABLE_BG_COLORS
+            ]
+            if picked:
+                normalized[tid] = picked
+        if normalized:
+            return normalized
+
+    keep_types = [
         str(item).strip()
-        for item in (raw.get("target_types") or DEFAULT_TARGET_TYPES)
+        for item in (
+            raw.get("keep_orange_types")
+            or raw.get("target_types")
+            or DEFAULT_TARGET_TYPES
+        )
         if str(item).strip() in ADMIN_TARGET_TYPES
     ]
+    legacy_bg = [
+        str(item).strip()
+        for item in (raw.get("keep_bg_colors") or list(DEFAULT_TYPE_KEEP_BG.get(TASK_TYPE_TRAIN, (CARD_BG_ORANGE,))))
+        if str(item).strip() in KEEPABLE_BG_COLORS
+    ]
+    if not legacy_bg:
+        legacy_bg = [CARD_BG_ORANGE]
+    result: dict[str, list[str]] = {}
+    for tid in keep_types:
+        default = DEFAULT_TYPE_KEEP_BG.get(tid, tuple(legacy_bg))
+        result[tid] = list(default)
+    if not result:
+        result[TASK_TYPE_TRAIN] = list(DEFAULT_TYPE_KEEP_BG[TASK_TYPE_TRAIN])
+    return result
+
+
+def target_types_from_keep_rules(type_keep_rules: dict[str, list[str]]) -> list[str]:
+    return [tid for tid in GUI_ALLIANCE_TYPE_ORDER if tid in type_keep_rules]
+
+
+def merge_task_config(cfg: dict | None) -> dict:
+    raw = cfg or {}
+    type_keep_rules = normalize_type_keep_rules(raw)
+    selected = target_types_from_keep_rules(type_keep_rules)
     if not selected:
         selected = list(DEFAULT_TARGET_TYPES)
+        type_keep_rules = normalize_type_keep_rules({"type_keep_rules": {TASK_TYPE_TRAIN: list(DEFAULT_TYPE_KEEP_BG[TASK_TYPE_TRAIN])}})
 
     slots: list[SlotConfig] = []
     for index, default in enumerate(DEFAULT_SLOTS):
@@ -175,6 +277,8 @@ def merge_task_config(cfg: dict | None) -> dict:
     coords = {**DEFAULT_COORDS, **(raw.get("coords") or {})}
     return {
         "target_types": selected,
+        "type_keep_rules": type_keep_rules,
+        "keep_orange_types": selected,
         "score_threshold": int(raw.get("score_threshold", DEFAULT_SCORE_THRESHOLD)),
         "scan_interval": float(raw.get("scan_interval", DEFAULT_SCAN_INTERVAL)),
         "step_delay": float(raw.get("step_delay", DEFAULT_STEP_DELAY)),
@@ -381,7 +485,9 @@ class AllianceMobilizationSession:
         best_conf = 0.0
         raw_conf = 0.0
         for task_type in self.target_types:
-            template = TASK_TYPE_TEMPLATES.get(task_type)
+            template = TASK_TYPE_ADMIN_TEMPLATES.get(task_type) or TASK_TYPE_TEMPLATES.get(
+                task_type
+            )
             if not template:
                 continue
             conf = self._match_in_roi(

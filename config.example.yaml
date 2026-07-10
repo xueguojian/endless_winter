@@ -20,36 +20,39 @@ gui:
 tasks:
   hunt_monster:
     enabled: false
-    interval: 300
+    interval: 60
     monster_level: 30
-    max_monster_level: 30
+    formation_name: '8'
+    use_stamina: false
+    check_march_heroes: true
+    use_formation: true
     skip_hour: 21
     step_delay: 1.5
     coords:
       search_open:
       - 55
       - 880
-      level_minus:
-      - 95
-      - 1145
-      level_plus:
-      - 625
-      - 1145
+      beast_tab:
+      - 84
+      - 916
       search_confirm:
+      - 366
+      - 1216
+      target_tap:
       - 360
-      - 1170
-      attack:
-      - 360
-      - 1125
+      - 640
       march:
-      - 360
-      - 1180
-      close_popup:
-      - 680
-      - 50
+      - 560
+      - 1200
+      dialog_cancel:
+      - 250
+      - 780
+      stamina_use:
+      - 630
+      - 570
   hunt_ice_beast:
     enabled: true
-    interval: 600
+    interval: 120
     beast_level: 8
     default_beast_level: 1
     formation_name: '6'
@@ -237,8 +240,9 @@ tasks:
   auto_lighthouse:
     enabled: false
     event_period: false
-    interval: 28800
+    interval: 60
     formation_slot: 8
+    check_march_heroes: true
     use_stamina: false
     monster_cooldown: 60
     step_delay: 1.5
@@ -276,6 +280,17 @@ alliance_mobilization:
   match_threshold: 0.6
   countdown_threshold: 0.62
   ocr_engine: auto
+  type_keep_rules:
+    train:
+      bg_colors:
+      - orange
+      - purple
+    beast:
+      bg_colors:
+      - orange
+    diamond:
+      bg_colors:
+      - orange
   coords:
     refresh_tap:
     - 196
@@ -326,31 +341,17 @@ alliance_mobilization_admin:
   - 446
   detail_match_threshold: 0.55
   use_score_ocr: false
-  # GUI「保留任务类型」多选会写入 keep_orange_types
-  # GUI「保留底色」多选会写入 keep_bg_colors（orange / purple / blue）
-  # 全部可选 ID：train / training / beast / speedup / tech / orange_shard / gem /
-  # fire_crystal / small_monster / gift_pack / building / diamond /
-  # energy_stone / resource
-  keep_orange_types:
-  - train
-  keep_bg_colors:
-  - orange
-  - purple
-  available_task_types:
-  - train
-  - training
-  - beast
-  - speedup
-  - tech
-  - orange_shard
-  - gem
-  - fire_crystal
-  - small_monster
-  - gift_pack
-  - building
-  - diamond
-  - energy_stone
-  - resource
+  type_keep_rules:
+    train:
+      bg_colors:
+      - orange
+      - purple
+    beast:
+      bg_colors:
+      - orange
+    diamond:
+      bg_colors:
+      - orange
   coords:
     refresh_tap:
     - 181
@@ -358,12 +359,9 @@ alliance_mobilization_admin:
     refresh_confirm:
     - 512
     - 776
-    detail_close:
-    - 666
-    - 426
     detail_mask_tap:
-    - 374
-    - 368
+    - 362
+    - 1272
   scroll:
     swipe_ms: 900
     swipe_x: 379

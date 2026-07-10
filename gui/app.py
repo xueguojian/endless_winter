@@ -35,17 +35,19 @@ from gui.dream_memory_panel import (
 )
 from gui.task_registry import TaskEntry, loop_tasks, once_tasks
 from tasks.alliance_mobilization import (
-    ADMIN_TARGET_TYPES,
+    CARD_BG_LABELS,
+    CARD_BG_ORANGE,
+    CARD_BG_PURPLE,
+    GUI_ALLIANCE_TYPE_ORDER,
+    KEEPABLE_BG_COLORS,
     TASK_TYPE_LABELS,
     AllianceMobilizationSession,
     merge_task_config as merge_alliance_config,
+    normalize_type_keep_rules,
 )
 from tasks.alliance_mobilization_admin import (
     AllianceMobilizationAdminSession,
     CALIBRATED_DETAIL_MASK_TAP,
-    CARD_BG_LABELS,
-    DEFAULT_KEEP_BG_COLORS,
-    KEEP_BG_COLOR_ORDER,
     merge_task_config as merge_alliance_admin_config,
 )
 from tasks.auto_lighthouse import AutoLighthouseTask, merge_task_config as merge_lighthouse_config
@@ -69,13 +71,19 @@ from tasks.hunt_monster import HuntMonsterTask
 
 ROOT = Path(__file__).parent.parent
 
-# 循环任务互斥组：同组内只能勾选一个
-LOOP_EXCLUSIVE_GROUPS: tuple[frozenset[str], ...] = (
-    frozenset({"hunt_ice_beast", "hunt_monster"}),
-)
+# 冰原巨兽 / 打野 与其余循环任务互斥；捐献/采集/练兵/领取探险物资 可同时勾选
+LOOP_COMBAT_EXCLUSIVE_TASK_IDS = frozenset({"hunt_ice_beast", "hunt_monster"})
+
+# 运行任务 Tab → 功能参数 Tab
+TASK_TAB_TO_PARAM_TAB: dict[str, str] = {
+    "循环任务": "冰原巨兽",
+    "一次性任务": "灯塔任务",
+    "联盟总动员自动刷新": "联盟总动员",
+    "联盟管理员刷新": "联盟总动员",
+}
 
 MAIN_WIDTH = 580
-MAIN_HEIGHT = 720
+MAIN_HEIGHT = 660
 LOG_WIDTH = 300
 ONCE_TASK_GAP_SEC = 3
 ONCE_TASK_COLUMNS = 2
@@ -127,6 +135,58 @@ def _configure_param_tab_grid(tab: ttk.Frame) -> None:
     tab.grid_columnconfigure(0, minsize=FORM_LABEL_COL_MINSIZE)
 
 
+def _bind_mousewheel_recursive(widget: tk.Misc, handler) -> None:
+    widget.bind("<MouseWheel>", handler)
+    widget.bind("<Button-4>", handler)
+    widget.bind("<Button-5>", handler)
+    for child in widget.winfo_children():
+        _bind_mousewheel_recursive(child, handler)
+
+
+def _create_scrollable_frame(
+    parent: tk.Misc,
+    *,
+    height: int = 240,
+) -> tuple[ttk.Frame, ttk.Frame, tk.Canvas]:
+    """返回 (inner, container, canvas)，支持滚动条 + 鼠标滚轮。"""
+    container = ttk.Frame(parent)
+    canvas = tk.Canvas(
+        container,
+        height=height,
+        highlightthickness=1,
+        highlightbackground="#cccccc",
+    )
+    scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+    inner = ttk.Frame(canvas)
+    window_id = canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+
+    def _sync_scrollregion(_event=None) -> None:
+        canvas.update_idletasks()
+        bbox = canvas.bbox("all")
+        if bbox:
+            canvas.configure(scrollregion=bbox)
+
+    def _sync_width(event) -> None:
+        canvas.itemconfigure(window_id, width=event.width)
+
+    def _on_mousewheel(event) -> None:
+        if getattr(event, "delta", 0):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+        elif getattr(event, "num", None) == 4:
+            canvas.yview_scroll(-3, "units")
+        elif getattr(event, "num", None) == 5:
+            canvas.yview_scroll(3, "units")
+
+    inner.bind("<Configure>", _sync_scrollregion)
+    canvas.bind("<Configure>", _sync_width)
+    _bind_mousewheel_recursive(container, _on_mousewheel)
+
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    return inner, container, canvas
+
+
 class EndlessWinterApp(tk.Tk):
     def __init__(self, config_path: Path | None = None):
         super().__init__()
@@ -164,8 +224,7 @@ class EndlessWinterApp(tk.Tk):
         self._alliance_session: AllianceMobilizationSession | None = None
         self._alliance_admin_worker: threading.Thread | None = None
         self._alliance_admin_session: AllianceMobilizationAdminSession | None = None
-        self._alliance_type_vars: dict[str, tk.BooleanVar] = {}
-        self._alliance_bg_color_vars: dict[str, tk.BooleanVar] = {}
+        self._alliance_type_bg_vars: dict[str, dict[str, tk.BooleanVar]] = {}
 
         self._build_ui()
         self._poll_log_queue()
@@ -206,6 +265,33 @@ class EndlessWinterApp(tk.Tk):
             return bool(task_cfg.get("enabled", False))
         return bool(task_cfg.get("enabled", False))
 
+    def _collect_alliance_type_keep_rules(self) -> dict[str, list[str]]:
+        rules: dict[str, list[str]] = {}
+        if not self._alliance_type_bg_vars:
+            return rules
+        for type_id in GUI_ALLIANCE_TYPE_ORDER:
+            bg_vars = self._alliance_type_bg_vars.get(type_id, {})
+            colors = [
+                color_id
+                for color_id in KEEPABLE_BG_COLORS
+                if bg_vars.get(color_id) is not None and bool(bg_vars[color_id].get())
+            ]
+            if colors:
+                rules[type_id] = colors
+        return rules
+
+    def _format_type_keep_rules(self, rules: dict[str, list[str]]) -> str:
+        parts: list[str] = []
+        for type_id in GUI_ALLIANCE_TYPE_ORDER:
+            colors = rules.get(type_id)
+            if not colors:
+                continue
+            bg_text = "、".join(
+                CARD_BG_LABELS[c] for c in KEEPABLE_BG_COLORS if c in colors
+            )
+            parts.append(f"{TASK_TYPE_LABELS[type_id]}[{bg_text}]")
+        return "；".join(parts) if parts else "无"
+
     def _save_config(self) -> None:
         cfg = self.config
         tasks = cfg.setdefault("tasks", {})
@@ -227,6 +313,7 @@ class EndlessWinterApp(tk.Tk):
             _normalize_formation_slot(self.var_lighthouse_formation_slot.get())
         )
         lighthouse["use_stamina"] = bool(self.var_lighthouse_use_stamina.get())
+        lighthouse["check_march_heroes"] = bool(self.var_lighthouse_check_march_heroes.get())
         lighthouse["event_period"] = bool(self.var_lighthouse_event_period.get())
         lighthouse["monster_cooldown"] = int(self.var_lighthouse_monster_cooldown.get()) * 60
         merged_lighthouse = merge_lighthouse_config(lighthouse)
@@ -237,6 +324,12 @@ class EndlessWinterApp(tk.Tk):
         monster["enabled"] = bool(self._task_vars["hunt_monster"].get())
         monster["interval"] = int(self.var_monster_interval.get()) * 60
         monster["monster_level"] = int(self.var_monster_level.get())
+        monster["formation_name"] = str(
+            _normalize_formation_slot(self.var_monster_formation_slot.get())
+        )
+        monster["check_march_heroes"] = bool(self.var_monster_check_march_heroes.get())
+        monster["use_formation"] = bool(self.var_monster_use_formation.get())
+        monster["use_stamina"] = bool(self.var_monster_use_stamina.get())
 
         donate = tasks.setdefault("donate_alliance_supplies", {})
         donate["enabled"] = bool(self._task_vars["donate_alliance_supplies"].get())
@@ -312,18 +405,25 @@ class EndlessWinterApp(tk.Tk):
             pk["tap_between_delay_interval"] = get_tap_interval_mode(self._dream_pk_widgets)
 
         alliance = cfg.setdefault("alliance_mobilization", {})
-        selected_types = [
-            type_id
-            for type_id, var in self._alliance_type_vars.items()
-            if bool(var.get())
-        ]
-        if not selected_types and self._alliance_type_vars:
-            selected_types = ["train"]
-            self._alliance_type_vars["train"].set(True)
+        type_keep_rules = self._collect_alliance_type_keep_rules()
+        selected_types = list(type_keep_rules.keys())
+        if not selected_types:
+            type_keep_rules = normalize_type_keep_rules({})
+            selected_types = list(type_keep_rules.keys())
+        alliance["type_keep_rules"] = {
+            tid: {"bg_colors": colors} for tid, colors in type_keep_rules.items()
+        }
         alliance["target_types"] = selected_types
+        if hasattr(self, "var_alliance_scan_minutes"):
+            alliance["scan_interval"] = float(self.var_alliance_scan_minutes.get()) * 60.0
         merged_alliance = merge_alliance_config(alliance)
         alliance["scan_interval"] = merged_alliance["scan_interval"]
         alliance["step_delay"] = merged_alliance["step_delay"]
+        alliance["type_keep_rules"] = {
+            tid: {"bg_colors": colors}
+            for tid, colors in merged_alliance["type_keep_rules"].items()
+        }
+        alliance["target_types"] = list(merged_alliance["target_types"])
         alliance["match_threshold"] = merged_alliance["match_threshold"]
         alliance["countdown_threshold"] = merged_alliance["countdown_threshold"]
         alliance["ocr_engine"] = merged_alliance["ocr_engine"]
@@ -333,18 +433,13 @@ class EndlessWinterApp(tk.Tk):
         # 分数阈值不再由 GUI 配置，保留文件内已有值或默认
 
         alliance_admin = cfg.setdefault("alliance_mobilization_admin", {})
+        alliance_admin["type_keep_rules"] = dict(alliance["type_keep_rules"])
         alliance_admin["target_types"] = list(selected_types)
         alliance_admin["keep_orange_types"] = list(selected_types)
-        keep_bg_colors = [
-            color_id
-            for color_id in KEEP_BG_COLOR_ORDER
-            if hasattr(self, "_alliance_bg_color_vars")
-            and self._alliance_bg_color_vars.get(color_id)
-            and bool(self._alliance_bg_color_vars[color_id].get())
-        ]
-        if not keep_bg_colors:
-            keep_bg_colors = list(DEFAULT_KEEP_BG_COLORS)
-        alliance_admin["keep_bg_colors"] = keep_bg_colors
+        if hasattr(self, "var_alliance_admin_scan_minutes"):
+            alliance_admin["scan_interval"] = (
+                float(self.var_alliance_admin_scan_minutes.get()) * 60.0
+            )
         merged_admin = merge_alliance_admin_config(alliance_admin)
         alliance_admin["scan_interval"] = merged_admin["scan_interval"]
         alliance_admin["step_delay"] = merged_admin["step_delay"]
@@ -369,7 +464,11 @@ class EndlessWinterApp(tk.Tk):
             "detail_match_threshold"
         ]
         alliance_admin["keep_orange_types"] = list(merged_admin["keep_orange_types"])
-        alliance_admin["keep_bg_colors"] = list(merged_admin["keep_bg_colors"])
+        alliance_admin["type_keep_rules"] = {
+            tid: {"bg_colors": colors}
+            for tid, colors in merged_admin["type_keep_rules"].items()
+        }
+        alliance_admin.pop("keep_bg_colors", None)
         alliance_admin["use_score_ocr"] = False
         alliance_admin["target_types"] = list(merged_admin.get("target_types") or selected_types)
 
@@ -384,6 +483,14 @@ class EndlessWinterApp(tk.Tk):
         else:
             self._ice_formation_spinbox.state(["disabled"])
 
+    def _update_monster_formation_state(self) -> None:
+        if not hasattr(self, "_monster_formation_spinbox"):
+            return
+        if bool(self.var_monster_use_formation.get()):
+            self._monster_formation_spinbox.state(["!disabled"])
+        else:
+            self._monster_formation_spinbox.state(["disabled"])
+
     def _on_use_formation_changed(self) -> None:
         self._update_ice_formation_state()
         try:
@@ -391,16 +498,48 @@ class EndlessWinterApp(tk.Tk):
         except ValueError:
             pass
 
+    def _on_monster_use_formation_changed(self) -> None:
+        self._update_monster_formation_state()
+        try:
+            self._save_config()
+        except ValueError:
+            pass
+
+    def _select_param_tab_by_name(self, tab_name: str) -> None:
+        notebook = getattr(self, "_param_notebook", None)
+        if notebook is None:
+            return
+        for tab_id in notebook.tabs():
+            if notebook.tab(tab_id, "text") == tab_name:
+                notebook.select(tab_id)
+                return
+
+    def _on_task_notebook_changed(self, _event=None) -> None:
+        notebook = getattr(self, "_task_notebook", None)
+        if notebook is None:
+            return
+        try:
+            tab_id = notebook.select()
+            task_tab_name = notebook.tab(tab_id, "text")
+        except tk.TclError:
+            return
+        param_tab = TASK_TAB_TO_PARAM_TAB.get(task_tab_name)
+        if param_tab:
+            self._select_param_tab_by_name(param_tab)
+
     def _on_loop_checkbox_changed(self, task_id: str) -> None:
-        """循环任务勾选互斥：冰原巨兽与自动打野只能二选一。"""
+        """冰原巨兽/打野与其他循环任务互斥；其余四个可同时勾选。"""
         if not self._task_vars[task_id].get():
             return
-        for group in LOOP_EXCLUSIVE_GROUPS:
-            if task_id not in group:
-                continue
-            for other_id in group:
+        all_loop_ids = [entry.task_id for entry in loop_tasks()]
+        if task_id in LOOP_COMBAT_EXCLUSIVE_TASK_IDS:
+            for other_id in all_loop_ids:
                 if other_id != task_id and other_id in self._task_vars:
                     self._task_vars[other_id].set(False)
+        else:
+            for combat_id in LOOP_COMBAT_EXCLUSIVE_TASK_IDS:
+                if combat_id in self._task_vars:
+                    self._task_vars[combat_id].set(False)
         try:
             self._save_config()
         except ValueError:
@@ -651,15 +790,18 @@ class EndlessWinterApp(tk.Tk):
         param_outer = ttk.LabelFrame(self._left, text="功能参数", padding=8)
         param_outer.pack(fill=tk.X, **pad)
 
-        self.var_interval = tk.IntVar(value=hunt_cfg.get("interval", 900) // 60)
+        self.var_interval = tk.IntVar(value=hunt_cfg.get("interval", 120) // 60)
         self.var_lighthouse_interval = tk.IntVar(
-            value=lighthouse_cfg.get("interval", 3600) // 60
+            value=max(1, int(lighthouse_cfg.get("interval", 60) // 60))
         )
         self.var_lighthouse_formation_slot = tk.IntVar(
-            value=_normalize_formation_slot(lighthouse_cfg.get("formation_slot", 7))
+            value=_normalize_formation_slot(lighthouse_cfg.get("formation_slot", 8))
         )
         self.var_lighthouse_use_stamina = tk.BooleanVar(
             value=bool(lighthouse_cfg.get("use_stamina", True))
+        )
+        self.var_lighthouse_check_march_heroes = tk.BooleanVar(
+            value=bool(lighthouse_cfg.get("check_march_heroes", True))
         )
         self.var_lighthouse_event_period = tk.BooleanVar(
             value=bool(lighthouse_cfg.get("event_period", False))
@@ -679,8 +821,20 @@ class EndlessWinterApp(tk.Tk):
             value=bool(hunt_cfg.get("check_march_heroes", True))
         )
         self.var_use_formation = tk.BooleanVar(value=bool(hunt_cfg.get("use_formation", True)))
-        self.var_monster_interval = tk.IntVar(value=monster_cfg.get("interval", 300) // 60)
+        self.var_monster_interval = tk.IntVar(value=monster_cfg.get("interval", 60) // 60)
         self.var_monster_level = tk.IntVar(value=monster_cfg.get("monster_level", 30))
+        self.var_monster_formation_slot = tk.IntVar(
+            value=_normalize_formation_slot(monster_cfg.get("formation_name", 8))
+        )
+        self.var_monster_use_stamina = tk.BooleanVar(
+            value=bool(monster_cfg.get("use_stamina", False))
+        )
+        self.var_monster_check_march_heroes = tk.BooleanVar(
+            value=bool(monster_cfg.get("check_march_heroes", True))
+        )
+        self.var_monster_use_formation = tk.BooleanVar(
+            value=bool(monster_cfg.get("use_formation", True))
+        )
         self.var_donate_interval = tk.IntVar(value=donate_cfg.get("interval", 3600) // 60)
         self.var_donate_times = tk.IntVar(value=donate_cfg.get("donate_times", 25))
         self.var_collect_interval = tk.IntVar(
@@ -701,8 +855,9 @@ class EndlessWinterApp(tk.Tk):
         self.var_mining_level_min = tk.IntVar(value=mining_level_min)
         self.var_mining_level_max = tk.IntVar(value=mining_level_max)
 
-        notebook = ttk.Notebook(param_outer)
-        notebook.pack(fill=tk.X)
+        self._param_notebook = ttk.Notebook(param_outer)
+        self._param_notebook.pack(fill=tk.X)
+        notebook = self._param_notebook
 
         tab_ice = ttk.Frame(notebook, padding=6)
         notebook.add(tab_ice, text="冰原巨兽")
@@ -772,13 +927,29 @@ class EndlessWinterApp(tk.Tk):
         _configure_param_tab_grid(tab_lighthouse)
 
         row = 0
+        lh_opts_row = ttk.Frame(tab_lighthouse)
+        lh_opts_row.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+        ttk.Checkbutton(
+            lh_opts_row,
+            text="检查出征英雄",
+            variable=self.var_lighthouse_check_march_heroes,
+            command=self._save_config,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Checkbutton(
+            lh_opts_row,
+            text="使用体力（不足时自动使用领主体力道具，否则结束任务）",
+            variable=self.var_lighthouse_use_stamina,
+            command=self._save_config,
+        ).pack(side=tk.LEFT)
+        row += 1
+
         ttk.Label(tab_lighthouse, text="扫描间隔（分钟）").grid(
             row=row, column=0, sticky=tk.W, pady=2
         )
         ttk.Spinbox(
-            tab_lighthouse, from_=5, to=1440, textvariable=self.var_lighthouse_interval, width=8
+            tab_lighthouse, from_=1, to=1440, textvariable=self.var_lighthouse_interval, width=8
         ).grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
-        ttk.Label(tab_lighthouse, text="（已改为一次性任务，此项不再生效）", font=("", 8)).grid(
+        ttk.Label(tab_lighthouse, text="（一次性任务，此项预留）", font=("", 8)).grid(
             row=row, column=2, sticky=tk.W, padx=(4, 0)
         )
         row += 1
@@ -811,14 +982,6 @@ class EndlessWinterApp(tk.Tk):
             tab_lighthouse,
             text="活动期间（使用含红色晶簇的活动背景图扫描）",
             variable=self.var_lighthouse_event_period,
-            command=self._save_config,
-        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
-        row += 1
-
-        ttk.Checkbutton(
-            tab_lighthouse,
-            text="使用体力（不足时自动使用领主体力道具，否则结束任务）",
-            variable=self.var_lighthouse_use_stamina,
             command=self._save_config,
         ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
 
@@ -865,7 +1028,23 @@ class EndlessWinterApp(tk.Tk):
         _configure_param_tab_grid(tab_monster)
 
         row = 0
-        ttk.Label(tab_monster, text="打野间隔（分钟）").grid(row=row, column=0, sticky=tk.W, pady=2)
+        monster_opts_row = ttk.Frame(tab_monster)
+        monster_opts_row.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+        ttk.Checkbutton(
+            monster_opts_row,
+            text="检查出征英雄",
+            variable=self.var_monster_check_march_heroes,
+            command=self._save_config,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Checkbutton(
+            monster_opts_row,
+            text="自动使用体力道具",
+            variable=self.var_monster_use_stamina,
+            command=self._save_config,
+        ).pack(side=tk.LEFT)
+        row += 1
+
+        ttk.Label(tab_monster, text="攻击间隔（分钟）").grid(row=row, column=0, sticky=tk.W, pady=2)
         ttk.Spinbox(
             tab_monster, from_=1, to=120, textvariable=self.var_monster_interval, width=8
         ).grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
@@ -875,6 +1054,30 @@ class EndlessWinterApp(tk.Tk):
         ttk.Spinbox(
             tab_monster, from_=1, to=30, textvariable=self.var_monster_level, width=8
         ).grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
+        ttk.Label(tab_monster, text="（暂不调级，预留）", font=("", 8)).grid(
+            row=row, column=2, sticky=tk.W, padx=6
+        )
+        row += 1
+
+        ttk.Checkbutton(
+            tab_monster,
+            text="启用编队",
+            variable=self.var_monster_use_formation,
+            command=self._on_monster_use_formation_changed,
+        ).grid(row=row, column=0, sticky=tk.W, pady=2)
+        self._monster_formation_spinbox = ttk.Spinbox(
+            tab_monster,
+            from_=FORMATION_SLOT_MIN,
+            to=FORMATION_SLOT_MAX,
+            textvariable=self.var_monster_formation_slot,
+            width=8,
+        )
+        self._monster_formation_spinbox.grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
+        ttk.Label(
+            tab_monster, text="出征界面左起第几个编队（1~8）", font=("", 8)
+        ).grid(row=row, column=2, sticky=tk.W, padx=6)
+        row += 1
+        self._update_monster_formation_state()
 
         tab_donate = ttk.Frame(notebook, padding=6)
         notebook.add(tab_donate, text="捐献物资")
@@ -922,83 +1125,126 @@ class EndlessWinterApp(tk.Tk):
         alliance_merged = merge_alliance_config(alliance_cfg)
         admin_cfg = self.config.get("alliance_mobilization_admin", {})
         admin_merged = merge_alliance_admin_config(admin_cfg)
-        # 勾选态优先用管理员 keep_orange_types，否则用普通模式 target_types
-        selected_alliance_types = set(
-            admin_merged.get("keep_orange_types")
-            or alliance_merged.get("target_types")
-            or ["train"]
+        type_keep_rules = (
+            admin_merged.get("type_keep_rules")
+            or alliance_merged.get("type_keep_rules")
+            or normalize_type_keep_rules({})
         )
-        for type_id in ADMIN_TARGET_TYPES:
-            self._alliance_type_vars[type_id] = tk.BooleanVar(
-                value=type_id in selected_alliance_types
-            )
-        if not any(var.get() for var in self._alliance_type_vars.values()):
-            self._alliance_type_vars["train"].set(True)
-
-        selected_bg_colors = set(
-            admin_merged.get("keep_bg_colors") or list(DEFAULT_KEEP_BG_COLORS)
+        self.var_alliance_scan_minutes = tk.IntVar(
+            value=max(1, int(round(float(alliance_merged.get("scan_interval", 360)) / 60)))
         )
-        for color_id in KEEP_BG_COLOR_ORDER:
-            self._alliance_bg_color_vars[color_id] = tk.BooleanVar(
-                value=color_id in selected_bg_colors
-            )
-        if not any(var.get() for var in self._alliance_bg_color_vars.values()):
-            self._alliance_bg_color_vars["orange"].set(True)
+        self.var_alliance_admin_scan_minutes = tk.IntVar(
+            value=max(1, int(round(float(admin_merged.get("scan_interval", 360)) / 60)))
+        )
 
-        tab_alliance = ttk.Frame(notebook, padding=6)
+        for type_id in GUI_ALLIANCE_TYPE_ORDER:
+            colors = set(type_keep_rules.get(type_id, []))
+            self._alliance_type_bg_vars[type_id] = {
+                CARD_BG_ORANGE: tk.BooleanVar(value=CARD_BG_ORANGE in colors),
+                CARD_BG_PURPLE: tk.BooleanVar(value=CARD_BG_PURPLE in colors),
+            }
+        if not type_keep_rules:
+            self._alliance_type_bg_vars["train"][CARD_BG_ORANGE].set(True)
+            self._alliance_type_bg_vars["train"][CARD_BG_PURPLE].set(True)
+
+        tab_alliance = ttk.Frame(notebook, padding=4)
         notebook.add(tab_alliance, text="联盟总动员")
         _configure_param_tab_grid(tab_alliance)
 
         row = 0
-        ttk.Label(tab_alliance, text="保留底色（可多选）").grid(
-            row=row, column=0, sticky=tk.NW, pady=2
+        cycle_row = ttk.Frame(tab_alliance)
+        cycle_row.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 2))
+        ttk.Label(cycle_row, text="普通循环").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            cycle_row,
+            from_=1,
+            to=720,
+            textvariable=self.var_alliance_scan_minutes,
+            width=5,
+            command=self._save_config,
+        ).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(cycle_row, text="管理员循环").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            cycle_row,
+            from_=1,
+            to=720,
+            textvariable=self.var_alliance_admin_scan_minutes,
+            width=5,
+            command=self._save_config,
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(cycle_row, text="（分钟）", font=("", 8), foreground="gray").pack(
+            side=tk.LEFT, padx=(4, 0)
         )
-        bg_wrap = ttk.Frame(tab_alliance)
-        bg_wrap.grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=FORM_INPUT_PADX)
-        for index, color_id in enumerate(KEEP_BG_COLOR_ORDER):
-            ttk.Checkbutton(
-                bg_wrap,
-                text=CARD_BG_LABELS[color_id],
-                variable=self._alliance_bg_color_vars[color_id],
-                command=self._save_config,
-            ).grid(row=0, column=index, sticky=tk.W, padx=(0, 12), pady=2)
         row += 1
 
-        ttk.Label(tab_alliance, text="保留任务类型（可多选）").grid(
-            row=row, column=0, sticky=tk.NW, pady=2
+        ttk.Label(tab_alliance, text="保留规则").grid(
+            row=row, column=0, sticky=tk.NW, pady=1
         )
-        type_wrap = ttk.Frame(tab_alliance)
-        type_wrap.grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=FORM_INPUT_PADX)
-        # 多行排布，避免类型太多挤成一行
-        per_row = 5
-        type_ids = list(ADMIN_TARGET_TYPES)
-        for index, type_id in enumerate(type_ids):
-            r, c = divmod(index, per_row)
-            ttk.Checkbutton(
-                type_wrap,
+        type_inner, scroll_wrap, type_canvas = _create_scrollable_frame(
+            tab_alliance, height=88
+        )
+        scroll_wrap.grid(row=row, column=1, columnspan=2, sticky="new", padx=FORM_INPUT_PADX)
+
+        _ALLIANCE_CELL_COLS = 3  # 类型名 + 橙 + 紫
+        for index, type_id in enumerate(GUI_ALLIANCE_TYPE_ORDER):
+            grid_row = index // 2
+            cell = index % 2
+            base_col = cell * _ALLIANCE_CELL_COLS
+            pad_left = 0 if cell == 0 else 16
+            ttk.Label(
+                type_inner,
                 text=TASK_TYPE_LABELS[type_id],
-                variable=self._alliance_type_vars[type_id],
+                width=5,
+            ).grid(row=grid_row, column=base_col, sticky=tk.W, padx=(pad_left, 2), pady=0)
+            ttk.Checkbutton(
+                type_inner,
+                text="橙",
+                variable=self._alliance_type_bg_vars[type_id][CARD_BG_ORANGE],
                 command=self._save_config,
-            ).grid(row=r, column=c, sticky=tk.W, padx=(0, 10), pady=2)
+                width=3,
+            ).grid(row=grid_row, column=base_col + 1, sticky=tk.W)
+            ttk.Checkbutton(
+                type_inner,
+                text="紫",
+                variable=self._alliance_type_bg_vars[type_id][CARD_BG_PURPLE],
+                command=self._save_config,
+                width=3,
+            ).grid(row=grid_row, column=base_col + 2, sticky=tk.W)
+        type_inner.update_idletasks()
+        bbox = type_canvas.bbox("all")
+        if bbox:
+            type_canvas.configure(scrollregion=bbox)
+
+        def _alliance_rules_wheel(event) -> None:
+            if getattr(event, "delta", 0):
+                type_canvas.yview_scroll(int(-event.delta / 120), "units")
+            elif getattr(event, "num", None) == 4:
+                type_canvas.yview_scroll(-3, "units")
+            elif getattr(event, "num", None) == 5:
+                type_canvas.yview_scroll(3, "units")
+
+        _bind_mousewheel_recursive(type_inner, _alliance_rules_wheel)
         row += 1
+
         ttk.Label(
             tab_alliance,
-            text="管理员：仅保留「勾选底色 + 勾选类型」；未勾选的底色或类型一律刷新。",
+            text="勾选橙/紫即保留该类型；均未勾选则不保留；蓝色一律刷新。",
             font=("", 8),
             foreground="gray",
-        ).grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=FORM_INPUT_PADX, pady=(0, 4))
+        ).grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=FORM_INPUT_PADX, pady=(0, 0))
 
-        tab_more = ttk.Frame(notebook, padding=12)
+        tab_more = ttk.Frame(notebook, padding=8)
         notebook.add(tab_more, text="更多")
         ttk.Label(tab_more, text="更多任务参数将在此添加", foreground="gray").pack(
             anchor=tk.W
         )
 
-        task_frame = ttk.LabelFrame(self._left, text="运行任务", padding=8)
+        task_frame = ttk.LabelFrame(self._left, text="运行任务", padding=6)
         task_frame.pack(fill=tk.X, **pad)
 
-        task_notebook = ttk.Notebook(task_frame)
-        task_notebook.pack(fill=tk.X)
+        self._task_notebook = ttk.Notebook(task_frame)
+        self._task_notebook.pack(fill=tk.X)
+        task_notebook = self._task_notebook
 
         tab_loop = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_loop, text="循环任务")
@@ -1064,7 +1310,7 @@ class EndlessWinterApp(tk.Tk):
         task_notebook.add(tab_alliance_admin_run, text="联盟管理员刷新")
         ttk.Label(
             tab_alliance_admin_run,
-            text="进入管理员任务列表后点开始。保留：勾选底色 + 勾选任务类型；未勾选则刷新。",
+            text="进入管理员任务列表后点开始。勾选橙/紫即保留；蓝色一律刷新。",
             foreground="gray",
             font=("", 8),
         ).pack(anchor=tk.W)
@@ -1093,6 +1339,8 @@ class EndlessWinterApp(tk.Tk):
         tab_dream_pk = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_dream_pk, text="寻梦记忆PK")
         self._build_dream_pk_tab(tab_dream_pk)
+
+        self._task_notebook.bind("<<NotebookTabChanged>>", self._on_task_notebook_changed)
 
         self.lbl_status = ttk.Label(task_frame, text="状态：待命", foreground="gray")
         self.lbl_status.pack(anchor=tk.W, pady=(8, 0))
@@ -1438,6 +1686,7 @@ class EndlessWinterApp(tk.Tk):
             use_stamina=bool(self.var_lighthouse_use_stamina.get()),
             event_period=bool(self.var_lighthouse_event_period.get()),
             monster_cooldown=float(self.var_lighthouse_monster_cooldown.get() * 60),
+            check_march_heroes=bool(self.var_lighthouse_check_march_heroes.get()),
             step_delay=merged["step_delay"],
             on_status=self._on_status,
         )
@@ -1467,9 +1716,12 @@ class EndlessWinterApp(tk.Tk):
             coords=monster_cfg.get("coords", {}),
             interval=float(self.var_monster_interval.get() * 60),
             monster_level=int(self.var_monster_level.get()),
-            max_monster_level=monster_cfg.get("max_monster_level", 30),
+            formation_name=str(_normalize_formation_slot(self.var_monster_formation_slot.get())),
             skip_hour=monster_cfg.get("skip_hour", 21),
             step_delay=monster_cfg.get("step_delay", 1.5),
+            use_stamina=bool(self.var_monster_use_stamina.get()),
+            check_march_heroes=bool(self.var_monster_check_march_heroes.get()),
+            use_formation=bool(self.var_monster_use_formation.get()),
             on_status=self._on_status,
         )
 
@@ -2044,13 +2296,12 @@ class EndlessWinterApp(tk.Tk):
             messagebox.showwarning("提示", "请先停止其他任务")
             return
 
-        selected_types = [
-            type_id
-            for type_id, var in self._alliance_type_vars.items()
-            if bool(var.get())
-        ]
-        if not selected_types:
-            messagebox.showwarning("提示", "请先在「功能参数 → 联盟总动员」勾选目标任务")
+        type_keep_rules = self._collect_alliance_type_keep_rules()
+        if not type_keep_rules:
+            messagebox.showwarning(
+                "提示",
+                "请先在「功能参数 → 联盟总动员」勾选类型并指定保留底色",
+            )
             return
 
         try:
@@ -2063,10 +2314,11 @@ class EndlessWinterApp(tk.Tk):
             messagebox.showerror("参数错误", str(exc))
             return
 
-        labels = "、".join(TASK_TYPE_LABELS[t] for t in selected_types)
+        rules_text = self._format_type_keep_rules(alliance_cfg["type_keep_rules"])
         self._set_alliance_buttons(running=True)
         self._on_status(
-            f"联盟总动员自动刷新：目标 {labels}"
+            f"联盟总动员：保留 {rules_text}，"
+            f"循环 {int(alliance_cfg['scan_interval'] // 60)} 分钟"
         )
 
         def work():
@@ -2075,7 +2327,7 @@ class EndlessWinterApp(tk.Tk):
                     return
                 session = AllianceMobilizationSession(
                     self._get_adb(),
-                    target_types=selected_types,
+                    target_types=list(alliance_cfg["target_types"]),
                     score_threshold=int(alliance_cfg["score_threshold"]),
                     scan_interval=float(alliance_cfg["scan_interval"]),
                     step_delay=float(alliance_cfg["step_delay"]),
@@ -2119,17 +2371,15 @@ class EndlessWinterApp(tk.Tk):
             messagebox.showwarning("提示", "请先停止其他任务")
             return
 
-        selected_types = [
-            type_id
-            for type_id, var in self._alliance_type_vars.items()
-            if bool(var.get())
-        ]
-        if not selected_types:
-            messagebox.showwarning("提示", "请先在「功能参数 → 联盟总动员」勾选目标任务")
+        type_keep_rules = self._collect_alliance_type_keep_rules()
+        if not type_keep_rules:
+            messagebox.showwarning(
+                "提示",
+                "请先在「功能参数 → 联盟总动员」勾选类型并指定保留底色",
+            )
             return
 
         try:
-            # 先从磁盘重载，避免内存里旧的 coords 覆盖实例配置文件
             self.config = self._load_config()
             self._save_config()
             self.config = self._load_config()
@@ -2140,18 +2390,14 @@ class EndlessWinterApp(tk.Tk):
             messagebox.showerror("参数错误", str(exc))
             return
 
-        labels = "、".join(TASK_TYPE_LABELS[t] for t in selected_types)
-        bg_labels = "、".join(
-            CARD_BG_LABELS[c]
-            for c in KEEP_BG_COLOR_ORDER
-            if self._alliance_bg_color_vars[c].get()
-        )
+        rules_text = self._format_type_keep_rules(admin_cfg["type_keep_rules"])
         self._set_alliance_admin_buttons(running=True)
         mask_xy = admin_cfg["coords"].get(
             "detail_mask_tap", list(CALIBRATED_DETAIL_MASK_TAP)
         )
         self._on_status(
-            f"联盟管理员刷新：保留底色[{bg_labels}]，类型[{labels}]，"
+            f"联盟管理员刷新：保留 {rules_text}，"
+            f"循环 {int(admin_cfg['scan_interval'] // 60)} 分钟，"
             f"遮罩 ({mask_xy[0]},{mask_xy[1]})"
         )
 
@@ -2159,17 +2405,7 @@ class EndlessWinterApp(tk.Tk):
             try:
                 if not self._ensure_device():
                     return
-                keep_bg_colors = [
-                    c
-                    for c in KEEP_BG_COLOR_ORDER
-                    if self._alliance_bg_color_vars[c].get()
-                ]
-                if not keep_bg_colors:
-                    keep_bg_colors = list(DEFAULT_KEEP_BG_COLORS)
                 run_cfg = dict(admin_cfg)
-                run_cfg["target_types"] = selected_types
-                run_cfg["keep_orange_types"] = selected_types
-                run_cfg["keep_bg_colors"] = keep_bg_colors
                 run_cfg["use_score_ocr"] = False
                 session = AllianceMobilizationAdminSession(
                     self._get_adb(),

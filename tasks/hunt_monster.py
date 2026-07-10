@@ -12,14 +12,59 @@ from loguru import logger
 
 from core.adb_client import AdbClient
 from core.navigation import WildernessNavigator
-from core.vision import Vision
+from core.vision import MatchResult, Vision
+from tasks.hunt_ice_beast import (
+    BTN_TOWN_LABEL,
+    BTN_WILDERNESS_LABEL,
+    FORMATION_SLOTS,
+    MARCH_BTN,
+    MARCH_CENTER,
+    MARCH_MATCH_THRESHOLD,
+    MARCH_MIN_Y,
+    MarchHeroCheckError,
+    NoStaminaError,
+    SCENE_TOGGLE_ROI,
+    SEARCH_CONFIRM_BTN,
+    SEARCH_ICON,
+    SEARCH_ICON_ROI,
+    SEARCH_PANEL_MARKER,
+    SEARCH_TAB_ROI,
+    STAMINA_GET_MORE_TITLE,
+    STAMINA_MATCH_THRESHOLD,
+    STAMINA_TITLE_ROI,
+    STAMINA_TITLE_THRESHOLD,
+    STAMINA_USE_BTN,
+    STAMINA_USE_ROW_ROI,
+    STAMINA_USE_Y_MAX,
+    STAMINA_USE_Y_MIN,
+    TAB_BAR_SCROLL_SWIPES,
+    TAB_BAR_SWIPE_DURATION_MS,
+    HuntIceBeastTask,
+)
 
 StatusCallback = Callable[[str], None]
 
 TEMPLATE_DIR = Path(__file__).parent.parent / "assets" / "templates"
 
+BEAST_TAB_TEMPLATE = "beast_tab.png"
+SEARCH_PANEL_TEMPLATES = (
+    SEARCH_PANEL_MARKER,
+    SEARCH_CONFIRM_BTN,
+    BEAST_TAB_TEMPLATE,
+)
+
+DEFAULT_BEAST_TAB = (84, 916)
+DEFAULT_SEARCH_CONFIRM = (366, 1216)
+DEFAULT_TARGET_TAP = (360, 640)
+
 DEFAULT_COORDS: dict[str, list[int]] = {
     "dialog_cancel": [250, 780],
+    "search_open": [55, 880],
+    "beast_tab": list(DEFAULT_BEAST_TAB),
+    "search_confirm": list(DEFAULT_SEARCH_CONFIRM),
+    "target_tap": list(DEFAULT_TARGET_TAP),
+    "march": [560, 1200],
+    "stamina_use": [630, 570],
 }
 
 
@@ -32,30 +77,46 @@ class HuntMonsterTask:
         coords: dict[str, list[int]],
         interval: float = 300.0,
         monster_level: int = 30,
-        max_monster_level: int = 30,
+        formation_name: str = "7",
         skip_hour: int = 21,
         step_delay: float = 1.5,
+        use_stamina: bool = True,
+        check_march_heroes: bool = True,
+        use_formation: bool = True,
         on_status: StatusCallback | None = None,
     ):
         self.adb = adb
         self.coords = {**DEFAULT_COORDS, **coords}
         self.interval = interval
         self.monster_level = monster_level
-        self.max_monster_level = max_monster_level
+        self.formation_name = str(formation_name).strip()
         self.skip_hour = skip_hour
         self.step_delay = step_delay
+        self.use_stamina = use_stamina
+        self.check_march_heroes = check_march_heroes
+        self.use_formation = use_formation
         self.on_status = on_status
+        self.vision = Vision(TEMPLATE_DIR, threshold=0.72)
+
         self._last_run = 0.0
         self._stop_event = threading.Event()
-        self.vision = Vision(TEMPLATE_DIR, threshold=0.70)
-        self._wilderness = WildernessNavigator.from_task(self)
+        self._running = False
+        self._tab_bar_already_scrolled = False
+        self._wilderness = WildernessNavigator.from_task(
+            self, is_overlay_open=self._is_search_panel_visible
+        )
 
     @property
     def name(self) -> str:
         return "自动打野怪"
 
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
     def stop(self) -> None:
         self._stop_event.set()
+        self._emit("正在停止…")
 
     def reset_stop(self) -> None:
         self._stop_event.clear()
@@ -73,43 +134,342 @@ class HuntMonsterTask:
             return False
         return time.time() - self._last_run >= self.interval
 
-    def _tap(self, key: str, delay: float | None = None) -> None:
+    def _tap_xy(self, x: int, y: int, delay: float | None = None) -> None:
         if self._interrupted():
             raise InterruptedError("任务已停止")
-        x, y = self.coords[key]
-        logger.debug(f"[{self.name}] 点击 {key} ({x}, {y})")
         self.adb.tap(x, y)
         time.sleep(delay if delay is not None else self.step_delay)
 
-    def _return_to_wilderness(self) -> None:
-        self._wilderness.try_return_to_wilderness()
+    def _swipe_xy(
+        self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300
+    ) -> None:
+        if self._interrupted():
+            raise InterruptedError("任务已停止")
+        self.adb.swipe(x1, y1, x2, y2, duration_ms)
 
-    def _close_popups(self) -> None:
-        if "close_popup" in self.coords:
-            self._tap("close_popup", delay=0.8)
+    def _tap(self, key: str, delay: float | None = None) -> None:
+        x, y = self.coords[key]
+        logger.debug(f"[{self.name}] 点击 {key} ({x}, {y})")
+        self._tap_xy(int(x), int(y), delay)
 
-    def _set_monster_level(self) -> None:
-        diff = self.max_monster_level - self.monster_level
-        if diff <= 0:
+    def _back(self, times: int = 1) -> None:
+        for _ in range(times):
+            if self._interrupted():
+                raise InterruptedError("任务已停止")
+            self.adb.back()
+            time.sleep(0.5)
+
+    def _match_in_roi(
+        self, screen, template: str, roi: tuple[int, int, int, int]
+    ) -> MatchResult:
+        x1, y1, x2, y2 = roi
+        result = self.vision.match_template(screen[y1:y2, x1:x2], template)
+        if not result.found:
+            return result
+        cx, cy = result.center
+        return MatchResult(
+            found=True,
+            confidence=result.confidence,
+            center=(x1 + cx, y1 + cy),
+            top_left=(x1 + result.top_left[0], y1 + result.top_left[1]),
+            size=result.size,
+        )
+
+    def _is_in_wilderness(self, screen) -> bool:
+        return self._match_in_roi(screen, BTN_TOWN_LABEL, SCENE_TOGGLE_ROI).found
+
+    def _is_in_town(self, screen) -> bool:
+        return self._match_in_roi(screen, BTN_WILDERNESS_LABEL, SCENE_TOGGLE_ROI).found
+
+    def _has_scene_templates(self) -> bool:
+        return (TEMPLATE_DIR / BTN_TOWN_LABEL).is_file() or (
+            TEMPLATE_DIR / BTN_WILDERNESS_LABEL
+        ).is_file()
+
+    def _is_search_panel_visible(self, screen=None) -> bool:
+        if screen is None:
+            screen = self.adb.screenshot()
+        for template in SEARCH_PANEL_TEMPLATES:
+            if self.vision.match_template(screen, template).found:
+                return True
+        return False
+
+    def _is_on_main_map(self, screen) -> bool:
+        if not self._has_scene_templates():
+            return not self._is_search_panel_visible(screen)
+        return self._is_in_wilderness(screen) or self._is_in_town(screen)
+
+    def _ensure_clean_ui(self) -> None:
+        self._emit("清理界面…")
+        if self._wilderness.return_to_wilderness():
+            self._emit("界面已就绪")
+            time.sleep(0.5)
+        else:
+            self._emit("已尝试清理界面，继续执行")
+
+    def _ensure_wilderness(self) -> None:
+        self._wilderness.ensure_wilderness()
+
+    def _open_search_panel(self) -> None:
+        self._ensure_wilderness()
+        screen = self.adb.screenshot()
+        if self._is_search_panel_visible(screen):
             return
 
-        key = "level_minus" if diff > 0 else "level_plus"
-        for _ in range(abs(diff)):
-            self._tap(key, delay=0.2)
+        result = self._match_in_roi(screen, SEARCH_ICON, SEARCH_ICON_ROI)
+        if result.found:
+            tx, ty = result.center
+            self._tap_xy(tx, ty, delay=1.5)
+        else:
+            logger.warning("放大镜模板未匹配，使用配置坐标")
+            self._tap("search_open", delay=1.5)
+
+        if not self._is_search_panel_visible():
+            raise RuntimeError("搜索面板未打开，请确认已在野外地图")
+        self._emit("已打开搜索面板")
+
+    def _scroll_search_tab_bar_to_rightmost(self) -> None:
+        x1, y1, x2, y2 = SEARCH_TAB_ROI
+        cy = (y1 + y2) // 2
+        swipe_start_x = x1 + 60
+        swipe_end_x = x2 - 60
+        self._emit("滚动搜索 tab 栏到最右端")
+        for _ in range(TAB_BAR_SCROLL_SWIPES):
+            self._swipe_xy(
+                swipe_start_x,
+                cy,
+                swipe_end_x,
+                cy,
+                duration_ms=TAB_BAR_SWIPE_DURATION_MS,
+            )
+            time.sleep(0.25)
+
+    def _select_beast_tab(self) -> None:
+        """滚到 tab 栏最右端后，点击从左起第 1 个 tab「野兽」。"""
+        if self._tab_bar_already_scrolled:
+            self._emit("上次已是野兽任务，跳过 tab 栏拖动")
+        else:
+            self._scroll_search_tab_bar_to_rightmost()
+            self._tab_bar_already_scrolled = True
+
+        tx, ty = self.coords["beast_tab"]
+        self._emit(f"选中野兽 tab @ ({tx},{ty})")
+        self._tap_xy(int(tx), int(ty), delay=1.0)
+
+    def _tap_search_confirm(self) -> None:
+        tx, ty = self.coords["search_confirm"]
+        self._emit(f"点击搜索 @ ({tx},{ty})")
+        self._tap_xy(int(tx), int(ty), delay=2.5)
+        self._emit("正在搜索野兽…")
+
+    def _parse_formation_slot(self, name: str) -> int | None:
+        if name.isdigit():
+            slot = int(name)
+            if 1 <= slot <= 8:
+                return slot
+        return None
+
+    def _require_formation_slot(self) -> int:
+        slot = self._parse_formation_slot(self.formation_name)
+        if slot is None:
+            raise RuntimeError(
+                f"编队槽位「{self.formation_name}」无效，请在 GUI 中填写 1~8"
+            )
+        return slot
+
+    def _is_deploy_screen(self, screen) -> bool:
+        march_vision = Vision(TEMPLATE_DIR, threshold=MARCH_MATCH_THRESHOLD)
+        if not (TEMPLATE_DIR / MARCH_BTN).exists():
+            return False
+        result = march_vision.match_template_multiscale(screen, MARCH_BTN)
+        return result.found and result.center[1] >= MARCH_MIN_Y
+
+    def _wait_for_deploy_screen(self, timeout: float = 15.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._interrupted():
+                raise InterruptedError("任务已停止")
+            screen = self.adb.screenshot()
+            if self._is_deploy_screen(screen):
+                march_vision = Vision(TEMPLATE_DIR, threshold=MARCH_MATCH_THRESHOLD)
+                result = march_vision.match_template_multiscale(screen, MARCH_BTN)
+                cx, cy = result.center
+                self._emit(
+                    f"出征界面就绪（出征按钮 {result.confidence:.2f} @ ({cx},{cy})）"
+                )
+                return
+            time.sleep(0.5)
+        raise RuntimeError(
+            "未检测到出征界面（右下角「出征」按钮）。"
+            "请确认上一步已定位目标。"
+        )
+
+    def _select_formation(self) -> None:
+        if not self.formation_name:
+            self._emit("未配置编队槽位，沿用当前编队")
+            return
+        slot = self._require_formation_slot()
+        self._emit(f"正在选择编队槽位 {slot}…")
+        self._wait_for_deploy_screen()
+        sx, sy = FORMATION_SLOTS[slot]
+        self._emit(f"点击编队槽位 {slot} @ ({sx},{sy})")
+        self._tap_xy(sx, sy, delay=1.0)
+        self._emit(f"已选择编队槽位 {slot}")
+
+    def _prepare_march(self) -> None:
+        if self.use_formation:
+            self._select_formation()
+            return
+        self._emit("未启用编队，跳过编队槽位")
+        self._wait_for_deploy_screen()
+
+    def _check_march_heroes(self) -> None:
+        if not self.check_march_heroes:
+            return
+        self._wait_for_deploy_screen()
+        self._emit("检查出征英雄…")
+        time.sleep(0.4)
+        screen = self.adb.screenshot()
+        empty_slots = HuntIceBeastTask._find_empty_march_hero_slots(screen)
+        if empty_slots:
+            slots_text = "、".join(str(i) for i in empty_slots)
+            raise MarchHeroCheckError(f"第 {slots_text} 个英雄位为空，跳过本轮")
+        self._emit("出征英雄已配满（3/3）")
+
+    def _resolve_march_button(self) -> tuple[int, int, float, bool]:
+        march_vision = Vision(TEMPLATE_DIR, threshold=MARCH_MATCH_THRESHOLD)
+        cx, cy = (
+            tuple(self.coords["march"])
+            if "march" in self.coords
+            else MARCH_CENTER
+        )
+        matched = False
+        match_conf = 0.0
+        for attempt in range(6):
+            screen = self.adb.screenshot()
+            if (TEMPLATE_DIR / MARCH_BTN).exists():
+                result = march_vision.match_template_multiscale(screen, MARCH_BTN)
+                if result.found and result.center[1] >= MARCH_MIN_Y:
+                    cx, cy = result.center
+                    matched = True
+                    match_conf = result.confidence
+                    break
+            time.sleep(0.5)
+        return cx, cy, match_conf, matched
+
+    def _click_march_button(self) -> None:
+        cx, cy, match_conf, matched = self._resolve_march_button()
+        if matched:
+            self._emit(f"点击出征 @ ({cx},{cy})（匹配 {match_conf:.2f}）")
+        else:
+            self._emit(f"点击出征 @ ({cx},{cy})（固定坐标）")
+        self._tap_xy(cx, cy, delay=0.6)
+
+    def _find_stamina_use_button(self, screen) -> MatchResult:
+        if not (TEMPLATE_DIR / STAMINA_USE_BTN).exists():
+            return MatchResult(found=False)
+        x1, y1, x2, y2 = STAMINA_USE_ROW_ROI
+        crop = screen[y1:y2, x1:x2]
+        stamina_vision = Vision(TEMPLATE_DIR, threshold=STAMINA_MATCH_THRESHOLD)
+        result = stamina_vision.match_template_multiscale(crop, STAMINA_USE_BTN)
+        if not result.found:
+            result = stamina_vision.match_template(crop, STAMINA_USE_BTN)
+        if result.found:
+            cx, cy = result.center
+            global_center = (x1 + cx, y1 + cy)
+            if not (STAMINA_USE_Y_MIN <= global_center[1] <= STAMINA_USE_Y_MAX):
+                return MatchResult(found=False, confidence=result.confidence)
+            return MatchResult(
+                found=True,
+                confidence=result.confidence,
+                center=global_center,
+                top_left=(x1 + result.top_left[0], y1 + result.top_left[1]),
+                size=result.size,
+            )
+        return MatchResult(found=False, confidence=result.confidence)
+
+    def _is_stamina_popup(self, screen) -> bool:
+        title_path = TEMPLATE_DIR / STAMINA_GET_MORE_TITLE
+        if title_path.exists():
+            x1, y1, x2, y2 = STAMINA_TITLE_ROI
+            title_vision = Vision(TEMPLATE_DIR, threshold=STAMINA_TITLE_THRESHOLD)
+            title = title_vision.match_template_multiscale(
+                screen[y1:y2, x1:x2], STAMINA_GET_MORE_TITLE
+            )
+            return title.found and title.confidence >= STAMINA_TITLE_THRESHOLD
+        btn = self._find_stamina_use_button(screen)
+        return btn.found and btn.confidence >= STAMINA_MATCH_THRESHOLD
+
+    def _wait_march_outcome(self, timeout: float = 10.0) -> bool:
+        self._emit("正在检测出征结果…")
+        time.sleep(3.0)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._interrupted():
+                raise InterruptedError("任务已停止")
+            if self._is_stamina_popup(self.adb.screenshot()):
+                return True
+            time.sleep(0.5)
+        return self._is_stamina_popup(self.adb.screenshot())
+
+    def _use_stamina_items(self) -> None:
+        self._emit("使用领主体力 @ (576, 522)")
+        self.adb.tap(576, 522)
+        time.sleep(0.15)
+        self.adb.tap(576, 522)
+        time.sleep(0.5)
+        self._emit("按返回键关闭弹窗")
+        self.adb.back()
+        time.sleep(0.8)
+
+    def _tap_march_button(self) -> None:
+        self._click_march_button()
+        time.sleep(0.8)
+        if not self._wait_march_outcome():
+            self._emit("队伍已出征")
+            return
+        self._emit("检测到体力不足弹窗，出征未成功")
+        if not self.use_stamina:
+            raise NoStaminaError("体力不足，任务结束")
+        self._emit("自动使用领主体力道具…")
+        self._use_stamina_items()
+        self._click_march_button()
+        time.sleep(0.8)
+        if self._wait_march_outcome():
+            self._emit("使用体力后仍出现体力不足弹窗，已停止")
+            raise NoStaminaError("没有体力，已停止")
+        self._emit("队伍已出征")
+
+    def _finish_after_march(self) -> None:
+        time.sleep(1.0)
+        screen = self.adb.screenshot()
+        if self._is_on_main_map(screen) and not self._is_search_panel_visible(screen):
+            if self._is_in_wilderness(screen):
+                self._emit("出征完成，已在野外主界面")
+            elif self._is_in_town(screen):
+                self._emit("出征完成，已在城镇主界面")
+            else:
+                self._emit("出征完成，已在主界面")
+            return
+        self._emit("清理出征后的残留界面…")
+        self._wilderness.return_to_wilderness()
 
     def run_hunt_cycle(self) -> None:
-        """野外 → 搜索 → 攻击 → 出征。"""
-        self._emit(f"开始打怪，目标等级 {self.monster_level}")
-        self._wilderness.ensure_wilderness()
-        self._close_popups()
+        self._ensure_clean_ui()
+        self._emit("开始搜索野兽")
 
-        self._tap("search_open")
-        self._set_monster_level()
-        self._tap("search_confirm", delay=2.5)
-        self._tap("attack", delay=2.0)
-        self._tap("march", delay=1.5)
+        self._open_search_panel()
+        self._select_beast_tab()
 
-        self._emit("已派出部队")
+        self._tap_search_confirm()
+
+        self._tap("target_tap", delay=2.0)
+        self._emit("已定位目标")
+
+        self._prepare_march()
+        self._check_march_heroes()
+        self._tap_march_button()
+        self._finish_after_march()
 
     def run_once(self, *, force: bool = False) -> bool:
         if not force and not self.should_run():
@@ -118,14 +478,52 @@ class HuntMonsterTask:
         self._last_run = time.time()
         try:
             self.run_hunt_cycle()
-            self._return_to_wilderness()
-            self._emit(f"本轮完成，{int(self.interval // 60)} 分钟后再次打野")
+            self._emit(f"本轮完成，{int(self.interval // 60)} 分钟后再次攻击")
             return True
         except InterruptedError:
             self._emit("任务已停止")
             raise
-        except Exception as exc:
-            logger.exception(f"[{self.name}] 执行失败")
-            self._emit(f"执行失败：{exc}")
-            self._return_to_wilderness()
+        except NoStaminaError:
+            if self.use_stamina:
+                self._emit("体力不足但已启用自动使用，跳过本轮继续循环")
+                self._wilderness.try_return_to_wilderness()
+                return False
+            self._stop_event.set()
+            raise InterruptedError("没有体力，已停止")
+        except MarchHeroCheckError as exc:
+            self._emit(str(exc))
+            self._emit("退回野外，等待下次循环")
+            self._wilderness.try_return_to_wilderness()
             return False
+        except Exception as exc:
+            logger.exception(f"[{self.name}] 执行失败，恢复界面后继续循环")
+            self._emit(f"本轮异常：{exc}，恢复界面后继续")
+            self._wilderness.try_return_to_wilderness()
+            return False
+
+    def run_loop(self) -> None:
+        self._running = True
+        self.reset_stop()
+        self._emit("=== 自动打野怪已启动 ===")
+        formation_desc = (
+            f"编队槽位 {self.formation_name}"
+            if self.use_formation
+            else "不启用编队，直接出征"
+        )
+        self._emit(
+            f"间隔 {int(self.interval // 60)} 分钟，{formation_desc}，"
+            f"检查出征英雄：{'是' if self.check_march_heroes else '否'}"
+        )
+        try:
+            while not self._interrupted():
+                try:
+                    self.run_once()
+                except InterruptedError:
+                    break
+                for _ in range(30):
+                    if self._interrupted():
+                        break
+                    time.sleep(1)
+        finally:
+            self._running = False
+            self._emit("自动打野怪已停止")

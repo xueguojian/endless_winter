@@ -108,14 +108,6 @@ class CoordRulerWindow(tk.Toplevel):
             foreground="#2ec27e",
         ).pack(side=tk.LEFT, padx=(10, 0))
 
-        ttk.Label(
-            self,
-            text="坐标为模拟器触控坐标（与实例 config_555x.yaml 中 coords 一致）。点击图片即复制，标记仅显示红点。",
-            font=("", 8),
-            foreground="gray",
-            wraplength=CANVAS_MAX_W + RULER_MARGIN * 2,
-        ).pack(fill=tk.X, padx=10, pady=(4, 6))
-
         frame = ttk.Frame(self, padding=(8, 0, 8, 8))
         frame.pack()
 

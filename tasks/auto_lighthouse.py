@@ -31,6 +31,7 @@ from core.navigation import (
     is_in_wilderness as nav_is_in_wilderness,
     is_on_main_map as nav_is_on_main_map,
 )
+from tasks.hunt_ice_beast import HuntIceBeastTask, MarchHeroCheckError
 from core.vision import Vision
 
 StatusCallback = Callable[[str], None]
@@ -78,6 +79,7 @@ def merge_task_config(cfg: dict) -> dict:
         "coords": coords,
         "monster_cooldown": float(cfg.get("monster_cooldown", DEFAULT_MONSTER_COOLDOWN)),
         "event_period": bool(cfg.get("event_period", False)),
+        "check_march_heroes": bool(cfg.get("check_march_heroes", True)),
     }
 
 
@@ -117,8 +119,9 @@ class AutoLighthouseTask:
         adb: AdbClient,
         coords: dict[str, list[int]] | None = None,
         interval: float = DEFAULT_INTERVAL,
-        formation_slot: int = 7,
+        formation_slot: int = 8,
         use_stamina: bool = True,
+        check_march_heroes: bool = True,
         step_delay: float = DEFAULT_STEP_DELAY,
         monster_cooldown: float = DEFAULT_MONSTER_COOLDOWN,
         event_period: bool = False,
@@ -130,6 +133,7 @@ class AutoLighthouseTask:
                 "step_delay": step_delay,
                 "monster_cooldown": monster_cooldown,
                 "event_period": event_period,
+                "check_march_heroes": check_march_heroes,
             }
         )
         self.adb = adb
@@ -137,6 +141,7 @@ class AutoLighthouseTask:
         self.interval = interval
         self.formation_slot = formation_slot
         self.use_stamina = use_stamina
+        self.check_march_heroes = merged["check_march_heroes"]
         self.step_delay = merged["step_delay"]
         self.monster_cooldown = merged["monster_cooldown"]
         self.event_period = merged["event_period"]
@@ -578,6 +583,20 @@ class AutoLighthouseTask:
         )
         return detail
 
+    def _check_march_heroes(self) -> None:
+        """小怪出征前检查英雄栏（与巨兽/打野逻辑一致）。"""
+        if not self.check_march_heroes:
+            return
+        self._deploy.wait_for_deploy_screen()
+        self._emit("检查出征英雄…")
+        time.sleep(0.4)
+        screen = self.adb.screenshot()
+        empty_slots = HuntIceBeastTask._find_empty_march_hero_slots(screen)
+        if empty_slots:
+            slots_text = "、".join(str(i) for i in empty_slots)
+            raise MarchHeroCheckError(f"第 {slots_text} 个英雄位为空，跳过出征")
+        self._emit("出征英雄已配满（3/3）")
+
     def _execute_detail_action(self, detail: MissionDetailClassification) -> None:
         """按详情页分类结果执行后续操作。"""
         if detail.kind == "tent":
@@ -603,6 +622,7 @@ class AutoLighthouseTask:
                 self._tap_xy(*detail.action_center, delay=1.5)
             self._emit("执行小怪出征…")
             self._deploy.select_formation()
+            self._check_march_heroes()
             self._deploy.tap_march()
             return
 
@@ -728,10 +748,13 @@ class AutoLighthouseTask:
                     )
                     self._back_from_detail_page()
                     continue
-                self._last_monster_dispatch_at = time.time()
 
             try:
                 self._execute_detail_action(detail)
+            except MarchHeroCheckError as exc:
+                self._emit(str(exc))
+                self._back_from_detail_page()
+                continue
             except StaminaInsufficientError:
                 raise
             except Exception as exc:
@@ -740,6 +763,7 @@ class AutoLighthouseTask:
                 continue
 
             if detail.kind == "small_monster":
+                self._last_monster_dispatch_at = time.time()
                 self._mark_monster_in_progress(tap_target.center)
 
             handled += 1

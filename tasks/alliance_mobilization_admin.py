@@ -17,8 +17,17 @@ from core.vision import Vision
 from tasks.alliance_mobilization import (
     ADMIN_DETAIL_TYPE_ORDER,
     ADMIN_TARGET_TYPES,
+    CARD_BG_BLUE,
+    CARD_BG_LABELS,
+    CARD_BG_ORANGE,
+    CARD_BG_PURPLE,
+    CARD_BG_UNKNOWN,
     COUNTDOWN_TEMPLATE,
     DEFAULT_STEP_DELAY,
+    DEFAULT_TYPE_KEEP_BG,
+    GUI_ALLIANCE_TYPE_ORDER,
+    KEEPABLE_BG_COLORS,
+    KEEP_BG_COLOR_ORDER,
     TASK_TYPE_ADMIN_DETAIL_TEMPLATES,
     TASK_TYPE_ADMIN_TEMPLATES,
     TASK_TYPE_LABELS,
@@ -27,6 +36,8 @@ from tasks.alliance_mobilization import (
     TEMPLATE_DIR,
     TRAIN_ICON_ADMIN_TEMPLATE,
     TRAIN_ICON_TEMPLATE,
+    normalize_type_keep_rules,
+    target_types_from_keep_rules,
     _crop,
     _looks_like_countdown_text,
     _parse_score,
@@ -60,27 +71,7 @@ DETAIL_MIN_CONF_MARGIN = 0.08
 DETAIL_NOISE_FLOOR = 0.45
 DETAIL_ICON_TIMER_EXCLUDE_PX = 36
 DETAIL_ICON_TIMER_RATIO = 0.28
-# 卡片底色：橙/紫/蓝（管理员列表品质）
-CARD_BG_ORANGE = "orange"
-CARD_BG_PURPLE = "purple"
-CARD_BG_BLUE = "blue"
-CARD_BG_UNKNOWN = "unknown"
-CARD_BG_LABELS = {
-    CARD_BG_ORANGE: "橙色",
-    CARD_BG_PURPLE: "紫色",
-    CARD_BG_BLUE: "蓝色",
-    CARD_BG_UNKNOWN: "未知",
-}
-KEEP_BG_COLOR_ORDER: tuple[str, ...] = (
-    CARD_BG_ORANGE,
-    CARD_BG_PURPLE,
-    CARD_BG_BLUE,
-)
-DEFAULT_KEEP_BG_COLORS: frozenset[str] = frozenset(
-    {CARD_BG_ORANGE, CARD_BG_PURPLE}
-)
-# 阶段目标默认：保留橙色练兵；可在配置/GUI 多选扩展
-KEEP_ORANGE_TYPES: frozenset[str] = frozenset({TASK_TYPE_TRAIN})
+# 卡片底色未知时 classify 使用
 TRAIN_ICON_ADMIN_INNER_TEMPLATE = "alliance_mobilization/train_icon_admin_inner.png"
 ADMIN_TRAIN_DETAIL_MATCH_SCALES: tuple[float, ...] = tuple(
     round(i / 100, 2) for i in range(55, 151, 5)
@@ -93,21 +84,18 @@ DEFAULT_DETAIL_TITLE_ROI = (268, 418, 452, 478)
 DEFAULT_DETAIL_CLOSE_BTN_ROI = (634, 406, 698, 446)
 DETAIL_POPUP_WAIT_SEC = 0.85
 DETAIL_CLOSE_SETTLE_SEC = 0.75
+DETAIL_MASK_TAP_GAP_SEC = 0.3
 
 DEFAULT_COORDS: dict[str, list[int]] = {
     # 弹窗内「刷新任务」按钮中心（详情 ROI 内）
     "refresh_tap": [181, 814],
     "refresh_confirm": [512, 776],
-    # 公共任务弹窗右上角 X（勿用 adb.back，会退出联盟界面）
-    "detail_close": [666, 426],
-    # 弹窗上方遮罩，X 无效时备用
-    "detail_mask_tap": [374, 368],
+    # 弹窗上方遮罩（关闭详情唯一方式；X 按钮位置不固定）
+    "detail_mask_tap": [362, 1272],
 }
-# 用户实机标定；config 中若仍为旧默认坐标则自动纠正
-CALIBRATED_DETAIL_CLOSE = (666, 426)
-CALIBRATED_DETAIL_MASK_TAP = (374, 368)
-DEPRECATED_DETAIL_CLOSE = frozenset({(694, 459), (684, 462)})
-DEPRECATED_DETAIL_MASK_TAP = frozenset({(360, 395)})
+CALIBRATED_DETAIL_MASK_TAP = (362, 1272)
+DEPRECATED_DETAIL_CLOSE = frozenset({(694, 459), (684, 462), (666, 426)})
+DEPRECATED_DETAIL_MASK_TAP = frozenset({(360, 395), (374, 368), (364, 306), (606, 1134)})
 DEFAULT_SCROLL = {
     "swipe_ms": 900,
     "swipe_x": 379,
@@ -167,18 +155,8 @@ class AdminCard:
 
 
 def _normalize_admin_coords(coords: dict) -> dict[str, list[int]]:
-    """合并并纠正详情弹窗关闭坐标（忽略历史错误默认值）。"""
+    """合并详情弹窗坐标；遮罩坐标过旧时自动纠正。"""
     merged = {**DEFAULT_COORDS, **(coords or {})}
-    raw_close = (coords or {}).get("detail_close")
-    if raw_close and len(raw_close) >= 2:
-        close_xy = (int(raw_close[0]), int(raw_close[1]))
-        if close_xy not in DEPRECATED_DETAIL_CLOSE:
-            merged["detail_close"] = [close_xy[0], close_xy[1]]
-        else:
-            merged["detail_close"] = list(CALIBRATED_DETAIL_CLOSE)
-    else:
-        merged["detail_close"] = list(CALIBRATED_DETAIL_CLOSE)
-
     raw_mask = (coords or {}).get("detail_mask_tap")
     if raw_mask and len(raw_mask) >= 2:
         mask_xy = (int(raw_mask[0]), int(raw_mask[1]))
@@ -193,32 +171,12 @@ def _normalize_admin_coords(coords: dict) -> dict[str, list[int]]:
 
 def merge_task_config(cfg: dict | None) -> dict:
     raw = cfg or {}
-    keep_types = [
-        str(item).strip()
-        for item in (
-            raw.get("keep_orange_types")
-            or raw.get("target_types")
-            or list(KEEP_ORANGE_TYPES)
-        )
-        if str(item).strip() in ADMIN_TARGET_TYPES
-    ]
+    type_keep_rules = normalize_type_keep_rules(raw)
+    keep_types = target_types_from_keep_rules(type_keep_rules)
     if not keep_types:
-        keep_types = list(KEEP_ORANGE_TYPES)
-    selected = [
-        str(item).strip()
-        for item in (raw.get("target_types") or keep_types)
-        if str(item).strip() in ADMIN_TARGET_TYPES
-    ]
-    if not selected:
-        selected = list(keep_types)
-
-    keep_bg_colors = [
-        str(item).strip()
-        for item in (raw.get("keep_bg_colors") or list(DEFAULT_KEEP_BG_COLORS))
-        if str(item).strip() in KEEP_BG_COLOR_ORDER
-    ]
-    if not keep_bg_colors:
-        keep_bg_colors = list(DEFAULT_KEEP_BG_COLORS)
+        type_keep_rules = normalize_type_keep_rules({})
+        keep_types = target_types_from_keep_rules(type_keep_rules)
+    selected = list(keep_types)
 
     roi = raw.get("list_roi") or list(DEFAULT_LIST_ROI)
     scroll = _normalize_scroll(raw.get("scroll"))
@@ -254,7 +212,12 @@ def merge_task_config(cfg: dict | None) -> dict:
             raw.get("detail_match_threshold", DEFAULT_DETAIL_MATCH_THRESHOLD)
         ),
         "keep_orange_types": keep_types,
-        "keep_bg_colors": keep_bg_colors,
+        "type_keep_rules": type_keep_rules,
+        "keep_bg_colors": list(
+            dict.fromkeys(
+                c for colors in type_keep_rules.values() for c in colors
+            )
+        ),
         "use_score_ocr": bool(raw.get("use_score_ocr", False)),
         "scroll": scroll,
         "coords": {
@@ -713,7 +676,9 @@ class AllianceMobilizationAdminSession:
         self.detail_close_btn_roi = merged["detail_close_btn_roi"]
         self.detail_match_threshold = float(merged["detail_match_threshold"])
         self.keep_orange_types = set(merged["keep_orange_types"])
-        self.keep_bg_colors = set(merged["keep_bg_colors"])
+        self.type_keep_rules = {
+            k: set(v) for k, v in merged["type_keep_rules"].items()
+        }
         self.use_score_ocr = bool(merged["use_score_ocr"])
         self.scroll = merged["scroll"]
         self.coords = merged["coords"]
@@ -732,6 +697,19 @@ class AllianceMobilizationAdminSession:
             if xy not in DEPRECATED_DETAIL_MASK_TAP:
                 return xy
         return CALIBRATED_DETAIL_MASK_TAP
+
+    def _tap_detail_mask(self, *, taps: int = 2, log_prefix: str = "点遮罩") -> None:
+        """点击详情蒙层。坐标处无 UI，可安全连点。"""
+        if self._interrupted():
+            raise InterruptedError("任务已停止")
+        mask_x, mask_y = self._detail_mask_xy()
+        suffix = "" if taps == 1 else f" ×{taps}"
+        self._emit(f"{log_prefix} ({mask_x},{mask_y}){suffix}")
+        for index in range(taps):
+            self.adb.tap(mask_x, mask_y)
+            if index < taps - 1:
+                self._sleep_interruptible(DETAIL_MASK_TAP_GAP_SEC)
+        self._sleep_interruptible(DETAIL_MASK_TAP_GAP_SEC)
 
     @property
     def name(self) -> str:
@@ -1166,7 +1144,7 @@ class AllianceMobilizationAdminSession:
         return is_open
 
     def _close_detail_popup(self) -> bool:
-        """关闭详情弹窗：点一次遮罩即可，不按返回键（易退出联盟界面）。"""
+        """关闭详情弹窗：连点两次遮罩，不按返回键（易退出联盟界面）。"""
         if self._interrupted():
             raise InterruptedError("任务已停止")
 
@@ -1174,16 +1152,14 @@ class AllianceMobilizationAdminSession:
         if not self._detail_popup_open(screen):
             return True
 
-        mask_x, mask_y = self._detail_mask_xy()
-        self._emit(f"点遮罩关闭详情 ({mask_x},{mask_y})")
-        self.adb.tap(mask_x, mask_y)
+        self._tap_detail_mask(taps=2, log_prefix="点遮罩关闭详情")
         self._sleep_interruptible(
             max(DETAIL_CLOSE_SETTLE_SEC, self.step_delay * 0.75)
         )
 
         if self._detail_popup_open(self._screenshot_stable()):
             logger.warning(
-                f"[{self.name}] 遮罩后标题仍像弹窗，不再按返回键"
+                f"[{self.name}] 遮罩连点后标题仍像弹窗，不再按返回键"
             )
         return True
 
@@ -1201,28 +1177,34 @@ class AllianceMobilizationAdminSession:
         self,
         *,
         label: str,
+        bg_color: str,
         detail_type: str | None,
         type_scores: dict[str, float],
         list_train: bool,
     ) -> str | None:
-        """在已勾选底色前提下，判断是否为目标任务类型。"""
-        keep_type = detail_type if detail_type in self.keep_orange_types else None
-        if keep_type is not None:
-            return keep_type
-        if not self.keep_orange_types:
+        """按类型 + 该类型勾选的底色判断是否保留。"""
+        if detail_type is not None:
+            allowed_bg = self.type_keep_rules.get(detail_type)
+            if allowed_bg and bg_color in allowed_bg:
+                type_label = TASK_TYPE_LABELS.get(detail_type, detail_type)
+                bg_label = CARD_BG_LABELS.get(bg_color, bg_color)
+                conf = type_scores.get(detail_type, 0.0)
+                self._emit(
+                    f"{label}：{bg_label}{type_label}（{type_label}={conf:.2f}），保留"
+                )
+                return detail_type
             return None
 
-        ranked = sorted(type_scores.items(), key=lambda item: item[1], reverse=True)
-        top_type, top_conf = ranked[0] if ranked else (None, 0.0)
-        if TASK_TYPE_TRAIN in self.keep_orange_types and list_train:
-            self._emit(f"{label}：练兵样式（列表预检），保留")
-            return TASK_TYPE_TRAIN
-        if top_type in self.keep_orange_types and top_conf >= 0.40:
-            type_label = TASK_TYPE_LABELS.get(top_type, top_type)
-            self._emit(
-                f"{label}：{type_label}样式（{type_label}={top_conf:.2f}），保留"
-            )
-            return top_type
+        if TASK_TYPE_TRAIN in self.type_keep_rules and list_train:
+            allowed_bg = self.type_keep_rules.get(TASK_TYPE_TRAIN)
+            if allowed_bg and bg_color in allowed_bg:
+                type_label = TASK_TYPE_LABELS.get(TASK_TYPE_TRAIN, TASK_TYPE_TRAIN)
+                bg_label = CARD_BG_LABELS.get(bg_color, bg_color)
+                conf = type_scores.get(TASK_TYPE_TRAIN, 0.0)
+                self._emit(
+                    f"{label}：{bg_label}{type_label}（列表预检+{type_label}={conf:.2f}），保留"
+                )
+                return TASK_TYPE_TRAIN
         return None
 
     def _process_card(self, screen: np.ndarray, card: AdminCard) -> tuple[str, bool]:
@@ -1270,17 +1252,16 @@ class AllianceMobilizationAdminSession:
             f"蓝{bg_ratios.get(CARD_BG_BLUE, 0):.2f})"
         )
 
-        if bg_color not in self.keep_bg_colors:
+        if bg_color == CARD_BG_BLUE or bg_color == CARD_BG_UNKNOWN:
             type_label = TASK_TYPE_LABELS.get(detail_type, detail_type or "未知")
-            self._emit(
-                f"{label}：{bg_label}未勾选保留（{type_label}），刷新"
-            )
+            self._emit(f"{label}：{bg_label}一律刷新（{type_label}）")
             self._finish_refresh_from_detail()
             self._sleep_interruptible(DETAIL_POPUP_WAIT_SEC)
             return "refresh", True
 
         keep_type = self._resolve_keep_task_type(
             label=label,
+            bg_color=bg_color,
             detail_type=detail_type,
             type_scores=type_scores,
             list_train=list_train,
@@ -1294,7 +1275,7 @@ class AllianceMobilizationAdminSession:
                 best_label = TASK_TYPE_LABELS.get(best_id, best_id)
                 top_hint = f"，最高={best_label}({best_conf:.2f})"
             self._emit(
-                f"{label}：{bg_label}但非目标类型（{type_label}{top_hint}），刷新"
+                f"{label}：{bg_label}未匹配保留规则（{type_label}{top_hint}），刷新"
             )
             self._finish_refresh_from_detail()
             self._sleep_interruptible(DETAIL_POPUP_WAIT_SEC)
@@ -1340,18 +1321,19 @@ class AllianceMobilizationAdminSession:
                 "请安装 rapidocr-onnxruntime onnxruntime，或确保本机已安装 Tesseract"
             )
 
-        keep_labels = "、".join(
-            TASK_TYPE_LABELS[t] for t in self.keep_orange_types if t in TASK_TYPE_LABELS
-        )
-        bg_labels = "、".join(
-            CARD_BG_LABELS[c] for c in KEEP_BG_COLOR_ORDER if c in self.keep_bg_colors
-        )
+        rule_parts: list[str] = []
+        for type_id in GUI_ALLIANCE_TYPE_ORDER:
+            colors = self.type_keep_rules.get(type_id)
+            if not colors:
+                continue
+            bg_text = "、".join(CARD_BG_LABELS[c] for c in KEEPABLE_BG_COLORS if c in colors)
+            rule_parts.append(f"{TASK_TYPE_LABELS[type_id]}[{bg_text}]")
         self._emit(
-            f"开始扫描管理员列表（保留底色：{bg_labels or '无'}；"
-            f"保留类型：{keep_labels or '无'}；"
+            f"开始扫描管理员列表（保留：{'；'.join(rule_parts) or '无'}；"
             f"{'读分数' if self.use_score_ocr else '跳过分数 OCR'}）"
         )
 
+        self._tap_detail_mask(taps=1, log_prefix="回顶前点遮罩（防残留弹窗）")
         self._scroll_to_top()
         self._sleep_interruptible(float(self.scroll["settle_delay"]))
 
@@ -1360,6 +1342,7 @@ class AllianceMobilizationAdminSession:
         actionable_count = 0
         refreshed = 0
         stale_scrolls = 0
+        scroll_mask_retried = False
         max_swipes = int(self.scroll["max_swipes_per_pass"])
         end_reason = "unknown"
         self._emit(
@@ -1477,13 +1460,21 @@ class AllianceMobilizationAdminSession:
                     f"当前上滑进度 {swipe_index + 1}/{max_swipes}"
                 )
                 if stale_scrolls >= 2:
-                    end_reason = "bottom"
-                    self._emit(
-                        "结束原因：连续 2 次上滑列表未移动，判定已滑到底部"
+                    if scroll_mask_retried:
+                        end_reason = "bottom"
+                        self._emit(
+                            "结束原因：点遮罩后仍无法上滑，判定已滑到底部或仍被遮挡"
+                        )
+                        break
+                    self._tap_detail_mask(
+                        taps=1, log_prefix="上滑无效点遮罩（尝试关闭遮挡）"
                     )
-                    break
+                    self._sleep_interruptible(float(self.scroll["settle_delay"]))
+                    scroll_mask_retried = True
+                    stale_scrolls = 0
             else:
                 stale_scrolls = 0
+                scroll_mask_retried = False
 
         if end_reason == "unknown":
             end_reason = "loop_finished"

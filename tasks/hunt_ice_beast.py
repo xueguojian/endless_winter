@@ -759,7 +759,8 @@ class HuntIceBeastTask:
             is_empty = True
         return is_empty, blue_ratio, template_score
 
-    def _find_empty_march_hero_slots(self, screen) -> list[int]:
+    @staticmethod
+    def _find_empty_march_hero_slots(screen) -> list[int]:
         empty_slots: list[int] = []
         for slot_index, roi in enumerate(
             HuntIceBeastTask._march_hero_slot_rois(), start=1
