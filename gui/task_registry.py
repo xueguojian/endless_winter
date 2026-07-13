@@ -83,6 +83,13 @@ TASK_ENTRIES: tuple[TaskEntry, ...] = (
         config_key="collect_commander_supplies",
         available=True,
     ),
+    TaskEntry(
+        task_id="collect_pet_supplies",
+        label="领取宠物物资",
+        kind="once",
+        config_key="collect_pet_supplies",
+        available=True,
+    ),
 )
 
 
@@ -92,3 +99,15 @@ def loop_tasks() -> list[TaskEntry]:
 
 def once_tasks() -> list[TaskEntry]:
     return [e for e in TASK_ENTRIES if e.kind == "once"]
+
+
+# 一键托管：按顺序各执行一次（与勾选无关）
+HOSTING_TASK_IDS: tuple[str, ...] = (
+    "auto_mining",
+    "donate_alliance_supplies",
+    "auto_train_troops",
+    "collect_supplies",
+    "auto_lighthouse",
+    "collect_commander_supplies",
+    "collect_pet_supplies",
+)

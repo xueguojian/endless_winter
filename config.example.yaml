@@ -219,6 +219,28 @@ tasks:
       claim_second:
       - 584
       - 818
+  collect_pet_supplies:
+    enabled: false
+    step_delay: 1.5
+    coords:
+      pet_open:
+      - 664
+      - 950
+      pet_slot_1:
+      - 282
+      - 298
+      pet_slot_2:
+      - 430
+      - 306
+      pet_slot_3:
+      - 570
+      - 300
+      pet_slot_4:
+      - 272
+      - 444
+      pet_confirm:
+      - 522
+      - 1092
   auto_train_troops:
     enabled: false
     interval: 10800

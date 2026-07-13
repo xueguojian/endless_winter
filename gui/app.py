@@ -33,7 +33,7 @@ from gui.dream_memory_panel import (
     set_map_selection,
     update_summary,
 )
-from gui.task_registry import TaskEntry, loop_tasks, once_tasks
+from gui.task_registry import TaskEntry, HOSTING_TASK_IDS, loop_tasks, once_tasks, TASK_ENTRIES
 from tasks.alliance_mobilization import (
     CARD_BG_LABELS,
     CARD_BG_ORANGE,
@@ -59,6 +59,10 @@ from tasks.auto_train_troops import (
 from tasks.collect_commander_supplies import (
     CollectCommanderSuppliesTask,
     merge_task_config as merge_commander_config,
+)
+from tasks.collect_pet_supplies import (
+    CollectPetSuppliesTask,
+    merge_task_config as merge_pet_supplies_config,
 )
 from tasks.collect_supplies import CollectSuppliesTask, merge_task_config as merge_collect_config
 from tasks.donate_alliance_supplies import (
@@ -378,6 +382,10 @@ class EndlessWinterApp(tk.Tk):
                 merged = merge_commander_config(section)
                 section["step_delay"] = merged["step_delay"]
                 section["double_tap_delay"] = merged["double_tap_delay"]
+                section["coords"] = merged["coords"]
+            if entry.task_id == "collect_pet_supplies":
+                merged = merge_pet_supplies_config(section)
+                section["step_delay"] = merged["step_delay"]
                 section["coords"] = merged["coords"]
 
         gui = cfg.setdefault("gui", {})
@@ -1279,6 +1287,10 @@ class EndlessWinterApp(tk.Tk):
             once_btn_row, text="停止", command=self._stop_once, width=10, state=tk.DISABLED
         )
         self.btn_stop_once.pack(side=tk.LEFT)
+        self.btn_hosting = ttk.Button(
+            once_btn_row, text="一键托管", command=self._run_hosting_batch, width=10
+        )
+        self.btn_hosting.pack(side=tk.LEFT, padx=(8, 0))
 
         tab_alliance_run = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_alliance_run, text="联盟总动员自动刷新")
@@ -1671,6 +1683,8 @@ class EndlessWinterApp(tk.Tk):
             return self._build_collect_supplies_task()
         if entry.task_id == "collect_commander_supplies":
             return self._build_collect_commander_supplies_task()
+        if entry.task_id == "collect_pet_supplies":
+            return self._build_collect_pet_supplies_task()
         return None
 
     def _build_auto_lighthouse_task(self) -> AutoLighthouseTask:
@@ -1768,6 +1782,16 @@ class EndlessWinterApp(tk.Tk):
             on_status=self._on_status,
         )
 
+    def _build_collect_pet_supplies_task(self) -> CollectPetSuppliesTask:
+        cfg = self.config.get("tasks", {}).get("collect_pet_supplies", {})
+        merged = merge_pet_supplies_config(cfg)
+        return CollectPetSuppliesTask(
+            adb=self._get_adb(),
+            coords=merged["coords"],
+            step_delay=merged["step_delay"],
+            on_status=self._on_status,
+        )
+
     def _build_auto_train_troops_task(self) -> AutoTrainTroopsTask:
         cfg = self.config.get("tasks", {}).get("auto_train_troops", {})
         merged = merge_train_config(cfg)
@@ -1856,6 +1880,23 @@ class EndlessWinterApp(tk.Tk):
             or self._is_alliance_running()
         )
 
+    def _configure_once_action_buttons(self, *, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        self.btn_run_once.configure(state=state)
+        if hasattr(self, "btn_hosting"):
+            self.btn_hosting.configure(state=state)
+
+    def _build_hosting_tasks(self) -> list:
+        tasks: list = []
+        for task_id in HOSTING_TASK_IDS:
+            entry = next((e for e in TASK_ENTRIES if e.task_id == task_id), None)
+            if entry is None or not entry.available:
+                continue
+            task = self._build_task_instance(entry)
+            if task is not None:
+                tasks.append(task)
+        return tasks
+
     def _set_loop_buttons(self, running: bool) -> None:
         self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.btn_stop_loop.configure(state=tk.NORMAL if running else tk.DISABLED)
@@ -1864,14 +1905,14 @@ class EndlessWinterApp(tk.Tk):
             and not self._is_any_dream_running()
             and not self._is_alliance_running()
         ):
-            self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
+            self._configure_once_action_buttons(enabled=not running)
             self.btn_alliance_start.configure(state=tk.DISABLED if running else tk.NORMAL)
             self.btn_alliance_admin_start.configure(
                 state=tk.DISABLED if running else tk.NORMAL
             )
 
     def _set_once_buttons(self, running: bool) -> None:
-        self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
+        self._configure_once_action_buttons(enabled=not running)
         self.btn_stop_once.configure(state=tk.NORMAL if running else tk.DISABLED)
         if (
             not self._is_loop_running()
@@ -1898,7 +1939,7 @@ class EndlessWinterApp(tk.Tk):
         )
         if not other_running:
             self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
-            self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
+            self._configure_once_action_buttons(enabled=not running)
         if self._dream_widgets is not None and not self._is_dream_memory_running():
             self._dream_widgets.btn_start.configure(
                 state=tk.DISABLED if running else tk.NORMAL
@@ -1926,7 +1967,7 @@ class EndlessWinterApp(tk.Tk):
         )
         if not other_running:
             self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
-            self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
+            self._configure_once_action_buttons(enabled=not running)
         if self._dream_widgets is not None and not self._is_dream_memory_running():
             self._dream_widgets.btn_start.configure(
                 state=tk.DISABLED if running else tk.NORMAL
@@ -1950,7 +1991,7 @@ class EndlessWinterApp(tk.Tk):
         )
         if not other_running:
             self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
-            self.btn_run_once.configure(state=tk.DISABLED if running else tk.NORMAL)
+            self._configure_once_action_buttons(enabled=not running)
             self.btn_alliance_start.configure(state=tk.DISABLED if running else tk.NORMAL)
             self.btn_alliance_admin_start.configure(
                 state=tk.DISABLED if running else tk.NORMAL
@@ -2084,6 +2125,84 @@ class EndlessWinterApp(tk.Tk):
 
         self._once_worker = threading.Thread(target=work, daemon=True)
         self._once_worker.start()
+
+    def _run_hosting_batch(self) -> None:
+        if self._is_once_running():
+            messagebox.showwarning("提示", "任务正在执行中")
+            return
+        if self._is_loop_running():
+            messagebox.showwarning("提示", "循环任务运行中，请先停止")
+            return
+        if self._is_any_dream_running():
+            messagebox.showwarning("提示", "寻梦记忆正在运行，请先点「结束」")
+            return
+        if self._is_alliance_running():
+            messagebox.showwarning("提示", "联盟总动员正在运行，请先点「结束」")
+            return
+
+        try:
+            self._save_config()
+            self.config = self._load_config()
+            self._once_tasks = self._build_hosting_tasks()
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+
+        if not self._once_tasks:
+            messagebox.showwarning("提示", "托管任务不可用")
+            return
+
+        self._once_stop_event.clear()
+        self._set_once_buttons(running=True)
+        names = " → ".join(t.name for t in self._once_tasks)
+        self._on_status(f"一键托管：{names}")
+
+        def work():
+            try:
+                if not self._ensure_device():
+                    return
+                for index, task in enumerate(self._once_tasks):
+                    if self._once_stop_event.is_set():
+                        self._on_status("一键托管已取消")
+                        return
+                    self._execute_hosting_task(task)
+                    if index < len(self._once_tasks) - 1:
+                        self._on_status(f"等待 {ONCE_TASK_GAP_SEC} 秒后执行下一项…")
+                        for _ in range(ONCE_TASK_GAP_SEC * 10):
+                            if self._once_stop_event.is_set():
+                                self._on_status("一键托管已取消")
+                                return
+                            time.sleep(0.1)
+                self._on_status("一键托管全部完成")
+            except InterruptedError:
+                self._on_status("一键托管已停止")
+            except Exception as exc:
+                self._on_status(f"一键托管异常：{exc}")
+            finally:
+                self.after(0, self._on_once_worker_done)
+
+        self._once_worker = threading.Thread(target=work, daemon=True)
+        self._once_worker.start()
+
+    def _execute_hosting_task(self, task) -> None:
+        self._on_status(f"▶ 托管：{task.name}")
+        try:
+            if hasattr(task, "reset_stop"):
+                task.reset_stop()
+            if hasattr(task, "run_once"):
+                task.run_once(force=True)
+            elif hasattr(task, "execute"):
+                task.execute()
+            self._on_status(f"✓ 完成：{task.name}")
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            self._on_status(f"✗ [{task.name}] 失败：{exc}")
+        finally:
+            try:
+                return_to_main_screen(self._get_adb(), on_status=self._on_status)
+            except Exception as exc:
+                self._on_status(f"返回主界面失败：{exc}")
 
     def _execute_once(self, task) -> None:
         self._on_status(f"▶ 一次性：{task.name}")
