@@ -239,7 +239,7 @@ tasks:
       - 272
       - 444
       pet_confirm:
-      - 522
+      - 356
       - 1092
   auto_train_troops:
     enabled: false

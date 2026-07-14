@@ -19,7 +19,7 @@ DEFAULT_COORDS: dict[str, list[int]] = {
     "pet_slot_2": [430, 306],
     "pet_slot_3": [570, 300],
     "pet_slot_4": [272, 444],
-    "pet_confirm": [522, 1092],
+    "pet_confirm": [356, 1092],
     "dialog_cancel": [250, 780],
 }
 
@@ -105,6 +105,7 @@ class CollectPetSuppliesTask:
             x, y = self.coords[slot_key]
             self._emit(f"领取第 {index} 格 @ ({x},{y})")
             self._tap(slot_key)
+            self._tap("pet_confirm")
             self._tap("pet_confirm")
 
         self._emit("领取完成")
