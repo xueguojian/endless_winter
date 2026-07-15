@@ -13,6 +13,7 @@ from loguru import logger
 
 from core.adb_client import AdbClient
 from core.navigation import WildernessNavigator
+from core.search_level import adjust_search_level, ensure_full_resource_checked
 from core.vision import MatchResult, Vision
 
 StatusCallback = Callable[[str], None]
@@ -35,10 +36,6 @@ SEARCH_PANEL_TEMPLATES = (
 SEARCH_ICON_ROI = (0, 780, 160, 960)
 SEARCH_TAB_ROI = (0, 850, 720, 980)
 SEARCH_BTN_ROI = (100, 1130, 530, 1240)
-LEVEL_NUM_ROI = (600, 1043, 680, 1078)
-LEVEL_NUM_DIR = "level_num"
-LEVEL_MINUS_BTN = "level_minus_btn.png"
-LEVEL_PLUS_BTN = "level_plus_btn.png"
 
 TAB_BAR_FIRST_SCROLL_SWIPES = 3
 TAB_BAR_LATER_SCROLL_SWIPES = 1
@@ -58,9 +55,10 @@ DEFAULT_COORDS: dict[str, list[int]] = {
     "gather_btn": [354, 628],
     "hero_remove_2": [424, 318],
     "hero_remove_3": [618, 318],
-    "level_minus": [73, 1065],
-    "level_plus": [470, 1065],
+    "level_minus": [66, 1050],
+    "level_plus": [482, 1048],
     "dialog_cancel": [250, 780],
+    "full_resource_check": [214, 1136],
     "march": [560, 1200],
 }
 
@@ -123,6 +121,7 @@ class AutoMiningTask:
         skip_hour: int = -1,
         step_delay: float = DEFAULT_STEP_DELAY,
         hero_match_threshold: float = MINING_HERO_MATCH_THRESHOLD,
+        adjust_level: bool = True,
         on_status: StatusCallback | None = None,
     ):
         merged = merge_task_config(
@@ -143,9 +142,11 @@ class AutoMiningTask:
         self.step_delay = merged["step_delay"]
         self.hero_roi = merged["hero_roi"]
         self.hero_match_threshold = merged["hero_match_threshold"]
+        self.adjust_level = adjust_level
         self.on_status = on_status
         self._last_run = 0.0
         self._stop_event = threading.Event()
+        self._level_already_adjusted = False
         self.vision = Vision(TEMPLATE_DIR, threshold=0.70)
         self._wilderness = WildernessNavigator.from_task(
             self, is_overlay_open=self._is_search_panel_visible
@@ -279,55 +280,30 @@ class AutoMiningTask:
         self._emit(f"选择{resource.label} ({tx}, {ty})")
         self._tap_xy(tx, ty, delay=1.0)
 
-    def _read_current_level(self, screen=None) -> int | None:
-        if screen is None:
-            screen = self.adb.screenshot()
-        x1, y1, x2, y2 = LEVEL_NUM_ROI
-        box = screen[y1:y2, x1:x2]
-        num_dir = TEMPLATE_DIR / LEVEL_NUM_DIR
-        if not num_dir.is_dir():
-            return None
-        best_level: int | None = None
-        best_conf = 0.0
-        digit_vision = Vision(TEMPLATE_DIR, threshold=0.88)
-        for path in sorted(num_dir.glob("[0-9]*.png")):
-            try:
-                level = int(path.stem)
-            except ValueError:
-                continue
-            result = digit_vision.match_template(box, f"{LEVEL_NUM_DIR}/{path.name}")
-            if result.found and result.confidence > best_conf:
-                best_level = level
-                best_conf = result.confidence
-        return best_level
-
-    def _tap_level_button(self, plus: bool) -> None:
-        template = LEVEL_PLUS_BTN if plus else LEVEL_MINUS_BTN
-        screen = self.adb.screenshot()
-        result = self.vision.match_template(screen, template)
-        if result.found:
-            self._tap_xy(*result.center, delay=0.35)
-        else:
-            self._tap("level_plus" if plus else "level_minus", delay=0.35)
-
     def _set_mine_level(self) -> None:
+        """仅大循环首次调整等级（游戏会记忆）；未勾选配置则跳过。"""
+        if not self.adjust_level:
+            self._emit("未启用修改等级，跳过")
+            return
+        if self._level_already_adjusted:
+            self._emit("本轮调度已调整过等级，跳过")
+            return
         target = max(self.level_min, min(self.level_max, self.mine_level))
-        current = self._read_current_level()
-        if current == target:
-            self._emit(f"等级已是 {target}，无需调整")
-            return
-        if current is None:
-            logger.warning("无法识别当前等级，跳过调节")
-            return
-        diff = target - current
-        self._emit(f"调整等级：{current} → {target}")
-        for i in range(abs(diff)):
-            self._tap_level_button(plus=(diff > 0))
-            if i == 0:
-                self._dismiss_dialog()
-            if self._read_current_level() == target:
-                self._emit(f"已调整到 {target} 级")
-                return
+        adjust_search_level(
+            self.adb,
+            target,
+            emit=self._emit,
+            interrupted=self._interrupted,
+            on_first_tap=self._dismiss_dialog,
+        )
+        self._level_already_adjusted = True
+
+    def _ensure_full_resource_option(self) -> None:
+        ensure_full_resource_checked(
+            self.adb,
+            emit=self._emit,
+            interrupted=self._interrupted,
+        )
 
     def _tap_search_confirm(self) -> None:
         screen = self.adb.screenshot()
@@ -378,6 +354,7 @@ class AutoMiningTask:
 
         self._emit(f"开始采集{resource.label}（{self.level_min}~{self.level_max} 级）")
         self._select_resource_tab(resource)
+        self._ensure_full_resource_option()
         self._set_mine_level()
         self._tap_search_confirm()
         self._tap_gather_button()

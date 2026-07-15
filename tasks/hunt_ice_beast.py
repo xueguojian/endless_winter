@@ -12,7 +12,23 @@ import cv2
 from loguru import logger
 
 from core.adb_client import AdbClient, AdbUnavailableError
+from core.deploy_march import (
+    DEPLOY_WAIT_POLL_SEC,
+    DEPLOY_WAIT_SETTLE_SEC,
+    DEPLOY_WAIT_TIMEOUT,
+    MARCH_RESOLVE_ATTEMPTS,
+    MARCH_RESOLVE_POLL_SEC,
+    find_march_button,
+)
 from core.navigation import WildernessNavigator
+from core.search_level import adjust_search_level
+from core.stamina_use import (
+    DEFAULT_STAMINA_CAN_LIMIT,
+    STAMINA_USE_XY,
+    StaminaCanBudget,
+    StaminaCanLimitReached,
+    use_stamina_cans_batch,
+)
 from core.vision import MatchResult, Vision
 
 StatusCallback = Callable[[str], None]
@@ -36,14 +52,14 @@ SEARCH_PANEL_TEMPLATES = (
     ICE_BEAST_TAB_SELECTED,
 )
 UI_CLEANUP_ATTEMPTS = 6
-MARCH_BTN = "march_btn.png"
+MARCH_BTN = "march_btn.png"  # 仅 deploy_march.find_march_button 使用其上半「出征」区域
 STAMINA_USE_BTN = "stamina_use_btn.png"
 STAMINA_GET_MORE_TITLE = "stamina_get_more_title.png"
 
 # 「获取更多」弹窗 (720×1280)
 STAMINA_TITLE_ROI = (100, 60, 620, 200)
 STAMINA_USE_ROW_ROI = (500, 520, 710, 660)
-STAMINA_USE_CENTER = (630, 570)
+STAMINA_USE_CENTER = (576, 522)
 STAMINA_USE_Y_MIN = 520
 STAMINA_USE_Y_MAX = 660
 STAMINA_MATCH_THRESHOLD = 0.58
@@ -52,8 +68,6 @@ STAMINA_TITLE_THRESHOLD = 0.60
 # 出征界面顶部编队栏 Y 范围（标定脚本用）
 FORMATION_BAR_Y1 = 95
 FORMATION_BAR_Y2 = 220
-MARCH_MATCH_THRESHOLD = 0.72
-MARCH_MIN_Y = 1050
 MARCH_CENTER = (560, 1200)
 
 # 720×1280 竖屏下 1~8 号编队槽位中心（实机标定）
@@ -81,15 +95,12 @@ ICE_BEAST_TAB_SLOT = 2
 TAB_FIRST_CENTER_X = 90
 TAB_ICON_SPACING = 115
 # 等级数字白框（仅裁白框内数字，勿含圆角边框）
-LEVEL_NUM_ROI = (600, 1043, 680, 1078)
 # 底部「搜索」按钮区域（排除右侧「自动狩猎」）
 SEARCH_BTN_ROI = (100, 1130, 530, 1240)
-LEVEL_NUM_DIR = "level_num"
-LEVEL_MINUS_BTN = "level_minus_btn.png"
-LEVEL_PLUS_BTN = "level_plus_btn.png"
 RALLY_MATCH_THRESHOLD = 0.68
-RALLY_RETRY_COUNT = 10
-RALLY_RETRY_INTERVAL = 0.8
+RALLY_RETRY_COUNT = 6
+RALLY_RETRY_INTERVAL = 1.0
+RALLY_CONFIRM_CLICK_RETRIES = 3
 RALLY_CONFIRM_THRESHOLD = 0.72
 RALLY_CONFIRM_MIN_Y = 780
 RALLY_CONFIRM_MAX_DX = 90
@@ -138,8 +149,10 @@ class HuntIceBeastTask:
         skip_hour: int = 21,
         step_delay: float = 1.5,
         use_stamina: bool = True,
+        stamina_can_limit: int = DEFAULT_STAMINA_CAN_LIMIT,
         check_march_heroes: bool = True,
         use_formation: bool = True,
+        adjust_level: bool = True,
         on_status: StatusCallback | None = None,
     ):
         self.adb = adb
@@ -150,6 +163,7 @@ class HuntIceBeastTask:
         self.formation_name = str(formation_name).strip()
         self.check_march_heroes = check_march_heroes
         self.use_formation = use_formation
+        self.adjust_level = adjust_level
         if rally_duration_minutes not in RALLY_TIME_COORDS:
             raise ValueError(
                 f"集结时长仅支持 {list(RALLY_DURATION_OPTIONS)} 分钟，"
@@ -159,6 +173,9 @@ class HuntIceBeastTask:
         self.skip_hour = skip_hour
         self.step_delay = step_delay
         self.use_stamina = use_stamina
+        self.stamina_budget = StaminaCanBudget(
+            enabled=use_stamina, limit=stamina_can_limit
+        )
         self.on_status = on_status
         self.vision = Vision(TEMPLATE_DIR, threshold=0.72)
 
@@ -167,6 +184,7 @@ class HuntIceBeastTask:
         self._running = False
         # 连续执行冰原巨兽时，搜索 tab 栏仍停留在上次滚动的位置
         self._tab_bar_already_scrolled = False
+        self._level_already_adjusted = False
         self._wilderness = WildernessNavigator.from_task(
             self, is_overlay_open=self._is_search_panel_visible
         )
@@ -416,65 +434,23 @@ class HuntIceBeastTask:
 
         self._emit("已选中冰原巨兽（非野兽）")
 
-    def _read_current_level(self, screen=None) -> int | None:
-        """读取右侧白框中的当前等级数字。"""
-        if screen is None:
-            screen = self.adb.screenshot()
-        x1, y1, x2, y2 = LEVEL_NUM_ROI
-        box = screen[y1:y2, x1:x2]
-        num_dir = TEMPLATE_DIR / LEVEL_NUM_DIR
-        if not num_dir.is_dir():
-            return None
-
-        best_level: int | None = None
-        best_conf = 0.0
-        digit_vision = Vision(TEMPLATE_DIR, threshold=0.88)
-        for path in sorted(num_dir.glob("[0-9]*.png")):
-            try:
-                level = int(path.stem)
-            except ValueError:
-                continue
-            result = digit_vision.match_template(box, f"{LEVEL_NUM_DIR}/{path.name}")
-            if result.found and result.confidence > best_conf:
-                best_level = level
-                best_conf = result.confidence
-        return best_level
-
-    def _tap_level_button(self, plus: bool) -> None:
-        template = LEVEL_PLUS_BTN if plus else LEVEL_MINUS_BTN
-        screen = self.adb.screenshot()
-        result = self.vision.match_template(screen, template)
-        if result.found:
-            self._tap_xy(*result.center, delay=0.35)
-        else:
-            key = "level_plus" if plus else "level_minus"
-            self._tap(key, delay=0.35)
-
     def _set_beast_level(self) -> None:
-        """冰原巨兽会记忆上次等级；读取白框数字，仅在需要时点击 +/-。"""
-        current = self._read_current_level()
-        if current == self.beast_level:
-            self._emit(f"等级已是 {self.beast_level}，无需调整")
+        """按配置调整搜索等级；仅大循环首次执行（游戏会记忆等级）。"""
+        if not self.adjust_level:
+            self._emit("未启用修改等级，跳过")
+            return
+        if self._level_already_adjusted:
+            self._emit("本轮调度已调整过等级，跳过")
             return
 
-        if current is None:
-            logger.warning(
-                f"无法识别当前等级（缺少 level_num/{self.beast_level}.png 模板），跳过调节"
-            )
-            return
-
-        diff = self.beast_level - current
-        self._emit(f"调整等级：{current} → {self.beast_level}")
-        for i in range(abs(diff)):
-            self._tap_level_button(plus=(diff > 0))
-            if i == 0 and "dialog_cancel" in self.coords:
-                self._dismiss_dialog()
-            now = self._read_current_level()
-            if now == self.beast_level:
-                self._emit(f"已调整到 {self.beast_level} 级")
-                return
-
-        logger.warning("未能到达目标等级，继续执行")
+        adjust_search_level(
+            self.adb,
+            self.beast_level,
+            emit=self._emit,
+            interrupted=self._interrupted,
+            on_first_tap=self._dismiss_dialog if "dialog_cancel" in self.coords else None,
+        )
+        self._level_already_adjusted = True
 
     def _tap_search_confirm(self) -> None:
         """点击底部「搜索」按钮（避开右侧自动狩猎）。"""
@@ -562,11 +538,7 @@ class HuntIceBeastTask:
 
     def _is_deploy_screen(self, screen) -> bool:
         """是否已进入出征/编队界面（右下角有「出征」按钮）。"""
-        march_vision = Vision(TEMPLATE_DIR, threshold=MARCH_MATCH_THRESHOLD)
-        if not (TEMPLATE_DIR / MARCH_BTN).exists():
-            return False
-        result = march_vision.match_template_multiscale(screen, MARCH_BTN)
-        return result.found and result.center[1] >= MARCH_MIN_Y
+        return find_march_button(screen).found
 
     def _confirm_rally_popup(self) -> None:
         """在「发起集结」弹窗中选择时长并点击底部确认按钮。"""
@@ -598,7 +570,7 @@ class HuntIceBeastTask:
             if "rally_confirm" in self.coords
             else RALLY_CONFIRM_CENTER
         )
-        for attempt in range(5):
+        for attempt in range(RALLY_CONFIRM_CLICK_RETRIES):
             screen = self.adb.screenshot()
             result = self._find_rally_confirm_button(screen)
             if result.found:
@@ -609,7 +581,7 @@ class HuntIceBeastTask:
             )
             self._tap_xy(cx, cy, delay=1.0)
 
-            time.sleep(0.8)
+            time.sleep(1.0)
             after = self.adb.screenshot()
             if self._is_deploy_screen(after):
                 self._emit(f"已确认集结（{duration} 分钟），进入出征界面")
@@ -618,7 +590,7 @@ class HuntIceBeastTask:
             if not gone.found or gone.confidence < 0.75:
                 self._emit(f"已确认集结（{duration} 分钟）")
                 return
-            logger.debug(f"发起集结弹窗仍在，重试 {attempt + 1}/5")
+            logger.debug(f"发起集结弹窗仍在，重试 {attempt + 1}/{RALLY_CONFIRM_CLICK_RETRIES}")
 
         raise RuntimeError("点击「发起集结」后弹窗未关闭，请检查模板或坐标")
 
@@ -637,27 +609,28 @@ class HuntIceBeastTask:
             )
         return slot
 
-    def _wait_for_deploy_screen(self, timeout: float = 15.0) -> None:
+    def _wait_for_deploy_screen(self, timeout: float = DEPLOY_WAIT_TIMEOUT) -> None:
         """等待出征界面（右下角「出征」按钮出现）。"""
+        time.sleep(DEPLOY_WAIT_SETTLE_SEC)
         deadline = time.time() + timeout
+        best_conf = 0.0
 
         while time.time() < deadline:
             if self._interrupted():
                 raise InterruptedError("任务已停止")
-            screen = self.adb.screenshot()
-            if self._is_deploy_screen(screen):
-                march_vision = Vision(TEMPLATE_DIR, threshold=MARCH_MATCH_THRESHOLD)
-                result = march_vision.match_template_multiscale(screen, MARCH_BTN)
+            result = find_march_button(self.adb.screenshot())
+            best_conf = max(best_conf, result.confidence)
+            if result.found:
                 cx, cy = result.center
                 self._emit(
                     f"出征界面就绪（出征按钮 {result.confidence:.2f} @ ({cx},{cy})）"
                 )
                 return
-            time.sleep(0.5)
+            time.sleep(DEPLOY_WAIT_POLL_SEC)
 
         raise RuntimeError(
             "未检测到出征界面（右下角「出征」按钮）。"
-            "请确认上一步已成功发起集结。"
+            f"最高匹配 {best_conf:.2f}。请确认上一步已成功发起集结。"
         )
 
     def _select_formation(self) -> None:
@@ -687,9 +660,10 @@ class HuntIceBeastTask:
         """出征前检查英雄栏三个槽位是否均已上阵。"""
         if not self.check_march_heroes:
             return
-        self._wait_for_deploy_screen()
+        # _prepare_march 已确认出征页；换编队后数字变化会导致「出征」模板抖动，
+        # 这里不再二次 15s 严格等待，短暂落定后直接检英雄。
+        time.sleep(0.5)
         self._emit("检查出征英雄…")
-        time.sleep(0.4)
         screen = self.adb.screenshot()
         empty_slots = self._find_empty_march_hero_slots(screen)
         if empty_slots:
@@ -832,21 +806,18 @@ class HuntIceBeastTask:
         return STAMINA_USE_CENTER
 
     def _use_stamina_items(self) -> None:
-        """点击固定坐标使用领主体力，然后按返回键关闭弹窗。"""
-        self._emit("使用领主体力 @ (576, 522)")
-        self.adb.tap(576, 522)
-        time.sleep(0.15)
-        self.adb.tap(576, 522)
-        time.sleep(0.5)
-        self._emit("按返回键关闭弹窗")
-        self.adb.back()
-        time.sleep(0.8)
+        """弹窗内连点领主体力（默认 20 次）。固定用实测坐标，勿用 stamina_use 配置误点。"""
+        use_stamina_cans_batch(
+            self.adb,
+            self.stamina_budget,
+            tap_xy=STAMINA_USE_XY,
+            emit=self._emit,
+            interrupted=self._interrupted,
+            close_with_back=True,
+        )
 
     def _resolve_march_button(self) -> tuple[int, int, float, bool]:
         """返回 (x, y, confidence, template_matched)。"""
-        march_vision = Vision(TEMPLATE_DIR, threshold=MARCH_MATCH_THRESHOLD)
-        template_path = TEMPLATE_DIR / MARCH_BTN
-
         cx, cy = (
             tuple(self.coords["march"])
             if "march" in self.coords
@@ -855,34 +826,35 @@ class HuntIceBeastTask:
         matched = False
         match_conf = 0.0
 
-        for attempt in range(6):
-            screen = self.adb.screenshot()
-            if template_path.exists():
-                result = march_vision.match_template_multiscale(screen, MARCH_BTN)
-                if result.found and result.center[1] >= MARCH_MIN_Y:
-                    cx, cy = result.center
-                    matched = True
-                    match_conf = result.confidence
-                    break
-                if result.found:
-                    logger.debug(
-                        f"忽略出征误匹配 @ {result.center}（y<{MARCH_MIN_Y}）"
-                    )
-            time.sleep(0.5)
-            logger.debug(f"等待出征按钮 {attempt + 1}/6")
+        for attempt in range(MARCH_RESOLVE_ATTEMPTS):
+            result = find_march_button(self.adb.screenshot())
+            if result.found:
+                cx, cy = result.center
+                matched = True
+                match_conf = result.confidence
+                break
+            time.sleep(MARCH_RESOLVE_POLL_SEC)
+            logger.debug(
+                f"等待出征按钮 {attempt + 1}/{MARCH_RESOLVE_ATTEMPTS}"
+                f"（当前最高 {result.confidence:.2f}）"
+            )
 
         return cx, cy, match_conf, matched
 
-    def _wait_march_outcome(self, timeout: float = 10.0) -> bool:
-        """等待出征结果。True=出现体力不足弹窗；False=未出现（视为出征成功）。"""
+    def _wait_march_outcome(self, timeout: float = 4.0) -> bool:
+        """等待出征结果。True=出现体力不足弹窗；False=未出现（视为出征成功）。
+
+        出征后先空等再少量截图：双开时截图是主要压力源，不必密采 10 秒。
+        """
         self._emit("正在检测出征结果…")
         logger.info(f"开始检测出征结果（超时 {timeout} 秒）")
 
-        # 等待游戏加载和弹窗出现（出征后有较长的加载过渡）
-        time.sleep(3.0)
+        # 弹窗/过场主要靠时间出现，空等不占 ADB
+        time.sleep(2.5)
 
         deadline = time.time() + timeout
         check_count = 0
+        interval = 0.9
 
         while time.time() < deadline:
             if self._interrupted():
@@ -890,21 +862,17 @@ class HuntIceBeastTask:
 
             screen = self.adb.screenshot()
             check_count += 1
-
-            # 检测体力弹窗
             is_popup = self._is_stamina_popup(screen)
-            logger.info(f"检测 {check_count}: 体力弹窗={is_popup}")
+            logger.debug(f"检测 {check_count}: 体力弹窗={is_popup}")
 
             if is_popup:
                 logger.info(f"检测到体力不足弹窗（第 {check_count} 次检测）")
                 return True
 
-            time.sleep(0.5)
+            time.sleep(interval)
 
-        final_check = self._is_stamina_popup(self.adb.screenshot())
-        logger.info(f"出征结果检测完成（共检测 {check_count} 次），"
-                     f"最终结果：{'体力不足' if final_check else '出征成功'}")
-        return final_check
+        logger.info(f"出征结果检测完成（共截图 {check_count} 次），视为出征成功")
+        return False
 
     def _click_march_button(self) -> None:
         cx, cy, match_conf, matched = self._resolve_march_button()
@@ -1005,6 +973,10 @@ class HuntIceBeastTask:
                 return False
             self._stop_event.set()
             raise InterruptedError("没有体力，已停止")
+        except StaminaCanLimitReached as exc:
+            self._emit(str(exc))
+            self._stop_event.set()
+            raise InterruptedError(str(exc)) from exc
         except MarchHeroCheckError as exc:
             self._emit(str(exc))
             self._emit("退回野外，等待下次循环")

@@ -83,16 +83,35 @@ class Vision:
             logger.warning(f"模板不存在: {template_path}")
             return MatchResult(found=False)
 
-        screen_gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
-        template_base = self._load_gray(template_path)
+        return self.match_gray_multiscale(
+            screen, self._load_gray(template_path), scales=scales
+        )
+
+    def match_gray_multiscale(
+        self,
+        screen: np.ndarray,
+        template_gray: np.ndarray,
+        scales: tuple[float, ...] = (0.85, 0.95, 1.0, 1.1, 1.25, 1.4, 1.55),
+        *,
+        offset: tuple[int, int] = (0, 0),
+    ) -> MatchResult:
+        """对灰度模板做多尺度匹配；offset 用于 ROI 裁图还原全图坐标。"""
+        if template_gray is None or template_gray.size == 0:
+            return MatchResult(found=False)
+
+        if len(screen.shape) == 2:
+            screen_gray = screen
+        else:
+            screen_gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
+        ox, oy = offset
         best = MatchResult(found=False)
 
         for scale in scales:
             if scale == 1.0:
-                template = template_base
+                template = template_gray
             else:
                 template = cv2.resize(
-                    template_base,
+                    template_gray,
                     None,
                     fx=scale,
                     fy=scale,
@@ -110,8 +129,8 @@ class Vision:
                 best = MatchResult(
                     found=max_val >= self.threshold,
                     confidence=float(max_val),
-                    center=(x + tw // 2, y + th // 2),
-                    top_left=(x, y),
+                    center=(ox + x + tw // 2, oy + y + th // 2),
+                    top_left=(ox + x, oy + y),
                     size=(tw, th),
                 )
 

@@ -11,16 +11,29 @@ from typing import Callable
 from loguru import logger
 
 from core.adb_client import AdbClient, AdbUnavailableError
+from core.deploy_march import (
+    DEPLOY_WAIT_POLL_SEC,
+    DEPLOY_WAIT_SETTLE_SEC,
+    DEPLOY_WAIT_TIMEOUT,
+    MARCH_RESOLVE_ATTEMPTS,
+    MARCH_RESOLVE_POLL_SEC,
+    find_march_button,
+)
 from core.navigation import WildernessNavigator
+from core.search_level import adjust_search_level
+from core.stamina_use import (
+    DEFAULT_STAMINA_CAN_LIMIT,
+    STAMINA_USE_XY,
+    StaminaCanBudget,
+    StaminaCanLimitReached,
+    use_stamina_cans_batch,
+)
 from core.vision import MatchResult, Vision
 from tasks.hunt_ice_beast import (
     BTN_TOWN_LABEL,
     BTN_WILDERNESS_LABEL,
     FORMATION_SLOTS,
-    MARCH_BTN,
     MARCH_CENTER,
-    MARCH_MATCH_THRESHOLD,
-    MARCH_MIN_Y,
     MarchHeroCheckError,
     NoStaminaError,
     SCENE_TOGGLE_ROI,
@@ -64,7 +77,9 @@ DEFAULT_COORDS: dict[str, list[int]] = {
     "search_confirm": list(DEFAULT_SEARCH_CONFIRM),
     "target_tap": list(DEFAULT_TARGET_TAP),
     "march": [560, 1200],
-    "stamina_use": [630, 570],
+    "stamina_use": [576, 522],
+    "level_minus": [66, 1050],
+    "level_plus": [482, 1048],
 }
 
 
@@ -81,8 +96,10 @@ class HuntMonsterTask:
         skip_hour: int = 21,
         step_delay: float = 1.5,
         use_stamina: bool = True,
+        stamina_can_limit: int = DEFAULT_STAMINA_CAN_LIMIT,
         check_march_heroes: bool = True,
         use_formation: bool = True,
+        adjust_level: bool = True,
         on_status: StatusCallback | None = None,
     ):
         self.adb = adb
@@ -93,8 +110,12 @@ class HuntMonsterTask:
         self.skip_hour = skip_hour
         self.step_delay = step_delay
         self.use_stamina = use_stamina
+        self.stamina_budget = StaminaCanBudget(
+            enabled=use_stamina, limit=stamina_can_limit
+        )
         self.check_march_heroes = check_march_heroes
         self.use_formation = use_formation
+        self.adjust_level = adjust_level
         self.on_status = on_status
         self.vision = Vision(TEMPLATE_DIR, threshold=0.72)
 
@@ -102,6 +123,7 @@ class HuntMonsterTask:
         self._stop_event = threading.Event()
         self._running = False
         self._tab_bar_already_scrolled = False
+        self._level_already_adjusted = False
         self._wilderness = WildernessNavigator.from_task(
             self, is_overlay_open=self._is_search_panel_visible
         )
@@ -278,30 +300,27 @@ class HuntMonsterTask:
         return slot
 
     def _is_deploy_screen(self, screen) -> bool:
-        march_vision = Vision(TEMPLATE_DIR, threshold=MARCH_MATCH_THRESHOLD)
-        if not (TEMPLATE_DIR / MARCH_BTN).exists():
-            return False
-        result = march_vision.match_template_multiscale(screen, MARCH_BTN)
-        return result.found and result.center[1] >= MARCH_MIN_Y
+        return find_march_button(screen).found
 
-    def _wait_for_deploy_screen(self, timeout: float = 15.0) -> None:
+    def _wait_for_deploy_screen(self, timeout: float = DEPLOY_WAIT_TIMEOUT) -> None:
+        time.sleep(DEPLOY_WAIT_SETTLE_SEC)
         deadline = time.time() + timeout
+        best_conf = 0.0
         while time.time() < deadline:
             if self._interrupted():
                 raise InterruptedError("任务已停止")
-            screen = self.adb.screenshot()
-            if self._is_deploy_screen(screen):
-                march_vision = Vision(TEMPLATE_DIR, threshold=MARCH_MATCH_THRESHOLD)
-                result = march_vision.match_template_multiscale(screen, MARCH_BTN)
+            result = find_march_button(self.adb.screenshot())
+            best_conf = max(best_conf, result.confidence)
+            if result.found:
                 cx, cy = result.center
                 self._emit(
                     f"出征界面就绪（出征按钮 {result.confidence:.2f} @ ({cx},{cy})）"
                 )
                 return
-            time.sleep(0.5)
+            time.sleep(DEPLOY_WAIT_POLL_SEC)
         raise RuntimeError(
             "未检测到出征界面（右下角「出征」按钮）。"
-            "请确认上一步已定位目标。"
+            f"最高匹配 {best_conf:.2f}。请确认上一步已定位目标。"
         )
 
     def _select_formation(self) -> None:
@@ -326,9 +345,9 @@ class HuntMonsterTask:
     def _check_march_heroes(self) -> None:
         if not self.check_march_heroes:
             return
-        self._wait_for_deploy_screen()
+        # 编队选择后界面已确认；避免二次严格等待因体力数字变化误杀
+        time.sleep(0.5)
         self._emit("检查出征英雄…")
-        time.sleep(0.4)
         screen = self.adb.screenshot()
         empty_slots = HuntIceBeastTask._find_empty_march_hero_slots(screen)
         if empty_slots:
@@ -337,7 +356,6 @@ class HuntMonsterTask:
         self._emit("出征英雄已配满（3/3）")
 
     def _resolve_march_button(self) -> tuple[int, int, float, bool]:
-        march_vision = Vision(TEMPLATE_DIR, threshold=MARCH_MATCH_THRESHOLD)
         cx, cy = (
             tuple(self.coords["march"])
             if "march" in self.coords
@@ -345,16 +363,18 @@ class HuntMonsterTask:
         )
         matched = False
         match_conf = 0.0
-        for attempt in range(6):
-            screen = self.adb.screenshot()
-            if (TEMPLATE_DIR / MARCH_BTN).exists():
-                result = march_vision.match_template_multiscale(screen, MARCH_BTN)
-                if result.found and result.center[1] >= MARCH_MIN_Y:
-                    cx, cy = result.center
-                    matched = True
-                    match_conf = result.confidence
-                    break
-            time.sleep(0.5)
+        for attempt in range(MARCH_RESOLVE_ATTEMPTS):
+            result = find_march_button(self.adb.screenshot())
+            if result.found:
+                cx, cy = result.center
+                matched = True
+                match_conf = result.confidence
+                break
+            time.sleep(MARCH_RESOLVE_POLL_SEC)
+            logger.debug(
+                f"等待出征按钮 {attempt + 1}/{MARCH_RESOLVE_ATTEMPTS}"
+                f"（当前最高 {result.confidence:.2f}）"
+            )
         return cx, cy, match_conf, matched
 
     def _click_march_button(self) -> None:
@@ -400,27 +420,29 @@ class HuntMonsterTask:
         btn = self._find_stamina_use_button(screen)
         return btn.found and btn.confidence >= STAMINA_MATCH_THRESHOLD
 
-    def _wait_march_outcome(self, timeout: float = 10.0) -> bool:
+    def _wait_march_outcome(self, timeout: float = 4.0) -> bool:
+        """出征后少量截图判体力弹窗（双开减负）。"""
         self._emit("正在检测出征结果…")
-        time.sleep(3.0)
+        time.sleep(2.5)
         deadline = time.time() + timeout
+        interval = 0.9
         while time.time() < deadline:
             if self._interrupted():
                 raise InterruptedError("任务已停止")
             if self._is_stamina_popup(self.adb.screenshot()):
                 return True
-            time.sleep(0.5)
-        return self._is_stamina_popup(self.adb.screenshot())
+            time.sleep(interval)
+        return False
 
     def _use_stamina_items(self) -> None:
-        self._emit("使用领主体力 @ (576, 522)")
-        self.adb.tap(576, 522)
-        time.sleep(0.15)
-        self.adb.tap(576, 522)
-        time.sleep(0.5)
-        self._emit("按返回键关闭弹窗")
-        self.adb.back()
-        time.sleep(0.8)
+        use_stamina_cans_batch(
+            self.adb,
+            self.stamina_budget,
+            tap_xy=STAMINA_USE_XY,
+            emit=self._emit,
+            interrupted=self._interrupted,
+            close_with_back=True,
+        )
 
     def _tap_march_button(self) -> None:
         self._click_march_button()
@@ -456,10 +478,11 @@ class HuntMonsterTask:
 
     def run_hunt_cycle(self) -> None:
         self._ensure_clean_ui()
-        self._emit("开始搜索野兽")
+        self._emit(f"开始搜索 {self.monster_level} 级野兽")
 
         self._open_search_panel()
         self._select_beast_tab()
+        self._set_monster_level()
 
         self._tap_search_confirm()
 
@@ -470,6 +493,26 @@ class HuntMonsterTask:
         self._check_march_heroes()
         self._tap_march_button()
         self._finish_after_march()
+
+    def _set_monster_level(self) -> None:
+        if not self.adjust_level:
+            self._emit("未启用修改等级，跳过")
+            return
+        if self._level_already_adjusted:
+            self._emit("本轮调度已调整过等级，跳过")
+            return
+        adjust_search_level(
+            self.adb,
+            self.monster_level,
+            emit=self._emit,
+            interrupted=self._interrupted,
+            on_first_tap=(
+                (lambda: self._tap("dialog_cancel", delay=0.5))
+                if "dialog_cancel" in self.coords
+                else None
+            ),
+        )
+        self._level_already_adjusted = True
 
     def run_once(self, *, force: bool = False) -> bool:
         if not force and not self.should_run():
@@ -490,6 +533,10 @@ class HuntMonsterTask:
                 return False
             self._stop_event.set()
             raise InterruptedError("没有体力，已停止")
+        except StaminaCanLimitReached as exc:
+            self._emit(str(exc))
+            self._stop_event.set()
+            raise InterruptedError(str(exc)) from exc
         except MarchHeroCheckError as exc:
             self._emit(str(exc))
             self._emit("退回野外，等待下次循环")

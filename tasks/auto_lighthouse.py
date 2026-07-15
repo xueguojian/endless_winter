@@ -11,6 +11,7 @@ from loguru import logger
 
 from core.adb_client import AdbClient
 from core.deploy_march import DeployMarchHelper, StaminaInsufficientError
+from core.stamina_use import DEFAULT_STAMINA_CAN_LIMIT, StaminaCanLimitReached
 
 from core.lighthouse_vision import (
     LIGHTHOUSE_SCAN_ROI,
@@ -121,6 +122,7 @@ class AutoLighthouseTask:
         interval: float = DEFAULT_INTERVAL,
         formation_slot: int = 8,
         use_stamina: bool = True,
+        stamina_can_limit: int = DEFAULT_STAMINA_CAN_LIMIT,
         check_march_heroes: bool = True,
         step_delay: float = DEFAULT_STEP_DELAY,
         monster_cooldown: float = DEFAULT_MONSTER_COOLDOWN,
@@ -157,6 +159,7 @@ class AutoLighthouseTask:
             adb,
             formation_slot=formation_slot,
             use_stamina=use_stamina,
+            stamina_can_limit=stamina_can_limit,
             coords=self.coords,
             on_status=on_status,
             interrupted=self._interrupted,
@@ -587,9 +590,9 @@ class AutoLighthouseTask:
         """小怪出征前检查英雄栏（与巨兽/打野逻辑一致）。"""
         if not self.check_march_heroes:
             return
-        self._deploy.wait_for_deploy_screen()
+        # select_formation 已确认出征页，此处不再二次长等待
+        time.sleep(0.5)
         self._emit("检查出征英雄…")
-        time.sleep(0.4)
         screen = self.adb.screenshot()
         empty_slots = HuntIceBeastTask._find_empty_march_hero_slots(screen)
         if empty_slots:
@@ -755,7 +758,7 @@ class AutoLighthouseTask:
                 self._emit(str(exc))
                 self._back_from_detail_page()
                 continue
-            except StaminaInsufficientError:
+            except (StaminaInsufficientError, StaminaCanLimitReached):
                 raise
             except Exception as exc:
                 self._emit(f"执行失败：{exc}")
@@ -780,6 +783,14 @@ class AutoLighthouseTask:
             self._return_to_wilderness_main()
             self._emit(f"本轮处理 {count} 个灯塔任务，扫描结束")
             return True
+        except StaminaCanLimitReached as exc:
+            self._emit(str(exc))
+            self._stop_event.set()
+            try:
+                self._return_to_wilderness_main()
+            except Exception as nav_exc:
+                logger.warning(f"[{self.name}] 返回野外失败: {nav_exc}")
+            raise InterruptedError(str(exc)) from exc
         except InterruptedError:
             self._emit("任务已停止")
             raise

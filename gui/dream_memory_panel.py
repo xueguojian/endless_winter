@@ -282,8 +282,10 @@ def build_dream_tab(
         foreground="#555",
     ).pack(side=tk.LEFT)
 
-    preview_btn_frame = ttk.Frame(parent)
-    preview_btn_frame.pack(anchor=tk.W, pady=(0, 6))
+    preview_row = ttk.Frame(parent)
+    preview_row.pack(anchor=tk.W, fill=tk.X, pady=(0, 4))
+    preview_btn_frame = ttk.Frame(preview_row)
+    preview_btn_frame.pack(side=tk.LEFT)
 
     widgets = DreamTabWidgets(
         pk=pk,
@@ -291,7 +293,7 @@ def build_dream_tab(
         cmb_map=cmb_map,
         lbl_summary=lbl_summary,
         preview_btn_frame=preview_btn_frame,
-        lbl_ocr=ttk.Label(parent, text=""),
+        lbl_ocr=ttk.Label(preview_row, text=""),
         btn_start=ttk.Button(parent, text="开始游戏"),
         btn_stop=ttk.Button(parent, text="结束"),
         var_tap_interval=var_tap_interval,
@@ -318,22 +320,18 @@ def build_dream_tab(
     ocr_engine = resolve_ocr_engine(dm_cfg.ocr_engine)
     ocr_ok = ocr_engine_available(dm_cfg.ocr_engine)
     if ocr_engine == "rapidocr":
-        ocr_text = "RapidOCR: 已就绪（推荐，中文游戏字体）" if ocr_ok else (
-            "RapidOCR: 未安装，请运行 pip install rapidocr-onnxruntime onnxruntime"
-        )
+        ocr_text = "RapidOCR: 已就绪" if ocr_ok else "RapidOCR: 未安装"
     else:
         ocr_text = (
-            f"Tesseract: 已就绪 ({dm_cfg.tesseract_cmd})"
+            f"Tesseract: 已就绪"
             if ocr_ok
-            else f"Tesseract: 未找到 ({dm_cfg.tesseract_cmd})"
+            else f"Tesseract: 未找到"
         )
     widgets.lbl_ocr.configure(
         text=ocr_text,
         foreground="green" if ocr_ok else "red",
-        wraplength=480,
-        justify=tk.LEFT,
     )
-    widgets.lbl_ocr.pack(anchor=tk.W, pady=(0, 6))
+    widgets.lbl_ocr.pack(side=tk.LEFT, padx=(10, 0))
 
     # 开始/结束统一在主界面运行区，此处按钮仅作内部状态兼容，不展示
     widgets.btn_start.configure(text="开始游戏", command=on_start, width=10)

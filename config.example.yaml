@@ -22,8 +22,10 @@ tasks:
     enabled: false
     interval: 60
     monster_level: 30
+    adjust_level: true
     formation_name: '8'
     use_stamina: false
+    stamina_can_limit: 800
     check_march_heroes: true
     use_formation: true
     skip_hour: 21
@@ -48,16 +50,24 @@ tasks:
       - 250
       - 780
       stamina_use:
-      - 630
-      - 570
+      - 576
+      - 522
+      level_minus:
+      - 66
+      - 1050
+      level_plus:
+      - 482
+      - 1048
   hunt_ice_beast:
     enabled: true
     interval: 120
     beast_level: 8
     default_beast_level: 1
+    adjust_level: true
     formation_name: '6'
     rally_duration_minutes: 5
     use_stamina: false
+    stamina_can_limit: 800
     check_march_heroes: true
     use_formation: true
     skip_hour: 21
@@ -73,11 +83,11 @@ tasks:
       - 205
       - 915
       level_minus:
-      - 73
-      - 1065
+      - 66
+      - 1050
       level_plus:
-      - 470
-      - 1065
+      - 482
+      - 1048
       search_confirm:
       - 360
       - 1175
@@ -109,13 +119,14 @@ tasks:
       - 250
       - 780
       stamina_use:
-      - 630
-      - 570
+      - 576
+      - 522
   auto_mining:
     interval: 3600
     use_mining_hero: true
     level_min: 5
     level_max: 8
+    adjust_level: true
     enabled: false
     step_delay: 1.5
     hero_roi:
@@ -156,11 +167,14 @@ tasks:
       - 618
       - 318
       level_minus:
-      - 73
-      - 1065
+      - 66
+      - 1050
       level_plus:
-      - 470
-      - 1065
+      - 482
+      - 1048
+      full_resource_check:
+      - 214
+      - 1136
       dialog_cancel:
       - 250
       - 780
@@ -266,6 +280,7 @@ tasks:
     formation_slot: 8
     check_march_heroes: true
     use_stamina: false
+    stamina_can_limit: 800
     monster_cooldown: 60
     step_delay: 1.5
     coords:

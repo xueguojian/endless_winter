@@ -33,12 +33,21 @@ class AdbClient:
     LDPLAYER_PROBE_PORTS = tuple(range(5555, 5571, 2))
 
     LDPLAYER_ADB_CANDIDATES = [
+        # 雷电 14 / 新版常见路径
+        r"C:\leidian\LDPlayer14\adb.exe",
+        r"D:\leidian\LDPlayer14\adb.exe",
+        r"C:\LDPlayer\LDPlayer14\adb.exe",
+        r"D:\LDPlayer\LDPlayer14\adb.exe",
+        r"C:\leidian\LDPlayer\adb.exe",
+        r"D:\leidian\LDPlayer\adb.exe",
+        # 雷电 9
         r"C:\leidian\LDPlayer9\adb.exe",
         r"D:\leidian\LDPlayer9\adb.exe",
+        r"C:\Program Files\LDPlayer\LDPlayer9\adb.exe",
+        r"D:\Program Files\LDPlayer\LDPlayer9\adb.exe",
+        # 雷电 4
         r"C:\leidian\LDPlayer4\adb.exe",
         r"D:\leidian\LDPlayer4\adb.exe",
-        r"C:\Program Files\LDPlayer\LDPlayer9\adb.exe",
-        r"C:\Program Files\LDPlayer\LDPlayer9\adb.exe",
     ]
 
     def __init__(

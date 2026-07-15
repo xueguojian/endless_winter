@@ -34,7 +34,6 @@ run_gui_5557.bat
 
 # 标定脚本
 .venv\Scripts\python.exe scripts/calibrate_stamina.py
-.venv\Scripts\python.exe scripts/calibrate_level_num.py
 ```
 
 ## 核心架构
