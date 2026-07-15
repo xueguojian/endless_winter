@@ -1260,37 +1260,11 @@ class EndlessWinterApp(tk.Tk):
             tab_loop, loop_tasks(), columns=LOOP_TASK_COLUMNS, show_hint=False
         )
 
-        loop_btn_row = ttk.Frame(tab_loop)
-        loop_btn_row.pack(fill=tk.X, pady=(8, 0))
-        self.btn_start_loop = ttk.Button(
-            loop_btn_row, text="启动", command=self._start_loop, width=10
-        )
-        self.btn_start_loop.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_stop_loop = ttk.Button(
-            loop_btn_row, text="停止", command=self._stop_loop, width=10, state=tk.DISABLED
-        )
-        self.btn_stop_loop.pack(side=tk.LEFT)
-
         tab_once = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_once, text="一次性任务")
         self._build_task_checkboxes(
             tab_once, once_tasks(), columns=ONCE_TASK_COLUMNS, show_hint=False
         )
-
-        once_btn_row = ttk.Frame(tab_once)
-        once_btn_row.pack(fill=tk.X, pady=(8, 0))
-        self.btn_run_once = ttk.Button(
-            once_btn_row, text="执行", command=self._run_once_batch, width=10
-        )
-        self.btn_run_once.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_stop_once = ttk.Button(
-            once_btn_row, text="停止", command=self._stop_once, width=10, state=tk.DISABLED
-        )
-        self.btn_stop_once.pack(side=tk.LEFT)
-        self.btn_hosting = ttk.Button(
-            once_btn_row, text="一键托管", command=self._run_hosting_batch, width=10
-        )
-        self.btn_hosting.pack(side=tk.LEFT, padx=(8, 0))
 
         tab_alliance_run = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_alliance_run, text="联盟总动员自动刷新")
@@ -1300,23 +1274,6 @@ class EndlessWinterApp(tk.Tk):
             foreground="gray",
             font=("", 8),
         ).pack(anchor=tk.W)
-        alliance_btn_row = ttk.Frame(tab_alliance_run)
-        alliance_btn_row.pack(fill=tk.X, pady=(8, 0))
-        self.btn_alliance_start = ttk.Button(
-            alliance_btn_row,
-            text="开始",
-            command=self._start_alliance_mobilization,
-            width=10,
-        )
-        self.btn_alliance_start.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_alliance_stop = ttk.Button(
-            alliance_btn_row,
-            text="结束",
-            command=self._stop_alliance_mobilization,
-            width=10,
-            state=tk.DISABLED,
-        )
-        self.btn_alliance_stop.pack(side=tk.LEFT)
 
         tab_alliance_admin_run = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_alliance_admin_run, text="联盟管理员刷新")
@@ -1326,23 +1283,6 @@ class EndlessWinterApp(tk.Tk):
             foreground="gray",
             font=("", 8),
         ).pack(anchor=tk.W)
-        admin_btn_row = ttk.Frame(tab_alliance_admin_run)
-        admin_btn_row.pack(fill=tk.X, pady=(8, 0))
-        self.btn_alliance_admin_start = ttk.Button(
-            admin_btn_row,
-            text="开始",
-            command=self._start_alliance_admin,
-            width=10,
-        )
-        self.btn_alliance_admin_start.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_alliance_admin_stop = ttk.Button(
-            admin_btn_row,
-            text="结束",
-            command=self._stop_alliance_admin,
-            width=10,
-            state=tk.DISABLED,
-        )
-        self.btn_alliance_admin_stop.pack(side=tk.LEFT)
 
         tab_dream = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_dream, text="寻梦记忆")
@@ -1353,6 +1293,25 @@ class EndlessWinterApp(tk.Tk):
         self._build_dream_pk_tab(tab_dream_pk)
 
         self._task_notebook.bind("<<NotebookTabChanged>>", self._on_task_notebook_changed)
+
+        run_btn_row = ttk.Frame(task_frame)
+        run_btn_row.pack(fill=tk.X, pady=(8, 0))
+        self.btn_start = ttk.Button(
+            run_btn_row, text="开始", command=self._start_from_current_tab, width=10
+        )
+        self.btn_start.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_stop = ttk.Button(
+            run_btn_row,
+            text="结束",
+            command=self._stop_running_tasks,
+            width=10,
+            state=tk.DISABLED,
+        )
+        self.btn_stop.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_hosting = ttk.Button(
+            run_btn_row, text="一键托管", command=self._run_hosting_batch, width=10
+        )
+        self.btn_hosting.pack(side=tk.LEFT)
 
         self.lbl_status = ttk.Label(task_frame, text="状态：待命", foreground="gray")
         self.lbl_status.pack(anchor=tk.W, pady=(8, 0))
@@ -1881,10 +1840,8 @@ class EndlessWinterApp(tk.Tk):
         )
 
     def _configure_once_action_buttons(self, *, enabled: bool) -> None:
-        state = tk.NORMAL if enabled else tk.DISABLED
-        self.btn_run_once.configure(state=state)
-        if hasattr(self, "btn_hosting"):
-            self.btn_hosting.configure(state=state)
+        _ = enabled
+        self._update_run_control_buttons()
 
     def _build_hosting_tasks(self) -> list:
         tasks: list = []
@@ -1897,118 +1854,93 @@ class EndlessWinterApp(tk.Tk):
                 tasks.append(task)
         return tasks
 
+    def _update_run_control_buttons(self) -> None:
+        """统一刷新开始/结束/一键托管按钮状态。"""
+        running = self._is_any_running()
+        if hasattr(self, "btn_start"):
+            self.btn_start.configure(state=tk.DISABLED if running else tk.NORMAL)
+        if hasattr(self, "btn_stop"):
+            self.btn_stop.configure(state=tk.NORMAL if running else tk.DISABLED)
+        if hasattr(self, "btn_hosting"):
+            self.btn_hosting.configure(state=tk.DISABLED if running else tk.NORMAL)
+        # 寻梦 Tab 内部隐藏按钮状态同步（兼容旧引用）
+        for widgets in (self._dream_widgets, self._dream_pk_widgets):
+            if widgets is None:
+                continue
+            widgets.btn_start.configure(state=tk.DISABLED if running else tk.NORMAL)
+            widgets.btn_stop.configure(state=tk.NORMAL if running else tk.DISABLED)
+
     def _set_loop_buttons(self, running: bool) -> None:
-        self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
-        self.btn_stop_loop.configure(state=tk.NORMAL if running else tk.DISABLED)
-        if (
-            not self._is_once_running()
-            and not self._is_any_dream_running()
-            and not self._is_alliance_running()
-        ):
-            self._configure_once_action_buttons(enabled=not running)
-            self.btn_alliance_start.configure(state=tk.DISABLED if running else tk.NORMAL)
-            self.btn_alliance_admin_start.configure(
-                state=tk.DISABLED if running else tk.NORMAL
-            )
+        _ = running
+        self._update_run_control_buttons()
 
     def _set_once_buttons(self, running: bool) -> None:
-        self._configure_once_action_buttons(enabled=not running)
-        self.btn_stop_once.configure(state=tk.NORMAL if running else tk.DISABLED)
-        if (
-            not self._is_loop_running()
-            and not self._is_any_dream_running()
-            and not self._is_alliance_running()
-        ):
-            self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
-            self.btn_alliance_start.configure(state=tk.DISABLED if running else tk.NORMAL)
-            self.btn_alliance_admin_start.configure(
-                state=tk.DISABLED if running else tk.NORMAL
-            )
+        _ = running
+        self._update_run_control_buttons()
 
     def _set_alliance_buttons(self, running: bool) -> None:
-        self.btn_alliance_start.configure(state=tk.DISABLED if running else tk.NORMAL)
-        self.btn_alliance_stop.configure(state=tk.NORMAL if running else tk.DISABLED)
-        if not running and not self._is_alliance_admin_running():
-            self.btn_alliance_admin_start.configure(state=tk.NORMAL)
-        elif running:
-            self.btn_alliance_admin_start.configure(state=tk.DISABLED)
-        other_running = (
-            self._is_loop_running()
-            or self._is_once_running()
-            or self._is_any_dream_running()
-        )
-        if not other_running:
-            self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
-            self._configure_once_action_buttons(enabled=not running)
-        if self._dream_widgets is not None and not self._is_dream_memory_running():
-            self._dream_widgets.btn_start.configure(
-                state=tk.DISABLED if running else tk.NORMAL
-            )
-        if self._dream_pk_widgets is not None and not self._is_dream_pk_running():
-            self._dream_pk_widgets.btn_start.configure(
-                state=tk.DISABLED if running else tk.NORMAL
-            )
+        _ = running
+        self._update_run_control_buttons()
 
     def _set_alliance_admin_buttons(self, running: bool) -> None:
-        self.btn_alliance_admin_start.configure(
-            state=tk.DISABLED if running else tk.NORMAL
-        )
-        self.btn_alliance_admin_stop.configure(
-            state=tk.NORMAL if running else tk.DISABLED
-        )
-        if not running and not self._is_alliance_regular_running():
-            self.btn_alliance_start.configure(state=tk.NORMAL)
-        elif running:
-            self.btn_alliance_start.configure(state=tk.DISABLED)
-        other_running = (
-            self._is_loop_running()
-            or self._is_once_running()
-            or self._is_any_dream_running()
-        )
-        if not other_running:
-            self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
-            self._configure_once_action_buttons(enabled=not running)
-        if self._dream_widgets is not None and not self._is_dream_memory_running():
-            self._dream_widgets.btn_start.configure(
-                state=tk.DISABLED if running else tk.NORMAL
-            )
-        if self._dream_pk_widgets is not None and not self._is_dream_pk_running():
-            self._dream_pk_widgets.btn_start.configure(
-                state=tk.DISABLED if running else tk.NORMAL
-            )
+        _ = running
+        self._update_run_control_buttons()
 
     def _set_dream_buttons(self, running: bool, *, pk: bool) -> None:
-        widgets = self._dream_widgets_for(pk)
-        widgets.btn_start.configure(state=tk.DISABLED if running else tk.NORMAL)
-        widgets.btn_stop.configure(state=tk.NORMAL if running else tk.DISABLED)
-        other_running = (
-            self._is_loop_running()
-            or self._is_once_running()
-            or self._is_alliance_running()
-            or (
-                self._is_dream_pk_running() if not pk else self._is_dream_memory_running()
-            )
-        )
-        if not other_running:
-            self.btn_start_loop.configure(state=tk.DISABLED if running else tk.NORMAL)
-            self._configure_once_action_buttons(enabled=not running)
-            self.btn_alliance_start.configure(state=tk.DISABLED if running else tk.NORMAL)
-            self.btn_alliance_admin_start.configure(
-                state=tk.DISABLED if running else tk.NORMAL
-            )
-        other_widgets = self._dream_pk_widgets if not pk else self._dream_widgets
-        if other_widgets is not None and not (
-            self._is_dream_pk_running() if not pk else self._is_dream_memory_running()
-        ):
-            other_widgets.btn_start.configure(
-                state=tk.DISABLED if running else tk.NORMAL
-            )
+        _ = running
+        _ = pk
+        self._update_run_control_buttons()
 
     def _set_dream_memory_buttons(self, running: bool) -> None:
         self._set_dream_buttons(running, pk=False)
 
     def _set_dream_pk_buttons(self, running: bool) -> None:
         self._set_dream_buttons(running, pk=True)
+
+    def _current_task_tab_name(self) -> str:
+        notebook = getattr(self, "_task_notebook", None)
+        if notebook is None:
+            return ""
+        try:
+            return notebook.tab(notebook.select(), "text")
+        except tk.TclError:
+            return ""
+
+    def _start_from_current_tab(self) -> None:
+        """根据当前运行任务 Tab 启动对应内容。"""
+        tab_name = self._current_task_tab_name()
+        dispatch = {
+            "循环任务": self._start_loop,
+            "一次性任务": self._run_once_batch,
+            "联盟总动员自动刷新": self._start_alliance_mobilization,
+            "联盟管理员刷新": self._start_alliance_admin,
+            "寻梦记忆": lambda: self._start_dream_session(pk=False),
+            "寻梦记忆PK": lambda: self._start_dream_session(pk=True),
+        }
+        handler = dispatch.get(tab_name)
+        if handler is None:
+            messagebox.showwarning("提示", f"当前 Tab「{tab_name or '未知'}」无法启动")
+            return
+        handler()
+
+    def _stop_running_tasks(self) -> None:
+        """按当前实际运行类型结束，不看 Tab。"""
+        if not self._is_any_running():
+            self._on_status("当前没有运行中的任务")
+            self._update_run_control_buttons()
+            return
+        if self._is_loop_running():
+            self._stop_loop()
+        if self._is_once_running():
+            self._stop_once()
+        if self._is_alliance_regular_running():
+            self._stop_alliance_mobilization()
+        if self._is_alliance_admin_running():
+            self._stop_alliance_admin()
+        if self._is_dream_memory_running():
+            self._stop_dream_session(pk=False)
+        if self._is_dream_pk_running():
+            self._stop_dream_session(pk=True)
 
     def _ensure_device(self) -> bool:
         adb = self._get_adb()

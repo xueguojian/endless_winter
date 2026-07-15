@@ -5,7 +5,10 @@ from __future__ import annotations
 import io
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +18,69 @@ from PIL import Image
 _WIN_SUBPROCESS_FLAGS = 0
 if sys.platform == "win32":
     _WIN_SUBPROCESS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# 进程内串行，避免同进程多线程同时 spawn adb.exe
+_THREAD_ADB_LOCK = threading.RLock()
+
+# 跨进程串行（双开 GUI 共用同一个雷电 adb.exe 时大幅降低 0xc0000142）
+_ADB_LOCK_PATH = Path(tempfile.gettempdir()) / "endless_winter_adb.lock"
+_ADB_RETRY_COUNT = 4
+_ADB_RETRY_BASE_DELAY = 0.6
+
+
+class AdbUnavailableError(RuntimeError):
+    """ADB 进程/连接不可用（含长时间双开后的 0xc0000142）。"""
+
+
+@contextmanager
+def _cross_process_adb_lock(timeout: float = 45.0):
+    """用临时文件锁串行化本机多脚本对 adb.exe 的调用。"""
+    _ADB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(_ADB_LOCK_PATH, "a+b")
+    deadline = time.time() + timeout
+    locked = False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if time.time() >= deadline:
+                        raise TimeoutError("等待 ADB 跨进程锁超时")
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except OSError:
+                    if time.time() >= deadline:
+                        raise TimeoutError("等待 ADB 跨进程锁超时")
+                    time.sleep(0.05)
+        yield
+    finally:
+        if locked:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
 
 
 class AdbClient:
@@ -43,6 +109,7 @@ class AdbClient:
         self.adb = self._resolve_adb(adb_path)
         self.touch_width = touch_width
         self.touch_height = touch_height
+        self._fail_streak = 0
 
     @classmethod
     def resolve_adb_path(cls, adb_path: str = "") -> str:
@@ -152,17 +219,72 @@ class AdbClient:
         logger.info(f"ADB 已连接设备: {devices or '无'}")
         return devices
 
+    def _spawn(
+        self,
+        args: list[str],
+        *,
+        timeout: int,
+        binary: bool = False,
+    ) -> subprocess.CompletedProcess:
+        kwargs: dict = {
+            "capture_output": True,
+            "timeout": timeout,
+            "creationflags": _WIN_SUBPROCESS_FLAGS,
+            "stdin": subprocess.DEVNULL,
+        }
+        if not binary:
+            kwargs.update(text=True, encoding="utf-8", errors="replace")
+        return subprocess.run([self.adb, *args], **kwargs)
+
+    def _recover_connection(self) -> None:
+        """尽量恢复连接，不 kill-server（会打断另一开脚本）。"""
+        try:
+            self._spawn(["start-server"], timeout=10)
+        except Exception as exc:
+            logger.warning(f"ADB start-server 失败: {exc}")
+        try:
+            self._spawn(["connect", self.address], timeout=8)
+        except Exception as exc:
+            logger.warning(f"ADB reconnect 失败: {exc}")
+
+    def _run_once(self, *args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+        cmd_preview = " ".join([self.adb, *args])
+        logger.debug(f"ADB: {cmd_preview}")
+        return self._spawn(list(args), timeout=timeout, binary=False)
+
     def _run(self, *args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
-        cmd = [self.adb, *args]
-        logger.debug(f"ADB: {' '.join(cmd)}")
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=_WIN_SUBPROCESS_FLAGS,
+        last_error: Exception | None = None
+        last_result: subprocess.CompletedProcess[str] | None = None
+
+        with _THREAD_ADB_LOCK:
+            with _cross_process_adb_lock():
+                for attempt in range(1, _ADB_RETRY_COUNT + 1):
+                    try:
+                        result = self._run_once(*args, timeout=timeout)
+                        last_result = result
+                        if result.returncode == 0:
+                            self._fail_streak = 0
+                            return result
+                        logger.warning(
+                            f"ADB 返回码 {result.returncode} "
+                            f"({attempt}/{_ADB_RETRY_COUNT}): "
+                            f"{(result.stderr or result.stdout).strip()[:200]}"
+                        )
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        last_error = exc
+                        logger.warning(
+                            f"ADB 进程异常 ({attempt}/{_ADB_RETRY_COUNT}): {exc}"
+                        )
+
+                    self._fail_streak += 1
+                    if attempt < _ADB_RETRY_COUNT:
+                        self._recover_connection()
+                        time.sleep(_ADB_RETRY_BASE_DELAY * attempt)
+
+        if last_result is not None:
+            return last_result
+        raise AdbUnavailableError(
+            f"ADB 无法启动（可能双开过久导致 adb.exe 0xc0000142）: {last_error}"
         )
 
     def connect(self) -> bool:
@@ -189,7 +311,7 @@ class AdbClient:
     def shell(self, command: str) -> str:
         result = self._run("-s", self.address, "shell", command)
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "ADB shell 命令失败")
+            raise AdbUnavailableError(result.stderr.strip() or "ADB shell 命令失败")
         return result.stdout.strip()
 
     def get_screen_size(self) -> tuple[int, int]:
@@ -200,18 +322,50 @@ class AdbClient:
 
     def screenshot(self) -> np.ndarray:
         """截取屏幕，返回 BGR 数组，shape=(height, width)，与 input tap 同一竖屏坐标系。"""
-        proc = subprocess.run(
-            [self.adb, "-s", self.address, "exec-out", "screencap", "-p"],
-            capture_output=True,
-            timeout=15,
-            creationflags=_WIN_SUBPROCESS_FLAGS,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError("截图失败，请确认模拟器已启动且 ADB 已连接")
+        last_error: Exception | None = None
 
-        image = Image.open(io.BytesIO(proc.stdout)).convert("RGB")
-        rgb = np.array(image)
-        return rgb[:, :, ::-1].copy()
+        with _THREAD_ADB_LOCK:
+            with _cross_process_adb_lock():
+                for attempt in range(1, _ADB_RETRY_COUNT + 1):
+                    try:
+                        proc = self._spawn(
+                            ["-s", self.address, "exec-out", "screencap", "-p"],
+                            timeout=15,
+                            binary=True,
+                        )
+                        if proc.returncode == 0 and proc.stdout:
+                            image = Image.open(io.BytesIO(proc.stdout)).convert("RGB")
+                            rgb = np.array(image)
+                            self._fail_streak = 0
+                            return rgb[:, :, ::-1].copy()
+                        last_error = RuntimeError(
+                            f"returncode={proc.returncode}, bytes={len(proc.stdout or b'')}"
+                        )
+                        logger.warning(
+                            f"截图失败 ({attempt}/{_ADB_RETRY_COUNT}): {last_error}"
+                        )
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        last_error = exc
+                        logger.warning(
+                            f"截图进程异常 ({attempt}/{_ADB_RETRY_COUNT}): {exc}"
+                        )
+                    except Exception as exc:
+                        last_error = exc
+                        logger.warning(
+                            f"截图解析失败 ({attempt}/{_ADB_RETRY_COUNT}): {exc}"
+                        )
+
+                    self._fail_streak += 1
+                    if attempt < _ADB_RETRY_COUNT:
+                        self._recover_connection()
+                        time.sleep(_ADB_RETRY_BASE_DELAY * attempt)
+
+        raise AdbUnavailableError(
+            "截图失败，请确认模拟器已启动且 ADB 已连接"
+            "（双开长时间运行若弹出 adb.exe 0xc0000142，请完全退出两侧脚本后重开，"
+            "或在任务管理器结束多余 adb.exe）"
+            + (f"；详情: {last_error}" if last_error else "")
+        )
 
     def tap(self, x: int, y: int) -> None:
         x = max(0, min(x, self.touch_width - 1))

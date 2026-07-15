@@ -11,7 +11,7 @@ from typing import Callable
 import cv2
 from loguru import logger
 
-from core.adb_client import AdbClient
+from core.adb_client import AdbClient, AdbUnavailableError
 from core.navigation import WildernessNavigator
 from core.vision import MatchResult, Vision
 
@@ -1009,6 +1009,11 @@ class HuntIceBeastTask:
             self._emit(str(exc))
             self._emit("退回野外，等待下次循环")
             self._wilderness.try_return_to_wilderness()
+            return False
+        except AdbUnavailableError as exc:
+            logger.exception(f"[{self.name}] ADB 不可用，延长等待后继续循环")
+            self._emit(f"本轮异常：{exc}，将等待后重试")
+            time.sleep(30)
             return False
         except Exception as exc:
             logger.exception(f"[{self.name}] 执行失败，恢复界面后继续循环")

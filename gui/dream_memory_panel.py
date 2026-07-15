@@ -10,7 +10,6 @@ from tkinter import filedialog, messagebox, ttk
 
 from core.dream_memory.config import (
     TAP_INTERVAL_LABELS,
-    format_tap_interval_hint,
     load_dream_memory_config,
     load_dream_memory_pk_config,
     normalize_tap_between_interval,
@@ -336,42 +335,9 @@ def build_dream_tab(
     )
     widgets.lbl_ocr.pack(anchor=tk.W, pady=(0, 6))
 
-    if pk:
-        usage = (
-            "PK 模式：扫描与点击解耦。每个物品整局只入队一次，重复扫描不再入队；"
-            f"扫描间隔 {dm_cfg.scan_interval:g}s，{format_tap_interval_hint(dm_cfg)}。"
-        )
-    else:
-        usage = (
-            "用法：模拟器内手动进入寻梦记忆关卡 → 本页选地图 → 点「开始游戏」"
-            " → 脚本 OCR 底栏并点击 → 关卡结束点「结束」。"
-            f"支持模糊匹配；未匹配地图不点击。{format_tap_interval_hint(dm_cfg)}，"
-            f"扫描 {dm_cfg.scan_interval:g}s。"
-        )
-    ttk.Label(
-        parent,
-        text=usage,
-        wraplength=480,
-        justify=tk.LEFT,
-        foreground="gray",
-    ).pack(anchor=tk.W, pady=(0, 8))
-
-    btn_row = ttk.Frame(parent)
-    btn_row.pack(fill=tk.X)
+    # 开始/结束统一在主界面运行区，此处按钮仅作内部状态兼容，不展示
     widgets.btn_start.configure(text="开始游戏", command=on_start, width=10)
-    widgets.btn_start.pack(side=tk.LEFT, padx=(0, 8))
     widgets.btn_stop.configure(text="结束", command=on_stop, width=10, state=tk.DISABLED)
-    widgets.btn_stop.pack(side=tk.LEFT)
-
-    cal_hint = "标定：选地图 → 点「标定地图」→ 模拟器截图 → 点击物品 → 填名称 → 写入地图"
-    ttk.Label(
-        parent,
-        text=cal_hint,
-        font=("", 8),
-        foreground="gray",
-        wraplength=480,
-        justify=tk.LEFT,
-    ).pack(anchor=tk.W, pady=(8, 0))
 
     cmb_map.bind("<<ComboboxSelected>>", lambda _e: on_map_changed())
     return widgets
