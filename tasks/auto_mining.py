@@ -12,6 +12,7 @@ from typing import Callable
 from loguru import logger
 
 from core.adb_client import AdbClient
+from core.deploy_march import find_march_button
 from core.navigation import WildernessNavigator
 from core.search_level import (
     adjust_search_level,
@@ -347,12 +348,49 @@ class AutoMiningTask:
     def _configure_mining_heroes(self, resource: MiningResource) -> None:
         self._verify_mining_hero(resource)
         self._emit("移除第 2、3 位英雄")
-        self._tap("hero_remove_2", delay=0.8)
-        self._tap("hero_remove_3", delay=0.8)
+        self._tap("hero_remove_2", delay=1.2)
+        self._tap("hero_remove_3", delay=1.2)
+        # 卸英雄后界面刷新较慢，等稳再出征
+        time.sleep(1.5)
+
+    def _resolve_march_tap(self) -> tuple[int, int, float, bool]:
+        fallback = tuple(self.coords.get("march", [560, 1200]))
+        result = find_march_button(self.adb.screenshot())
+        if result.found:
+            return result.center[0], result.center[1], result.confidence, True
+        return fallback[0], fallback[1], result.confidence, False
 
     def _tap_march(self) -> None:
-        self._emit("出征")
-        self._tap("march", delay=1.5)
+        """点击出征；优先固定坐标，点完确认已离开出征界面。"""
+        last_conf = 0.0
+        for attempt in range(3):
+            if self._interrupted():
+                raise InterruptedError("任务已停止")
+            # 坐标本身无问题：优先用配置坐标，匹配仅作日志参考
+            cx, cy = tuple(self.coords.get("march", [560, 1200]))
+            matched_cx, matched_cy, conf, matched = self._resolve_march_tap()
+            last_conf = conf
+            if matched:
+                self._emit(
+                    f"出征 @ ({cx},{cy})（配置坐标；按钮匹配 {conf:.2f} @ "
+                    f"({matched_cx},{matched_cy})）"
+                )
+            else:
+                self._emit(f"出征 @ ({cx},{cy})（配置坐标）")
+            self._tap_xy(cx, cy, delay=2.0)
+
+            time.sleep(1.2)
+            still = find_march_button(self.adb.screenshot())
+            if not still.found:
+                return
+            self._emit(
+                f"出征未生效（仍在出征界面，匹配 {still.confidence:.2f}），"
+                f"重试 {attempt + 1}/3"
+            )
+            time.sleep(1.0)
+        raise RuntimeError(
+            f"点击出征后仍停留在出征界面（最高匹配 {last_conf:.2f}），请检查出征按钮"
+        )
 
     def _run_single_resource(self, resource: MiningResource, *, is_first: bool) -> bool:
         if is_first:
