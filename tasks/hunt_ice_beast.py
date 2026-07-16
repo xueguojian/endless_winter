@@ -150,9 +150,8 @@ class HuntIceBeastTask:
         step_delay: float = 1.5,
         use_stamina: bool = True,
         stamina_can_limit: int = DEFAULT_STAMINA_CAN_LIMIT,
-        check_march_heroes: bool = True,
         use_formation: bool = True,
-        adjust_level: bool = True,
+        adjust_level: bool = False,
         on_status: StatusCallback | None = None,
     ):
         self.adb = adb
@@ -161,7 +160,6 @@ class HuntIceBeastTask:
         self.beast_level = beast_level
         self.default_beast_level = default_beast_level
         self.formation_name = str(formation_name).strip()
-        self.check_march_heroes = check_march_heroes
         self.use_formation = use_formation
         self.adjust_level = adjust_level
         if rally_duration_minutes not in RALLY_TIME_COORDS:
@@ -448,7 +446,6 @@ class HuntIceBeastTask:
             self.beast_level,
             emit=self._emit,
             interrupted=self._interrupted,
-            on_first_tap=self._dismiss_dialog if "dialog_cancel" in self.coords else None,
         )
         self._level_already_adjusted = True
 
@@ -649,16 +646,16 @@ class HuntIceBeastTask:
         self._emit(f"已选择编队槽位 {slot}")
 
     def _prepare_march(self) -> None:
-        """出征前准备：启用编队则选槽位，否则等待出征界面后直接出征。"""
+        """出征前准备：启用编队则选槽位并校验英雄，否则直接等出征界面。"""
         if self.use_formation:
             self._select_formation()
             return
-        self._emit("未启用编队，跳过编队槽位")
+        self._emit("未启用编队，跳过编队选择与英雄校验")
         self._wait_for_deploy_screen()
 
     def _check_march_heroes(self) -> None:
-        """出征前检查英雄栏三个槽位是否均已上阵。"""
-        if not self.check_march_heroes:
+        """出征前检查英雄栏三个槽位是否均已上阵（仅启用编队时）。"""
+        if not self.use_formation:
             return
         # _prepare_march 已确认出征页；换编队后数字变化会导致「出征」模板抖动，
         # 这里不再二次 15s 严格等待，短暂落定后直接检英雄。
@@ -1004,8 +1001,7 @@ class HuntIceBeastTask:
         )
         self._emit(
             f"目标 {self.beast_level} 级冰原巨兽，间隔 {int(self.interval // 60)} 分钟，"
-            f"{formation_desc}，"
-            f"检查出征英雄：{'是' if self.check_march_heroes else '否'}"
+            f"{formation_desc}"
         )
 
         try:

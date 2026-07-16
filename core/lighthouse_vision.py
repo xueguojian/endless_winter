@@ -275,8 +275,11 @@ def _patch_vivid_ratio(hsv: np.ndarray, center: tuple[int, int], radius: int = 2
     patch = hsv[y1:y2, x1:x2]
     if patch.size == 0:
         return 0.0
-    sat, val = patch[:, :, 1], patch[:, :, 2]
-    return float(((sat > 100) & (val > 130)).mean())
+    hue, sat, val = patch[:, :, 0], patch[:, :, 1], patch[:, :, 2]
+    # 橙/蓝图钉较亮；帐篷紫偏暗，单独放宽 V
+    bright = (sat > 100) & (val > 130)
+    purple = ((hue >= 125) & (hue <= 175)) & (sat > 90) & (val > 70)
+    return float((bright | purple).mean())
 
 
 def _pin_diff_support(
@@ -1743,9 +1746,10 @@ def _build_vivid_pin_mask(hsv: np.ndarray) -> np.ndarray:
     mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
     for lower, upper in (
         ((10, 120, 140), (30, 255, 255)),
-        ((125, 55, 100), (155, 255, 255)),
+        # 帐篷紫偏暗，V 下限到 70，避免漏检
+        ((125, 55, 70), (155, 255, 255)),
         ((98, 65, 110), (118, 255, 255)),
-        ((155, 80, 140), (175, 255, 255)),
+        ((155, 80, 70), (175, 255, 255)),
     ):
         mask = cv2.bitwise_or(
             mask, cv2.inRange(hsv, np.array(lower), np.array(upper))
@@ -1856,10 +1860,10 @@ def _accept_pin_candidate(
         return None
 
     snapped, vivid = _snap_to_vivid_peak(hsv, refined, roi_offset)
-    if vivid >= BG_DIFF_VIVID_MIN:
-        refined = snapped
-    elif confidence < BG_DIFF_VIVID_MIN and diff_ratio < 0.40:
+    # 空雪地/飞机等无图钉色区域：差分再大也不接受
+    if vivid < BG_DIFF_VIVID_MIN:
         return None
+    refined = snapped
     if _is_plane_point(refined):
         return None
     if not _screen_center_in_map(refined):

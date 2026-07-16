@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import queue
+import random
+import re
 import threading
 import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
+import cv2
 import yaml
 
 from core.adb_client import AdbClient
+from core.common_task_opts import apply_common_options, resolve_common_options
 from core.config_path import (
     default_instance_name,
     ensure_config_file,
@@ -19,8 +23,13 @@ from core.config_path import (
 )
 from core.dream_memory.config import load_dream_memory_config, load_dream_memory_pk_config
 from core.dream_memory.maps import delete_map, list_maps, load_map, rename_map_name
-from core.dream_memory.ocr_engine import ocr_engine_available, resolve_ocr_engine, warmup_ocr
-from core.navigation import return_to_main_screen
+from core.dream_memory.ocr_engine import (
+    ocr_chip_text,
+    ocr_engine_available,
+    resolve_ocr_engine,
+    warmup_ocr,
+)
+from core.navigation import WildernessNavigator, return_to_main_screen
 from gui.coord_ruler import CoordRulerWindow
 from gui.dream_memory_calibrator import DreamMemoryCalibratorWindow
 from gui.dream_memory_panel import (
@@ -60,6 +69,10 @@ from tasks.collect_commander_supplies import (
     CollectCommanderSuppliesTask,
     merge_task_config as merge_commander_config,
 )
+from tasks.auto_shop_exchange import (
+    AutoShopExchangeTask,
+    merge_task_config as merge_shop_exchange_config,
+)
 from tasks.collect_pet_supplies import (
     CollectPetSuppliesTask,
     merge_task_config as merge_pet_supplies_config,
@@ -93,6 +106,26 @@ ONCE_TASK_GAP_SEC = 3
 ONCE_TASK_COLUMNS = 2
 LOOP_TASK_COLUMNS = 2
 
+# 启动时随机挑选一个窗口标题
+WINDOW_TITLE_POOL: tuple[str, ...] = (
+    "永冬裁决 · 极寒统御者",
+    "霜原统帅 · 无尽寒锋",
+    "极寒主宰 · 永夜猎杀令",
+    "永冬猎手 · 霜刃裁决台",
+    "无尽寒锋 · 冰原指挥官",
+    "霜月裁决 · 永冬核心引擎",
+    "极地统御 · 寒域主宰者",
+    "永冬引擎 · 霜原猎杀者",
+    "寒锋破晓 · 无尽冬日统帅",
+    "霜刃永夜 · 极寒裁决者",
+    "永冬裂隙 · 冰原征服者",
+    "寒域敕令 · 霜原铁腕",
+)
+
+# 个人主页：头像入口与昵称 OCR 区域（720×1280）
+ACCOUNT_PROFILE_TAP = (42, 52)
+ACCOUNT_NAME_ROI = (284, 878, 606, 926)
+
 FORMATION_SLOT_MIN = 1
 FORMATION_SLOT_MAX = 8
 
@@ -102,7 +135,7 @@ FORM_INPUT_PADX = (14, 0)
 
 MINING_LEVEL_MIN = 1
 MINING_LEVEL_MAX = 8
-MINING_LEVEL_DEFAULT_MIN = 5
+MINING_LEVEL_DEFAULT_MIN = 8
 MINING_LEVEL_DEFAULT_MAX = 8
 
 
@@ -125,13 +158,11 @@ def _normalize_mining_level(raw, default: int = MINING_LEVEL_MIN) -> int:
 
 
 def _normalize_mining_range(level_min, level_max) -> tuple[int, int]:
-    """规范采矿范围，保证 min < max。"""
-    low = _normalize_mining_level(level_min, MINING_LEVEL_MIN)
-    high = _normalize_mining_level(level_max, MINING_LEVEL_MAX)
-    if high <= low:
-        high = min(MINING_LEVEL_MAX, low + 1)
-    if high <= low:
-        low = max(MINING_LEVEL_MIN, high - 1)
+    """规范采矿范围，允许 min == max。"""
+    low = _normalize_mining_level(level_min, MINING_LEVEL_DEFAULT_MIN)
+    high = _normalize_mining_level(level_max, MINING_LEVEL_DEFAULT_MAX)
+    if high < low:
+        low, high = high, low
     return low, high
 
 
@@ -210,7 +241,7 @@ class EndlessWinterApp(tk.Tk):
         self._once_tasks: list = []
         self._task_vars: dict[str, tk.BooleanVar] = {}
         self._adb: AdbClient | None = None
-        self._log_visible = False
+        self._log_visible = True
         self._coord_ruler_window: CoordRulerWindow | None = None
         self._dream_memory_calibrator: DreamMemoryCalibratorWindow | None = None
         self._dream_pk_calibrator: DreamMemoryCalibratorWindow | None = None
@@ -229,6 +260,8 @@ class EndlessWinterApp(tk.Tk):
         self._alliance_admin_worker: threading.Thread | None = None
         self._alliance_admin_session: AllianceMobilizationAdminSession | None = None
         self._alliance_type_bg_vars: dict[str, dict[str, tk.BooleanVar]] = {}
+        self._account_check_worker: threading.Thread | None = None
+        self._account_check_stop_event = threading.Event()
 
         self._build_ui()
         self._poll_log_queue()
@@ -239,25 +272,18 @@ class EndlessWinterApp(tk.Tk):
         with open(self.config_path, encoding="utf-8") as f:
             return yaml.safe_load(f)
 
-    def _instance_name_value(self) -> str:
-        if hasattr(self, "var_instance_name"):
-            name = self.var_instance_name.get().strip()
-            if name:
-                return name
-        return default_instance_name(self.config, self.config_path)
+    def _account_name_value(self) -> str:
+        gui = self.config.get("gui", {})
+        name = str(gui.get("account_name", "")).strip()
+        return name
 
     def _update_window_title(self) -> None:
-        self.title(f"无尽冬日 — 自动脚本 【{self._instance_name_value()}】")
+        self.title(random.choice(WINDOW_TITLE_POOL))
 
-    def _on_instance_name_changed(self, *_args) -> None:
-        name = self.var_instance_name.get().strip()
-        if not name:
-            self.var_instance_name.set(default_instance_name(self.config, self.config_path))
-        self._update_window_title()
-        try:
-            self._save_config()
-        except ValueError:
-            pass
+    def _set_account_name_display(self, name: str) -> None:
+        text = name.strip() if name and name.strip() else "未知"
+        if hasattr(self, "lbl_account_name"):
+            self.lbl_account_name.configure(text=text)
 
     def _task_enabled_in_config(self, entry: TaskEntry) -> bool:
         task_cfg = self.config.get("tasks", {}).get(entry.config_key, {})
@@ -300,17 +326,20 @@ class EndlessWinterApp(tk.Tk):
         cfg = self.config
         tasks = cfg.setdefault("tasks", {})
 
+        common_opts = {
+            "use_formation": bool(self.var_common_use_formation.get()),
+            "adjust_level": bool(self.var_common_adjust_level.get()),
+            "use_stamina": bool(self.var_common_use_stamina.get()),
+            "stamina_can_limit": int(self.var_common_stamina_can_limit.get()),
+        }
+        apply_common_options(tasks, common_opts)
+
         ice = tasks.setdefault("hunt_ice_beast", {})
         ice["enabled"] = bool(self._task_vars["hunt_ice_beast"].get())
         ice["interval"] = int(self.var_interval.get()) * 60
         ice["beast_level"] = int(self.var_level.get())
-        ice["adjust_level"] = bool(self.var_adjust_beast_level.get())
         ice["formation_name"] = str(_normalize_formation_slot(self.var_formation_slot.get()))
-        ice["check_march_heroes"] = bool(self.var_check_march_heroes.get())
-        ice["use_formation"] = bool(self.var_use_formation.get())
         ice["rally_duration_minutes"] = int(self.var_rally_duration.get())
-        ice["use_stamina"] = bool(self.var_use_stamina.get())
-        ice["stamina_can_limit"] = int(self.var_ice_stamina_can_limit.get())
 
         lighthouse = tasks.setdefault("auto_lighthouse", {})
         lighthouse["enabled"] = bool(self._task_vars["auto_lighthouse"].get())
@@ -318,9 +347,6 @@ class EndlessWinterApp(tk.Tk):
         lighthouse["formation_slot"] = int(
             _normalize_formation_slot(self.var_lighthouse_formation_slot.get())
         )
-        lighthouse["use_stamina"] = bool(self.var_lighthouse_use_stamina.get())
-        lighthouse["stamina_can_limit"] = int(self.var_lighthouse_stamina_can_limit.get())
-        lighthouse["check_march_heroes"] = bool(self.var_lighthouse_check_march_heroes.get())
         lighthouse["event_period"] = bool(self.var_lighthouse_event_period.get())
         lighthouse["monster_cooldown"] = int(self.var_lighthouse_monster_cooldown.get()) * 60
         merged_lighthouse = merge_lighthouse_config(lighthouse)
@@ -331,14 +357,9 @@ class EndlessWinterApp(tk.Tk):
         monster["enabled"] = bool(self._task_vars["hunt_monster"].get())
         monster["interval"] = int(self.var_monster_interval.get()) * 60
         monster["monster_level"] = int(self.var_monster_level.get())
-        monster["adjust_level"] = bool(self.var_adjust_monster_level.get())
         monster["formation_name"] = str(
             _normalize_formation_slot(self.var_monster_formation_slot.get())
         )
-        monster["check_march_heroes"] = bool(self.var_monster_check_march_heroes.get())
-        monster["use_formation"] = bool(self.var_monster_use_formation.get())
-        monster["use_stamina"] = bool(self.var_monster_use_stamina.get())
-        monster["stamina_can_limit"] = int(self.var_monster_stamina_can_limit.get())
         donate = tasks.setdefault("donate_alliance_supplies", {})
         donate["enabled"] = bool(self._task_vars["donate_alliance_supplies"].get())
         donate["interval"] = int(self.var_donate_interval.get()) * 60
@@ -350,12 +371,11 @@ class EndlessWinterApp(tk.Tk):
         mining = tasks.setdefault("auto_mining", {})
         level_min = _normalize_mining_level(self.var_mining_level_min.get())
         level_max = _normalize_mining_level(self.var_mining_level_max.get())
-        if level_max <= level_min:
-            raise ValueError("采矿范围无效：后面的等级必须大于前面的等级")
+        if level_max < level_min:
+            raise ValueError("采矿范围无效：最高等级不能低于最低等级")
         mining["enabled"] = bool(self._task_vars["auto_mining"].get())
         mining["interval"] = int(self.var_mining_interval.get()) * 60
         mining["use_mining_hero"] = bool(self.var_use_mining_hero.get())
-        mining["adjust_level"] = bool(self.var_adjust_mining_level.get())
         mining["level_min"] = level_min
         mining["level_max"] = level_max
         merged_mining = merge_mining_config(mining)
@@ -392,13 +412,24 @@ class EndlessWinterApp(tk.Tk):
                 merged = merge_pet_supplies_config(section)
                 section["step_delay"] = merged["step_delay"]
                 section["coords"] = merged["coords"]
+            if entry.task_id == "auto_shop_exchange":
+                merged = merge_shop_exchange_config(section)
+                section["step_delay"] = merged["step_delay"]
+                section["coords"] = merged["coords"]
 
         gui = cfg.setdefault("gui", {})
         gui["show_console"] = bool(self.var_show_console.get())
         gui["log_visible"] = self._log_visible
-        if hasattr(self, "var_instance_name"):
-            name = self.var_instance_name.get().strip()
-            gui["instance_name"] = name or default_instance_name(cfg, self.config_path)
+        gui["instance_name"] = default_instance_name(cfg, self.config_path)
+        account = self._account_name_value()
+        if hasattr(self, "lbl_account_name"):
+            shown = self.lbl_account_name.cget("text").strip()
+            if shown and shown not in ("未知", "未识别"):
+                account = shown
+        if account:
+            gui["account_name"] = account
+        elif "account_name" not in gui:
+            gui["account_name"] = ""
 
         if hasattr(self, "var_device_serial"):
             serial = self.var_device_serial.get().strip()
@@ -488,13 +519,36 @@ class EndlessWinterApp(tk.Tk):
         with open(self.config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
 
+    def _update_formation_spinboxes_state(self) -> None:
+        enabled = bool(self.var_common_use_formation.get())
+        for spin in (
+            getattr(self, "_ice_formation_spinbox", None),
+            getattr(self, "_monster_formation_spinbox", None),
+            getattr(self, "_lighthouse_formation_spinbox", None),
+        ):
+            if spin is None:
+                continue
+            spin.state(["!disabled"] if enabled else ["disabled"])
+
+    def _update_common_stamina_limit_state(self) -> None:
+        self._set_stamina_limit_spin_state(
+            getattr(self, "spn_common_stamina_can_limit", None),
+            bool(self.var_common_use_stamina.get()),
+        )
+
+    def _on_common_use_formation_changed(self) -> None:
+        self._update_formation_spinboxes_state()
+        try:
+            self._save_config()
+        except ValueError:
+            pass
+
+    def _on_common_use_stamina_changed(self) -> None:
+        self._update_common_stamina_limit_state()
+        self._save_config()
+
     def _update_ice_formation_state(self) -> None:
-        if not hasattr(self, "_ice_formation_spinbox"):
-            return
-        if bool(self.var_use_formation.get()):
-            self._ice_formation_spinbox.state(["!disabled"])
-        else:
-            self._ice_formation_spinbox.state(["disabled"])
+        self._update_formation_spinboxes_state()
 
     def _set_stamina_limit_spin_state(self, spinbox: ttk.Spinbox | None, enabled: bool) -> None:
         if spinbox is None:
@@ -502,56 +556,31 @@ class EndlessWinterApp(tk.Tk):
         spinbox.state(["!disabled"] if enabled else ["disabled"])
 
     def _update_ice_stamina_limit_state(self) -> None:
-        self._set_stamina_limit_spin_state(
-            getattr(self, "spn_ice_stamina_can_limit", None),
-            bool(self.var_use_stamina.get()),
-        )
+        self._update_common_stamina_limit_state()
 
     def _update_monster_stamina_limit_state(self) -> None:
-        self._set_stamina_limit_spin_state(
-            getattr(self, "spn_monster_stamina_can_limit", None),
-            bool(self.var_monster_use_stamina.get()),
-        )
+        self._update_common_stamina_limit_state()
 
     def _update_lighthouse_stamina_limit_state(self) -> None:
-        self._set_stamina_limit_spin_state(
-            getattr(self, "spn_lighthouse_stamina_can_limit", None),
-            bool(self.var_lighthouse_use_stamina.get()),
-        )
+        self._update_common_stamina_limit_state()
 
     def _on_ice_use_stamina_changed(self) -> None:
-        self._update_ice_stamina_limit_state()
-        self._save_config()
+        self._on_common_use_stamina_changed()
 
     def _on_monster_use_stamina_changed(self) -> None:
-        self._update_monster_stamina_limit_state()
-        self._save_config()
+        self._on_common_use_stamina_changed()
 
     def _on_lighthouse_use_stamina_changed(self) -> None:
-        self._update_lighthouse_stamina_limit_state()
-        self._save_config()
+        self._on_common_use_stamina_changed()
 
     def _update_monster_formation_state(self) -> None:
-        if not hasattr(self, "_monster_formation_spinbox"):
-            return
-        if bool(self.var_monster_use_formation.get()):
-            self._monster_formation_spinbox.state(["!disabled"])
-        else:
-            self._monster_formation_spinbox.state(["disabled"])
+        self._update_formation_spinboxes_state()
 
     def _on_use_formation_changed(self) -> None:
-        self._update_ice_formation_state()
-        try:
-            self._save_config()
-        except ValueError:
-            pass
+        self._on_common_use_formation_changed()
 
     def _on_monster_use_formation_changed(self) -> None:
-        self._update_monster_formation_state()
-        try:
-            self._save_config()
-        except ValueError:
-            pass
+        self._on_common_use_formation_changed()
 
     def _select_param_tab_by_name(self, tab_name: str) -> None:
         notebook = getattr(self, "_param_notebook", None)
@@ -748,7 +777,9 @@ class EndlessWinterApp(tk.Tk):
             int(dev_cfg.get("adb_port", 5555)),
         )
 
-        self._log_visible = bool(gui_cfg.get("log_visible", False))
+        self._log_visible = bool(gui_cfg.get("log_visible", True))
+        self.var_show_console = tk.BooleanVar(value=bool(gui_cfg.get("show_console", True)))
+        self._build_menu_bar()
 
         self._container = ttk.Frame(self)
         self._container.pack(fill=tk.BOTH, expand=True)
@@ -758,67 +789,90 @@ class EndlessWinterApp(tk.Tk):
         self._left.pack(side=tk.LEFT, fill=tk.BOTH)
         self._left.pack_propagate(False)
 
-        # 底部固定：运行控制 + 系统，保证设备/标尺等按钮永远可见
+        # 底部固定：运行控制 + 设备；运行控制向上吃掉与「运行任务」之间的空隙
         bottom = ttk.Frame(self._left, padding=(10, 2, 10, 8))
-        bottom.pack(fill=tk.X, side=tk.BOTTOM)
+        bottom.pack(fill=tk.BOTH, expand=True, side=tk.BOTTOM)
 
-        run_frame = ttk.LabelFrame(bottom, text="运行控制", padding=4)
-        run_frame.pack(fill=tk.X, pady=(0, 4))
+        run_frame = ttk.LabelFrame(bottom, text="运行控制", padding=6)
+        run_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+
+        account_row = ttk.Frame(run_frame)
+        account_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(
+            account_row,
+            text="账号名称",
+            font=("", 11, "bold"),
+            foreground="#c45c00",
+        ).pack(side=tk.LEFT)
+        self.lbl_account_name = tk.Label(
+            account_row,
+            text="未知",
+            font=("", 16, "bold"),
+            foreground="#e67e22",
+            bg="#f0f0f0",
+        )
+        self.lbl_account_name.pack(side=tk.LEFT, padx=(10, 0))
+
         run_btn_row = ttk.Frame(run_frame)
         run_btn_row.pack(fill=tk.X)
         self.btn_start = ttk.Button(
-            run_btn_row, text="开始", command=self._start_from_current_tab, width=10
+            run_btn_row, text="开始", command=self._start_from_current_tab, width=8
         )
-        self.btn_start.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_start.pack(side=tk.LEFT, padx=(0, 6))
         self.btn_stop = ttk.Button(
             run_btn_row,
             text="结束",
             command=self._stop_running_tasks,
-            width=10,
+            width=8,
             state=tk.DISABLED,
         )
-        self.btn_stop.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_stop.pack(side=tk.LEFT, padx=(0, 6))
         self.btn_hosting = ttk.Button(
-            run_btn_row, text="一键托管", command=self._run_hosting_batch, width=10
+            run_btn_row, text="一键辅助", command=self._run_hosting_batch, width=8
         )
-        self.btn_hosting.pack(side=tk.LEFT)
-        self.lbl_status = ttk.Label(
-            run_btn_row, text="状态：待命", foreground="gray"
+        self.btn_hosting.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_quick_monster = ttk.Button(
+            run_btn_row,
+            text="一键打野",
+            command=lambda: self._start_quick_loop_task("hunt_monster"),
+            width=8,
         )
-        self.lbl_status.pack(side=tk.LEFT, padx=(12, 0))
+        self.btn_quick_monster.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_quick_ice = ttk.Button(
+            run_btn_row,
+            text="一键集结巨兽",
+            command=lambda: self._start_quick_loop_task("hunt_ice_beast"),
+            width=12,
+        )
+        self.btn_quick_ice.pack(side=tk.LEFT)
 
-        settings_frame = ttk.LabelFrame(bottom, text="系统", padding=6)
+        status_row = ttk.Frame(run_frame)
+        status_row.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self._status_lines: list[str] = ["待命"]
+        self.txt_status = tk.Text(
+            status_row,
+            height=2,
+            wrap=tk.WORD,
+            font=("", 9),
+            foreground="#555555",
+            bg="#f0f0f0",
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=0,
+            padx=2,
+            pady=2,
+        )
+        self.txt_status.pack(fill=tk.BOTH, expand=True)
+        self.txt_status.insert("1.0", "状态：待命")
+        self.txt_status.configure(state=tk.DISABLED)
+        # 兼容旧引用
+        self.lbl_status = self.txt_status
+
+        settings_frame = ttk.LabelFrame(bottom, text="设备", padding=6)
         settings_frame.pack(fill=tk.X)
 
-        name_row = ttk.Frame(settings_frame)
-        name_row.pack(fill=tk.X)
-
-        ttk.Label(name_row, text="实例名称").pack(side=tk.LEFT)
-        self.var_instance_name = tk.StringVar(
-            value=default_instance_name(self.config, self.config_path)
-        )
-        instance_entry = ttk.Entry(name_row, textvariable=self.var_instance_name, width=22)
-        instance_entry.pack(side=tk.LEFT, padx=(6, 0))
-        instance_entry.bind("<FocusOut>", self._on_instance_name_changed)
-        instance_entry.bind("<Return>", self._on_instance_name_changed)
-
-        ttk.Label(
-            settings_frame,
-            text=f"配置：{self.config_path.name}",
-            font=("", 8),
-            foreground="gray",
-        ).pack(anchor=tk.W, pady=(2, 0))
-
-        self.var_show_console = tk.BooleanVar(value=bool(gui_cfg.get("show_console", False)))
-        ttk.Checkbutton(
-            settings_frame,
-            text="启动时显示 CMD 窗口（调试用，下次启动 GUI 生效）",
-            variable=self.var_show_console,
-            command=self._save_config,
-        ).pack(anchor=tk.W)
-
         dev_row = ttk.Frame(settings_frame)
-        dev_row.pack(fill=tk.X, pady=(6, 0))
+        dev_row.pack(fill=tk.X)
 
         ttk.Label(dev_row, text="模拟器设备").pack(side=tk.LEFT)
         self.var_device_serial = tk.StringVar(value=default_device)
@@ -831,31 +885,90 @@ class EndlessWinterApp(tk.Tk):
         self.cmb_device.pack(side=tk.LEFT, padx=(6, 0))
         self.cmb_device.bind("<<ComboboxSelected>>", lambda _event: self._on_device_selected())
 
-        ttk.Button(dev_row, text="刷新", width=6, command=lambda: self._refresh_devices(probe=True)).pack(
-            side=tk.LEFT, padx=(6, 0)
+        ttk.Button(
+            dev_row,
+            text="刷新设备",
+            width=8,
+            command=lambda: self._refresh_devices(probe=True),
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            dev_row,
+            text="坐标标尺",
+            width=8,
+            command=self._open_coord_ruler,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        self.btn_check_account = ttk.Button(
+            dev_row,
+            text="检查账号名称",
+            command=self._start_check_account_name,
+            width=12,
         )
+        self.btn_check_account.pack(side=tk.LEFT, padx=(6, 0))
 
         sys_row = ttk.Frame(settings_frame)
         sys_row.pack(fill=tk.X, pady=(6, 0))
 
         self.lbl_conn = ttk.Label(sys_row, text="设备：未连接")
         self.lbl_conn.pack(side=tk.LEFT)
-
-        self.btn_toggle_log = ttk.Button(
-            sys_row, text="显示日志 ▸", width=12, command=self._toggle_log
-        )
-        self.btn_toggle_log.pack(side=tk.RIGHT)
-
-        ttk.Button(sys_row, text="测试连接", command=self._test_connection).pack(
-            side=tk.RIGHT, padx=(0, 8)
-        )
-
-        ttk.Button(sys_row, text="坐标标尺", command=self._open_coord_ruler, width=10).pack(
-            side=tk.RIGHT, padx=(0, 8)
-        )
+        ttk.Label(
+            sys_row,
+            text=f"配置：{self.config_path.name}",
+            font=("", 8),
+            foreground="gray",
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
         param_outer = ttk.LabelFrame(self._left, text="功能参数", padding=6)
         param_outer.pack(fill=tk.X, **pad)
+
+        common_opts = resolve_common_options(self.config.get("tasks", {}))
+
+        self.var_common_use_formation = tk.BooleanVar(
+            value=bool(common_opts["use_formation"])
+        )
+        self.var_common_adjust_level = tk.BooleanVar(
+            value=bool(common_opts["adjust_level"])
+        )
+        self.var_common_use_stamina = tk.BooleanVar(
+            value=bool(common_opts["use_stamina"])
+        )
+        self.var_common_stamina_can_limit = tk.IntVar(
+            value=int(common_opts["stamina_can_limit"])
+        )
+
+        common_frame = ttk.LabelFrame(param_outer, text="通用出征 / 搜索", padding=6)
+        common_frame.pack(fill=tk.X, pady=(0, 6))
+
+        common_row1 = ttk.Frame(common_frame)
+        common_row1.pack(fill=tk.X)
+        ttk.Checkbutton(
+            common_row1,
+            text="启用编队",
+            variable=self.var_common_use_formation,
+            command=self._on_common_use_formation_changed,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Checkbutton(
+            common_row1,
+            text="修改等级",
+            variable=self.var_common_adjust_level,
+            command=self._save_config,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Checkbutton(
+            common_row1,
+            text="自动使用罐头",
+            variable=self.var_common_use_stamina,
+            command=self._on_common_use_stamina_changed,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(common_row1, text="罐头数量").pack(side=tk.LEFT)
+        self.spn_common_stamina_can_limit = ttk.Spinbox(
+            common_row1,
+            from_=1,
+            to=99999,
+            textvariable=self.var_common_stamina_can_limit,
+            width=8,
+            command=self._save_config,
+        )
+        self.spn_common_stamina_can_limit.pack(side=tk.LEFT, padx=(6, 0))
+        self._update_common_stamina_limit_state()
 
         self.var_interval = tk.IntVar(value=hunt_cfg.get("interval", 120) // 60)
         self.var_lighthouse_interval = tk.IntVar(
@@ -864,15 +977,6 @@ class EndlessWinterApp(tk.Tk):
         self.var_lighthouse_formation_slot = tk.IntVar(
             value=_normalize_formation_slot(lighthouse_cfg.get("formation_slot", 8))
         )
-        self.var_lighthouse_use_stamina = tk.BooleanVar(
-            value=bool(lighthouse_cfg.get("use_stamina", True))
-        )
-        self.var_lighthouse_stamina_can_limit = tk.IntVar(
-            value=int(lighthouse_cfg.get("stamina_can_limit", 800))
-        )
-        self.var_lighthouse_check_march_heroes = tk.BooleanVar(
-            value=bool(lighthouse_cfg.get("check_march_heroes", True))
-        )
         self.var_lighthouse_event_period = tk.BooleanVar(
             value=bool(lighthouse_cfg.get("event_period", False))
         )
@@ -880,42 +984,16 @@ class EndlessWinterApp(tk.Tk):
             value=max(1, int(lighthouse_cfg.get("monster_cooldown", 120) // 60))
         )
         self.var_level = tk.IntVar(value=hunt_cfg.get("beast_level", 8))
-        self.var_adjust_beast_level = tk.BooleanVar(
-            value=bool(hunt_cfg.get("adjust_level", True))
-        )
         self.var_formation_slot = tk.IntVar(
             value=_normalize_formation_slot(hunt_cfg.get("formation_name", 7))
         )
         self.var_rally_duration = tk.StringVar(
             value=str(hunt_cfg.get("rally_duration_minutes", 5))
         )
-        self.var_use_stamina = tk.BooleanVar(value=bool(hunt_cfg.get("use_stamina", True)))
-        self.var_ice_stamina_can_limit = tk.IntVar(
-            value=int(hunt_cfg.get("stamina_can_limit", 800))
-        )
-        self.var_check_march_heroes = tk.BooleanVar(
-            value=bool(hunt_cfg.get("check_march_heroes", True))
-        )
-        self.var_use_formation = tk.BooleanVar(value=bool(hunt_cfg.get("use_formation", True)))
         self.var_monster_interval = tk.IntVar(value=monster_cfg.get("interval", 60) // 60)
         self.var_monster_level = tk.IntVar(value=monster_cfg.get("monster_level", 30))
-        self.var_adjust_monster_level = tk.BooleanVar(
-            value=bool(monster_cfg.get("adjust_level", True))
-        )
         self.var_monster_formation_slot = tk.IntVar(
             value=_normalize_formation_slot(monster_cfg.get("formation_name", 8))
-        )
-        self.var_monster_use_stamina = tk.BooleanVar(
-            value=bool(monster_cfg.get("use_stamina", False))
-        )
-        self.var_monster_stamina_can_limit = tk.IntVar(
-            value=int(monster_cfg.get("stamina_can_limit", 800))
-        )
-        self.var_monster_check_march_heroes = tk.BooleanVar(
-            value=bool(monster_cfg.get("check_march_heroes", True))
-        )
-        self.var_monster_use_formation = tk.BooleanVar(
-            value=bool(monster_cfg.get("use_formation", True))
         )
         self.var_donate_interval = tk.IntVar(value=donate_cfg.get("interval", 3600) // 60)
         self.var_donate_times = tk.IntVar(value=donate_cfg.get("donate_times", 25))
@@ -934,9 +1012,6 @@ class EndlessWinterApp(tk.Tk):
         self.var_use_mining_hero = tk.BooleanVar(
             value=bool(mining_cfg.get("use_mining_hero", True))
         )
-        self.var_adjust_mining_level = tk.BooleanVar(
-            value=bool(mining_cfg.get("adjust_level", True))
-        )
         self.var_mining_level_min = tk.IntVar(value=mining_level_min)
         self.var_mining_level_max = tk.IntVar(value=mining_level_max)
 
@@ -949,46 +1024,6 @@ class EndlessWinterApp(tk.Tk):
         _configure_param_tab_grid(tab_ice)
 
         row = 0
-        ice_opts_row = ttk.Frame(tab_ice)
-        ice_opts_row.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
-        ttk.Checkbutton(
-            ice_opts_row,
-            text="检查出征英雄",
-            variable=self.var_check_march_heroes,
-            command=self._save_config,
-        ).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Checkbutton(
-            ice_opts_row,
-            text="自动使用体力道具",
-            variable=self.var_use_stamina,
-            command=self._on_ice_use_stamina_changed,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(
-            ice_opts_row,
-            text="修改等级",
-            variable=self.var_adjust_beast_level,
-            command=self._save_config,
-        ).pack(side=tk.LEFT)
-        row += 1
-
-        ttk.Label(tab_ice, text="体力罐头数量").grid(row=row, column=0, sticky=tk.W, pady=2)
-        self.spn_ice_stamina_can_limit = ttk.Spinbox(
-            tab_ice,
-            from_=1,
-            to=99999,
-            textvariable=self.var_ice_stamina_can_limit,
-            width=8,
-            command=self._save_config,
-        )
-        self.spn_ice_stamina_can_limit.grid(
-            row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX
-        )
-        ttk.Label(
-            tab_ice, text="勾选使用体力后生效；累计点满即停", font=("", 8)
-        ).grid(row=row, column=2, sticky=tk.W, padx=6)
-        self._update_ice_stamina_limit_state()
-        row += 1
-
         ttk.Label(tab_ice, text="集结间隔（分钟）").grid(row=row, column=0, sticky=tk.W, pady=2)
         ttk.Spinbox(tab_ice, from_=5, to=120, textvariable=self.var_interval, width=8).grid(
             row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX
@@ -1001,12 +1036,7 @@ class EndlessWinterApp(tk.Tk):
         )
         row += 1
 
-        ttk.Checkbutton(
-            tab_ice,
-            text="启用编队",
-            variable=self.var_use_formation,
-            command=self._on_use_formation_changed,
-        ).grid(row=row, column=0, sticky=tk.W, pady=2)
+        ttk.Label(tab_ice, text="编队槽位").grid(row=row, column=0, sticky=tk.W, pady=2)
         self._ice_formation_spinbox = ttk.Spinbox(
             tab_ice,
             from_=FORMATION_SLOT_MIN,
@@ -1016,7 +1046,7 @@ class EndlessWinterApp(tk.Tk):
         )
         self._ice_formation_spinbox.grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
         self._ice_formation_hint = ttk.Label(
-            tab_ice, text="出征界面左起第几个编队（1~8）", font=("", 8)
+            tab_ice, text="启用编队时生效（1~8）", font=("", 8)
         )
         self._ice_formation_hint.grid(row=row, column=2, sticky=tk.W, padx=6)
         row += 1
@@ -1029,49 +1059,13 @@ class EndlessWinterApp(tk.Tk):
             width=6,
             state="readonly",
         ).grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
-        self._update_ice_formation_state()
+        self._update_formation_spinboxes_state()
 
         tab_lighthouse = ttk.Frame(notebook, padding=6)
         notebook.add(tab_lighthouse, text="灯塔任务")
         _configure_param_tab_grid(tab_lighthouse)
 
         row = 0
-        lh_opts_row = ttk.Frame(tab_lighthouse)
-        lh_opts_row.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
-        ttk.Checkbutton(
-            lh_opts_row,
-            text="检查出征英雄",
-            variable=self.var_lighthouse_check_march_heroes,
-            command=self._save_config,
-        ).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Checkbutton(
-            lh_opts_row,
-            text="使用体力",
-            variable=self.var_lighthouse_use_stamina,
-            command=self._on_lighthouse_use_stamina_changed,
-        ).pack(side=tk.LEFT)
-        row += 1
-
-        ttk.Label(tab_lighthouse, text="体力罐头数量").grid(
-            row=row, column=0, sticky=tk.W, pady=2
-        )
-        self.spn_lighthouse_stamina_can_limit = ttk.Spinbox(
-            tab_lighthouse,
-            from_=1,
-            to=99999,
-            textvariable=self.var_lighthouse_stamina_can_limit,
-            width=8,
-            command=self._save_config,
-        )
-        self.spn_lighthouse_stamina_can_limit.grid(
-            row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX
-        )
-        ttk.Label(
-            tab_lighthouse, text="勾选使用体力后生效；累计点满即停", font=("", 8)
-        ).grid(row=row, column=2, sticky=tk.W, padx=6)
-        self._update_lighthouse_stamina_limit_state()
-        row += 1
-
         ttk.Label(tab_lighthouse, text="扫描间隔（分钟）").grid(
             row=row, column=0, sticky=tk.W, pady=2
         )
@@ -1084,14 +1078,17 @@ class EndlessWinterApp(tk.Tk):
         row += 1
 
         ttk.Label(tab_lighthouse, text="编队槽位").grid(row=row, column=0, sticky=tk.W, pady=2)
-        ttk.Spinbox(
+        self._lighthouse_formation_spinbox = ttk.Spinbox(
             tab_lighthouse,
             from_=FORMATION_SLOT_MIN,
             to=FORMATION_SLOT_MAX,
             textvariable=self.var_lighthouse_formation_slot,
             width=8,
-        ).grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
-        ttk.Label(tab_lighthouse, text="小怪出征用（1~8）", font=("", 8)).grid(
+        )
+        self._lighthouse_formation_spinbox.grid(
+            row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX
+        )
+        ttk.Label(tab_lighthouse, text="启用编队时生效（1~8）", font=("", 8)).grid(
             row=row, column=2, sticky=tk.W, padx=6
         )
         row += 1
@@ -1133,14 +1130,6 @@ class EndlessWinterApp(tk.Tk):
         ).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=2)
         row += 1
 
-        ttk.Checkbutton(
-            tab_mining,
-            text="修改等级（大循环仅首次）",
-            variable=self.var_adjust_mining_level,
-            command=self._save_config,
-        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
-        row += 1
-
         ttk.Label(tab_mining, text="采矿范围").grid(row=row, column=0, sticky=tk.W, pady=2)
         range_row = ttk.Frame(tab_mining)
         range_row.grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
@@ -1165,46 +1154,6 @@ class EndlessWinterApp(tk.Tk):
         _configure_param_tab_grid(tab_monster)
 
         row = 0
-        monster_opts_row = ttk.Frame(tab_monster)
-        monster_opts_row.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
-        ttk.Checkbutton(
-            monster_opts_row,
-            text="检查出征英雄",
-            variable=self.var_monster_check_march_heroes,
-            command=self._save_config,
-        ).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Checkbutton(
-            monster_opts_row,
-            text="自动使用体力道具",
-            variable=self.var_monster_use_stamina,
-            command=self._on_monster_use_stamina_changed,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(
-            monster_opts_row,
-            text="修改等级",
-            variable=self.var_adjust_monster_level,
-            command=self._save_config,
-        ).pack(side=tk.LEFT)
-        row += 1
-
-        ttk.Label(tab_monster, text="体力罐头数量").grid(row=row, column=0, sticky=tk.W, pady=2)
-        self.spn_monster_stamina_can_limit = ttk.Spinbox(
-            tab_monster,
-            from_=1,
-            to=99999,
-            textvariable=self.var_monster_stamina_can_limit,
-            width=8,
-            command=self._save_config,
-        )
-        self.spn_monster_stamina_can_limit.grid(
-            row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX
-        )
-        ttk.Label(
-            tab_monster, text="勾选使用体力后生效；累计点满即停", font=("", 8)
-        ).grid(row=row, column=2, sticky=tk.W, padx=6)
-        self._update_monster_stamina_limit_state()
-        row += 1
-
         ttk.Label(tab_monster, text="攻击间隔（分钟）").grid(row=row, column=0, sticky=tk.W, pady=2)
         ttk.Spinbox(
             tab_monster, from_=1, to=120, textvariable=self.var_monster_interval, width=8
@@ -1215,17 +1164,9 @@ class EndlessWinterApp(tk.Tk):
         ttk.Spinbox(
             tab_monster, from_=1, to=30, textvariable=self.var_monster_level, width=8
         ).grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
-        ttk.Label(tab_monster, text="（暂不调级，预留）", font=("", 8)).grid(
-            row=row, column=2, sticky=tk.W, padx=6
-        )
         row += 1
 
-        ttk.Checkbutton(
-            tab_monster,
-            text="启用编队",
-            variable=self.var_monster_use_formation,
-            command=self._on_monster_use_formation_changed,
-        ).grid(row=row, column=0, sticky=tk.W, pady=2)
+        ttk.Label(tab_monster, text="编队槽位").grid(row=row, column=0, sticky=tk.W, pady=2)
         self._monster_formation_spinbox = ttk.Spinbox(
             tab_monster,
             from_=FORMATION_SLOT_MIN,
@@ -1235,10 +1176,10 @@ class EndlessWinterApp(tk.Tk):
         )
         self._monster_formation_spinbox.grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
         ttk.Label(
-            tab_monster, text="出征界面左起第几个编队（1~8）", font=("", 8)
+            tab_monster, text="启用编队时生效（1~8）", font=("", 8)
         ).grid(row=row, column=2, sticky=tk.W, padx=6)
         row += 1
-        self._update_monster_formation_state()
+        self._update_formation_spinboxes_state()
 
         tab_donate = ttk.Frame(notebook, padding=6)
         notebook.add(tab_donate, text="捐献物资")
@@ -1385,14 +1326,6 @@ class EndlessWinterApp(tk.Tk):
                 type_canvas.yview_scroll(3, "units")
 
         _bind_mousewheel_recursive(type_inner, _alliance_rules_wheel)
-        row += 1
-
-        ttk.Label(
-            tab_alliance,
-            text="勾选橙/紫即保留该类型；均未勾选则不保留；蓝色一律刷新。",
-            font=("", 8),
-            foreground="gray",
-        ).grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=FORM_INPUT_PADX, pady=(0, 0))
 
         tab_more = ttk.Frame(notebook, padding=8)
         notebook.add(tab_more, text="更多")
@@ -1421,21 +1354,9 @@ class EndlessWinterApp(tk.Tk):
 
         tab_alliance_run = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_alliance_run, text="联盟总动员自动刷新")
-        ttk.Label(
-            tab_alliance_run,
-            text="请先进入联盟总动员任务页，再点开始。冷却倒计时不做处理。",
-            foreground="gray",
-            font=("", 8),
-        ).pack(anchor=tk.W)
 
         tab_alliance_admin_run = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_alliance_admin_run, text="联盟管理员刷新")
-        ttk.Label(
-            tab_alliance_admin_run,
-            text="进入管理员任务列表后点开始。勾选橙/紫即保留；蓝色一律刷新。",
-            foreground="gray",
-            font=("", 8),
-        ).pack(anchor=tk.W)
 
         tab_dream = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_dream, text="寻梦记忆")
@@ -1456,6 +1377,38 @@ class EndlessWinterApp(tk.Tk):
         if self._log_visible:
             self._show_log_panel(save_config=False)
 
+    def _build_menu_bar(self) -> None:
+        menubar = tk.Menu(self)
+        super().config(menu=menubar)
+
+        system_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="系统", menu=system_menu)
+
+        self._menu_log_hidden = tk.BooleanVar(value=not self._log_visible)
+        system_menu.add_checkbutton(
+            label="隐藏日志",
+            variable=self._menu_log_hidden,
+            command=self._on_menu_log_hidden_toggled,
+        )
+        system_menu.add_checkbutton(
+            label="启动时显示 CMD 窗口",
+            variable=self.var_show_console,
+            command=self._save_config,
+        )
+        system_menu.add_separator()
+        system_menu.add_command(label="测试连接", command=self._test_connection_with_dialog)
+
+    def _sync_log_menu_check(self) -> None:
+        if hasattr(self, "_menu_log_hidden"):
+            self._menu_log_hidden.set(not self._log_visible)
+
+    def _on_menu_log_hidden_toggled(self) -> None:
+        if self._menu_log_hidden.get():
+            if self._log_visible:
+                self._hide_log_panel()
+        elif not self._log_visible:
+            self._show_log_panel()
+
     def _toggle_log(self) -> None:
         if self._log_visible:
             self._hide_log_panel()
@@ -1466,7 +1419,7 @@ class EndlessWinterApp(tk.Tk):
         self._log_visible = True
         self._log_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.geometry(f"{MAIN_WIDTH + LOG_WIDTH}x{MAIN_HEIGHT}")
-        self.btn_toggle_log.configure(text="隐藏日志 ◂")
+        self._sync_log_menu_check()
         if save_config:
             self._save_config()
 
@@ -1474,8 +1427,38 @@ class EndlessWinterApp(tk.Tk):
         self._log_visible = False
         self._log_frame.pack_forget()
         self.geometry(f"{MAIN_WIDTH}x{MAIN_HEIGHT}")
-        self.btn_toggle_log.configure(text="显示日志 ▸")
+        self._sync_log_menu_check()
         self._save_config()
+
+    def _test_connection_with_dialog(self) -> None:
+        self._test_connection(show_dialog=True)
+
+    def _set_status_text(self, message: str) -> None:
+        """运行控制区状态：保留最近两行。"""
+        text = (message or "").strip()
+        if text.startswith("状态："):
+            text = text[3:].strip()
+        if not text:
+            return
+        lines = getattr(self, "_status_lines", None)
+        if lines is None:
+            self._status_lines = []
+            lines = self._status_lines
+        if lines and lines[-1] == text:
+            return
+        lines.append(text)
+        del lines[:-2]
+        body = "\n".join(f"状态：{line}" for line in lines)
+        widget = getattr(self, "txt_status", None) or getattr(self, "lbl_status", None)
+        if widget is None:
+            return
+        if isinstance(widget, tk.Text):
+            widget.configure(state=tk.NORMAL)
+            widget.delete("1.0", tk.END)
+            widget.insert("1.0", body)
+            widget.configure(state=tk.DISABLED)
+        else:
+            widget.configure(text=body.replace("\n", " | "))
 
     def _append_log(self, message: str) -> None:
         from datetime import datetime
@@ -1493,7 +1476,7 @@ class EndlessWinterApp(tk.Tk):
             except queue.Empty:
                 break
             self._append_log(msg)
-            self.lbl_status.configure(text=f"状态：{msg}")
+            self._set_status_text(msg)
         self.after(200, self._poll_log_queue)
 
     def _on_status(self, message: str) -> None:
@@ -1528,7 +1511,7 @@ class EndlessWinterApp(tk.Tk):
             return
         try:
             self._apply_device_serial(serial, save=True)
-            self.lbl_conn.configure(text=f"设备：{serial}", foreground="")
+            self.lbl_conn.configure(text=f"设备：{serial}", foreground="green")
             self._on_status(f"已切换模拟器：{serial}")
         except ValueError as exc:
             messagebox.showerror("设备地址无效", str(exc))
@@ -1559,7 +1542,7 @@ class EndlessWinterApp(tk.Tk):
                     self._apply_device_serial(pick, save=(pick != current))
                     self.lbl_conn.configure(
                         text=f"设备：{pick}（{len(devices)} 个已连接）",
-                        foreground="",
+                        foreground="green",
                     )
                     if pick != current:
                         self._on_status(f"已自动选择模拟器：{pick}")
@@ -1602,7 +1585,7 @@ class EndlessWinterApp(tk.Tk):
             )
         return self._adb
 
-    def _test_connection(self) -> None:
+    def _test_connection(self, *, show_dialog: bool = False) -> None:
         self.lbl_conn.configure(text="连接中…")
         self.update_idletasks()
         serial = self.var_device_serial.get().strip()
@@ -1610,6 +1593,7 @@ class EndlessWinterApp(tk.Tk):
         adb_path = dev_cfg.get("adb_path", "")
 
         def work():
+            ok = False
             try:
                 if serial:
                     host, port = AdbClient.parse_address(serial)
@@ -1637,6 +1621,11 @@ class EndlessWinterApp(tk.Tk):
                 if connected_address:
                     self._adb = adb
                     self._apply_device_serial(connected_address, save=True)
+                if show_dialog:
+                    if ok:
+                        messagebox.showinfo("测试连接", msg)
+                    else:
+                        messagebox.showerror("测试连接", msg)
 
             self.after(0, finish)
 
@@ -1775,6 +1764,8 @@ class EndlessWinterApp(tk.Tk):
             return self._build_collect_commander_supplies_task()
         if entry.task_id == "collect_pet_supplies":
             return self._build_collect_pet_supplies_task()
+        if entry.task_id == "auto_shop_exchange":
+            return self._build_auto_shop_exchange_task()
         return None
 
     def _build_auto_lighthouse_task(self) -> AutoLighthouseTask:
@@ -1787,11 +1778,11 @@ class EndlessWinterApp(tk.Tk):
             formation_slot=int(
                 _normalize_formation_slot(self.var_lighthouse_formation_slot.get())
             ),
-            use_stamina=bool(self.var_lighthouse_use_stamina.get()),
-            stamina_can_limit=int(self.var_lighthouse_stamina_can_limit.get()),
+            use_stamina=bool(self.var_common_use_stamina.get()),
+            stamina_can_limit=int(self.var_common_stamina_can_limit.get()),
+            use_formation=bool(self.var_common_use_formation.get()),
             event_period=bool(self.var_lighthouse_event_period.get()),
             monster_cooldown=float(self.var_lighthouse_monster_cooldown.get() * 60),
-            check_march_heroes=bool(self.var_lighthouse_check_march_heroes.get()),
             step_delay=merged["step_delay"],
             on_status=self._on_status,
         )
@@ -1808,11 +1799,10 @@ class EndlessWinterApp(tk.Tk):
             rally_duration_minutes=int(self.var_rally_duration.get()),
             skip_hour=hunt_cfg.get("skip_hour", 21),
             step_delay=hunt_cfg.get("step_delay", 1.5),
-            use_stamina=bool(self.var_use_stamina.get()),
-            stamina_can_limit=int(self.var_ice_stamina_can_limit.get()),
-            check_march_heroes=bool(self.var_check_march_heroes.get()),
-            use_formation=bool(self.var_use_formation.get()),
-            adjust_level=bool(self.var_adjust_beast_level.get()),
+            use_stamina=bool(self.var_common_use_stamina.get()),
+            stamina_can_limit=int(self.var_common_stamina_can_limit.get()),
+            use_formation=bool(self.var_common_use_formation.get()),
+            adjust_level=bool(self.var_common_adjust_level.get()),
             on_status=self._on_status,
         )
 
@@ -1826,11 +1816,10 @@ class EndlessWinterApp(tk.Tk):
             formation_name=str(_normalize_formation_slot(self.var_monster_formation_slot.get())),
             skip_hour=monster_cfg.get("skip_hour", 21),
             step_delay=monster_cfg.get("step_delay", 1.5),
-            use_stamina=bool(self.var_monster_use_stamina.get()),
-            stamina_can_limit=int(self.var_monster_stamina_can_limit.get()),
-            check_march_heroes=bool(self.var_monster_check_march_heroes.get()),
-            use_formation=bool(self.var_monster_use_formation.get()),
-            adjust_level=bool(self.var_adjust_monster_level.get()),
+            use_stamina=bool(self.var_common_use_stamina.get()),
+            stamina_can_limit=int(self.var_common_stamina_can_limit.get()),
+            use_formation=bool(self.var_common_use_formation.get()),
+            adjust_level=bool(self.var_common_adjust_level.get()),
             on_status=self._on_status,
         )
 
@@ -1846,7 +1835,7 @@ class EndlessWinterApp(tk.Tk):
             level_min=level_min,
             level_max=level_max,
             use_mining_hero=bool(self.var_use_mining_hero.get()),
-            adjust_level=bool(self.var_adjust_mining_level.get()),
+            adjust_level=bool(self.var_common_adjust_level.get()),
             skip_hour=mining_cfg.get("skip_hour", -1),
             step_delay=merged["step_delay"],
             hero_match_threshold=merged["hero_match_threshold"],
@@ -1882,6 +1871,16 @@ class EndlessWinterApp(tk.Tk):
         cfg = self.config.get("tasks", {}).get("collect_pet_supplies", {})
         merged = merge_pet_supplies_config(cfg)
         return CollectPetSuppliesTask(
+            adb=self._get_adb(),
+            coords=merged["coords"],
+            step_delay=merged["step_delay"],
+            on_status=self._on_status,
+        )
+
+    def _build_auto_shop_exchange_task(self) -> AutoShopExchangeTask:
+        cfg = self.config.get("tasks", {}).get("auto_shop_exchange", {})
+        merged = merge_shop_exchange_config(cfg)
+        return AutoShopExchangeTask(
             adb=self._get_adb(),
             coords=merged["coords"],
             step_delay=merged["step_delay"],
@@ -1968,12 +1967,19 @@ class EndlessWinterApp(tk.Tk):
     def _is_alliance_running(self) -> bool:
         return self._is_alliance_regular_running() or self._is_alliance_admin_running()
 
+    def _is_account_check_running(self) -> bool:
+        return (
+            self._account_check_worker is not None
+            and self._account_check_worker.is_alive()
+        )
+
     def _is_any_running(self) -> bool:
         return (
             self._is_loop_running()
             or self._is_once_running()
             or self._is_any_dream_running()
             or self._is_alliance_running()
+            or self._is_account_check_running()
         )
 
     def _configure_once_action_buttons(self, *, enabled: bool) -> None:
@@ -1992,10 +1998,7 @@ class EndlessWinterApp(tk.Tk):
         return tasks
 
     def _update_run_control_buttons(self, *, running: bool | None = None) -> None:
-        """统一刷新开始/结束/一键托管按钮状态。
-
-        running 可显式传入：启动时线程尚未 start，不能仅靠 is_alive() 推断。
-        """
+        """统一刷新开始/结束/一键辅助/打野/巨兽/检查账号按钮状态。"""
         if running is None:
             running = self._is_any_running()
         if hasattr(self, "btn_start"):
@@ -2004,7 +2007,16 @@ class EndlessWinterApp(tk.Tk):
             self.btn_stop.configure(state=tk.NORMAL if running else tk.DISABLED)
         if hasattr(self, "btn_hosting"):
             self.btn_hosting.configure(state=tk.DISABLED if running else tk.NORMAL)
-        # 寻梦 Tab 内部隐藏按钮状态同步（兼容旧引用）
+        if hasattr(self, "btn_quick_monster"):
+            self.btn_quick_monster.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
+        if hasattr(self, "btn_quick_ice"):
+            self.btn_quick_ice.configure(state=tk.DISABLED if running else tk.NORMAL)
+        if hasattr(self, "btn_check_account"):
+            self.btn_check_account.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
         for widgets in (self._dream_widgets, self._dream_pk_widgets):
             if widgets is None:
                 continue
@@ -2044,6 +2056,9 @@ class EndlessWinterApp(tk.Tk):
 
     def _start_from_current_tab(self) -> None:
         """根据当前运行任务 Tab 启动对应内容。"""
+        if self._is_account_check_running():
+            messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
+            return
         tab_name = self._current_task_tab_name()
         dispatch = {
             "循环任务": self._start_loop,
@@ -2077,6 +2092,100 @@ class EndlessWinterApp(tk.Tk):
             self._stop_dream_session(pk=False)
         if self._is_dream_pk_running():
             self._stop_dream_session(pk=True)
+        if self._is_account_check_running():
+            self._stop_check_account_name()
+
+    def _read_account_name_from_screen(self, screen) -> str:
+        x1, y1, x2, y2 = ACCOUNT_NAME_ROI
+        h, w = screen.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            return ""
+        crop = screen[y1:y2, x1:x2]
+        big = cv2.resize(crop, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        text, engine = ocr_chip_text(big)
+        cleaned = re.sub(r"\s+", "", (text or "").strip())
+        # 去掉常见 OCR 噪点符号，保留中文/字母/数字/下划线
+        cleaned = re.sub(r"[^\w\u4e00-\u9fff·•\-]", "", cleaned)
+        self._on_status(f"账号名称 OCR({engine})：{cleaned or '空'}")
+        return cleaned
+
+    def _start_check_account_name(self) -> None:
+        if self._is_any_running():
+            messagebox.showwarning("提示", "已有任务在运行，请先点「结束」")
+            return
+        if not self._ensure_device():
+            return
+
+        self._account_check_stop_event.clear()
+        self._update_run_control_buttons(running=True)
+        self._on_status("开始检查账号名称…")
+
+        def work():
+            try:
+                adb = self._get_adb()
+                nav = WildernessNavigator(
+                    adb,
+                    on_status=self._on_status,
+                    interrupted=self._account_check_stop_event.is_set,
+                )
+                self._on_status("确保在野外主界面…")
+                nav.ensure_wilderness()
+                if self._account_check_stop_event.is_set():
+                    raise InterruptedError("任务已停止")
+
+                px, py = ACCOUNT_PROFILE_TAP
+                self._on_status(f"打开用户页 @ ({px},{py})")
+                adb.tap(px, py)
+                time.sleep(2.0)
+                if self._account_check_stop_event.is_set():
+                    raise InterruptedError("任务已停止")
+
+                name = self._read_account_name_from_screen(adb.screenshot())
+                if not name:
+                    raise RuntimeError("未能识别账号名称，请确认已打开用户页")
+
+                def apply():
+                    self.config.setdefault("gui", {})["account_name"] = name
+                    self._set_account_name_display(name)
+                    try:
+                        self._save_config()
+                    except ValueError:
+                        pass
+                    self._on_status(f"账号名称：{name}")
+                    messagebox.showinfo("检查账号名称", f"当前账号：{name}")
+
+                self.after(0, apply)
+                try:
+                    adb.back()
+                    time.sleep(0.8)
+                    nav.try_return_to_wilderness()
+                except Exception:
+                    pass
+            except InterruptedError:
+                self.after(0, lambda: self._on_status("检查账号名称已停止"))
+            except Exception as exc:
+                err = str(exc)
+
+                def fail(msg=err):
+                    self._on_status(f"检查账号名称失败：{msg}")
+                    messagebox.showerror("检查账号名称", msg)
+
+                self.after(0, fail)
+            finally:
+                self.after(0, self._on_account_check_done)
+
+        self._account_check_worker = threading.Thread(target=work, daemon=True)
+        self._account_check_worker.start()
+
+    def _stop_check_account_name(self) -> None:
+        self._account_check_stop_event.set()
+        self._on_status("正在停止检查账号名称…")
+
+    def _on_account_check_done(self) -> None:
+        self._account_check_worker = None
+        self._update_run_control_buttons(running=False)
 
     def _ensure_device(self) -> bool:
         adb = self._get_adb()
@@ -2087,6 +2196,9 @@ class EndlessWinterApp(tk.Tk):
         return False
 
     def _start_loop(self) -> None:
+        if self._is_account_check_running():
+            messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
+            return
         if self._is_loop_running():
             messagebox.showwarning("提示", "循环任务已在运行中")
             return
@@ -2115,10 +2227,56 @@ class EndlessWinterApp(tk.Tk):
             messagebox.showwarning("提示", "没有可启动的循环任务")
             return
 
+        names = "、".join(t.name for t in self._loop_tasks)
+        self._launch_loop_worker(status=f"启动循环任务：{names}")
+
+    def _start_quick_loop_task(self, task_id: str) -> None:
+        """一键打野 / 一键集结巨兽：直接启动对应循环任务（不依赖勾选）。"""
+        labels = {
+            "hunt_monster": "一键打野",
+            "hunt_ice_beast": "一键集结巨兽",
+        }
+        label = labels.get(task_id, task_id)
+        if self._is_account_check_running():
+            messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
+            return
+        if self._is_loop_running():
+            messagebox.showwarning("提示", "循环任务已在运行中")
+            return
+        if self._is_once_running():
+            messagebox.showwarning("提示", "一次性任务正在执行，请稍候或先停止")
+            return
+        if self._is_any_dream_running():
+            messagebox.showwarning("提示", "寻梦记忆正在运行，请先点「结束」")
+            return
+        if self._is_alliance_running():
+            messagebox.showwarning("提示", "联盟总动员正在运行，请先点「结束」")
+            return
+
+        entry = next((e for e in loop_tasks() if e.task_id == task_id), None)
+        if entry is None or not entry.available:
+            messagebox.showwarning("提示", f"「{label}」任务不可用")
+            return
+
+        try:
+            self._save_config()
+            self.config = self._load_config()
+            task = self._build_task_instance(entry)
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+
+        if task is None:
+            messagebox.showwarning("提示", f"「{label}」任务不可用")
+            return
+
+        self._loop_tasks = [task]
+        self._launch_loop_worker(status=f"{label}：{task.name}")
+
+    def _launch_loop_worker(self, *, status: str) -> None:
         self._loop_stop_event.clear()
         self._set_loop_buttons(running=True)
-        names = "、".join(t.name for t in self._loop_tasks)
-        self._on_status(f"启动循环任务：{names}")
+        self._on_status(status)
 
         def work():
             try:
@@ -2195,6 +2353,9 @@ class EndlessWinterApp(tk.Tk):
         self._once_worker.start()
 
     def _run_hosting_batch(self) -> None:
+        if self._is_account_check_running():
+            messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
+            return
         if self._is_once_running():
             messagebox.showwarning("提示", "任务正在执行中")
             return
@@ -2217,13 +2378,13 @@ class EndlessWinterApp(tk.Tk):
             return
 
         if not self._once_tasks:
-            messagebox.showwarning("提示", "托管任务不可用")
+            messagebox.showwarning("提示", "辅助任务不可用")
             return
 
         self._once_stop_event.clear()
         self._set_once_buttons(running=True)
         names = " → ".join(t.name for t in self._once_tasks)
-        self._on_status(f"一键托管：{names}")
+        self._on_status(f"一键辅助：{names}")
 
         def work():
             try:
@@ -2231,21 +2392,21 @@ class EndlessWinterApp(tk.Tk):
                     return
                 for index, task in enumerate(self._once_tasks):
                     if self._once_stop_event.is_set():
-                        self._on_status("一键托管已取消")
+                        self._on_status("一键辅助已取消")
                         return
                     self._execute_hosting_task(task)
                     if index < len(self._once_tasks) - 1:
                         self._on_status(f"等待 {ONCE_TASK_GAP_SEC} 秒后执行下一项…")
                         for _ in range(ONCE_TASK_GAP_SEC * 10):
                             if self._once_stop_event.is_set():
-                                self._on_status("一键托管已取消")
+                                self._on_status("一键辅助已取消")
                                 return
                             time.sleep(0.1)
-                self._on_status("一键托管全部完成")
+                self._on_status("一键辅助全部完成")
             except InterruptedError:
-                self._on_status("一键托管已停止")
+                self._on_status("一键辅助已停止")
             except Exception as exc:
-                self._on_status(f"一键托管异常：{exc}")
+                self._on_status(f"一键辅助异常：{exc}")
             finally:
                 self.after(0, self._on_once_worker_done)
 
@@ -2253,7 +2414,7 @@ class EndlessWinterApp(tk.Tk):
         self._once_worker.start()
 
     def _execute_hosting_task(self, task) -> None:
-        self._on_status(f"▶ 托管：{task.name}")
+        self._on_status(f"▶ 辅助：{task.name}")
         try:
             if hasattr(task, "reset_stop"):
                 task.reset_stop()
@@ -2639,6 +2800,7 @@ class EndlessWinterApp(tk.Tk):
                 self._stop_dream_session(pk=True)
                 self._stop_alliance_mobilization()
                 self._stop_alliance_admin()
+                self._stop_check_account_name()
                 self.destroy()
         else:
             try:

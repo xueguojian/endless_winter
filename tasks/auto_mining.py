@@ -13,7 +13,11 @@ from loguru import logger
 
 from core.adb_client import AdbClient
 from core.navigation import WildernessNavigator
-from core.search_level import adjust_search_level, ensure_full_resource_checked
+from core.search_level import (
+    adjust_search_level,
+    ensure_full_resource_checked,
+    read_search_level,
+)
 from core.vision import MatchResult, Vision
 
 StatusCallback = Callable[[str], None]
@@ -115,13 +119,13 @@ class AutoMiningTask:
         adb: AdbClient,
         coords: dict[str, list[int]] | None = None,
         interval: float = 3600.0,
-        level_min: int = 5,
+        level_min: int = 8,
         level_max: int = 8,
         use_mining_hero: bool = True,
         skip_hour: int = -1,
         step_delay: float = DEFAULT_STEP_DELAY,
         hero_match_threshold: float = MINING_HERO_MATCH_THRESHOLD,
-        adjust_level: bool = True,
+        adjust_level: bool = False,
         on_status: StatusCallback | None = None,
     ):
         merged = merge_task_config(
@@ -146,7 +150,6 @@ class AutoMiningTask:
         self.on_status = on_status
         self._last_run = 0.0
         self._stop_event = threading.Event()
-        self._level_already_adjusted = False
         self.vision = Vision(TEMPLATE_DIR, threshold=0.70)
         self._wilderness = WildernessNavigator.from_task(
             self, is_overlay_open=self._is_search_panel_visible
@@ -281,22 +284,29 @@ class AutoMiningTask:
         self._tap_xy(tx, ty, delay=1.0)
 
     def _set_mine_level(self) -> None:
-        """仅大循环首次调整等级（游戏会记忆）；未勾选配置则跳过。"""
+        """每种资源 tab 各校验/调整一次等级；未勾选配置则跳过。
+
+        当前等级在 [level_min, level_max] 内不改；低于最低则调到最低；
+        高于最高则调到最高。允许 min == max。
+        """
         if not self.adjust_level:
             self._emit("未启用修改等级，跳过")
             return
-        if self._level_already_adjusted:
-            self._emit("本轮调度已调整过等级，跳过")
+        current = read_search_level(self.adb.screenshot())
+        if current is None:
+            raise RuntimeError("无法识别当前搜索等级，已中止以免按错误等级搜索")
+        if self.level_min <= current <= self.level_max:
+            self._emit(
+                f"当前等级 {current} 已在 {self.level_min}~{self.level_max} 内，跳过"
+            )
             return
-        target = max(self.level_min, min(self.level_max, self.mine_level))
+        target = self.level_min if current < self.level_min else self.level_max
         adjust_search_level(
             self.adb,
             target,
             emit=self._emit,
             interrupted=self._interrupted,
-            on_first_tap=self._dismiss_dialog,
         )
-        self._level_already_adjusted = True
 
     def _ensure_full_resource_option(self) -> None:
         ensure_full_resource_checked(

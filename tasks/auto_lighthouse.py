@@ -10,6 +10,7 @@ from typing import Callable
 from loguru import logger
 
 from core.adb_client import AdbClient
+from core.common_task_opts import resolve_use_formation
 from core.deploy_march import DeployMarchHelper, StaminaInsufficientError
 from core.stamina_use import DEFAULT_STAMINA_CAN_LIMIT, StaminaCanLimitReached
 
@@ -80,7 +81,7 @@ def merge_task_config(cfg: dict) -> dict:
         "coords": coords,
         "monster_cooldown": float(cfg.get("monster_cooldown", DEFAULT_MONSTER_COOLDOWN)),
         "event_period": bool(cfg.get("event_period", False)),
-        "check_march_heroes": bool(cfg.get("check_march_heroes", True)),
+        "use_formation": resolve_use_formation(cfg),
     }
 
 
@@ -123,7 +124,7 @@ class AutoLighthouseTask:
         formation_slot: int = 8,
         use_stamina: bool = True,
         stamina_can_limit: int = DEFAULT_STAMINA_CAN_LIMIT,
-        check_march_heroes: bool = True,
+        use_formation: bool = True,
         step_delay: float = DEFAULT_STEP_DELAY,
         monster_cooldown: float = DEFAULT_MONSTER_COOLDOWN,
         event_period: bool = False,
@@ -135,7 +136,7 @@ class AutoLighthouseTask:
                 "step_delay": step_delay,
                 "monster_cooldown": monster_cooldown,
                 "event_period": event_period,
-                "check_march_heroes": check_march_heroes,
+                "use_formation": use_formation,
             }
         )
         self.adb = adb
@@ -143,7 +144,7 @@ class AutoLighthouseTask:
         self.interval = interval
         self.formation_slot = formation_slot
         self.use_stamina = use_stamina
-        self.check_march_heroes = merged["check_march_heroes"]
+        self.use_formation = merged["use_formation"]
         self.step_delay = merged["step_delay"]
         self.monster_cooldown = merged["monster_cooldown"]
         self.event_period = merged["event_period"]
@@ -587,8 +588,8 @@ class AutoLighthouseTask:
         return detail
 
     def _check_march_heroes(self) -> None:
-        """小怪出征前检查英雄栏（与巨兽/打野逻辑一致）。"""
-        if not self.check_march_heroes:
+        """小怪出征前检查英雄栏（仅启用编队时）。"""
+        if not self.use_formation:
             return
         # select_formation 已确认出征页，此处不再二次长等待
         time.sleep(0.5)
@@ -624,8 +625,12 @@ class AutoLighthouseTask:
                 self._emit(f"点击出征 @ {detail.action_center}")
                 self._tap_xy(*detail.action_center, delay=1.5)
             self._emit("执行小怪出征…")
-            self._deploy.select_formation()
-            self._check_march_heroes()
+            if self.use_formation:
+                self._deploy.select_formation()
+                self._check_march_heroes()
+            else:
+                self._emit("未启用编队，跳过编队选择与英雄校验")
+                self._deploy.wait_for_deploy_screen()
             self._deploy.tap_march()
             return
 

@@ -97,9 +97,8 @@ class HuntMonsterTask:
         step_delay: float = 1.5,
         use_stamina: bool = True,
         stamina_can_limit: int = DEFAULT_STAMINA_CAN_LIMIT,
-        check_march_heroes: bool = True,
         use_formation: bool = True,
-        adjust_level: bool = True,
+        adjust_level: bool = False,
         on_status: StatusCallback | None = None,
     ):
         self.adb = adb
@@ -113,7 +112,6 @@ class HuntMonsterTask:
         self.stamina_budget = StaminaCanBudget(
             enabled=use_stamina, limit=stamina_can_limit
         )
-        self.check_march_heroes = check_march_heroes
         self.use_formation = use_formation
         self.adjust_level = adjust_level
         self.on_status = on_status
@@ -339,11 +337,11 @@ class HuntMonsterTask:
         if self.use_formation:
             self._select_formation()
             return
-        self._emit("未启用编队，跳过编队槽位")
+        self._emit("未启用编队，跳过编队选择与英雄校验")
         self._wait_for_deploy_screen()
 
     def _check_march_heroes(self) -> None:
-        if not self.check_march_heroes:
+        if not self.use_formation:
             return
         # 编队选择后界面已确认；避免二次严格等待因体力数字变化误杀
         time.sleep(0.5)
@@ -506,11 +504,6 @@ class HuntMonsterTask:
             self.monster_level,
             emit=self._emit,
             interrupted=self._interrupted,
-            on_first_tap=(
-                (lambda: self._tap("dialog_cancel", delay=0.5))
-                if "dialog_cancel" in self.coords
-                else None
-            ),
         )
         self._level_already_adjusted = True
 
@@ -564,8 +557,7 @@ class HuntMonsterTask:
             else "不启用编队，直接出征"
         )
         self._emit(
-            f"间隔 {int(self.interval // 60)} 分钟，{formation_desc}，"
-            f"检查出征英雄：{'是' if self.check_march_heroes else '否'}"
+            f"间隔 {int(self.interval // 60)} 分钟，{formation_desc}"
         )
         try:
             while not self._interrupted():

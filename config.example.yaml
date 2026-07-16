@@ -17,12 +17,18 @@ vision:
 gui:
   show_console: true
   log_visible: true
+  account_name: ''
 tasks:
+  common:
+    use_formation: true
+    adjust_level: false
+    use_stamina: false
+    stamina_can_limit: 800
   hunt_monster:
     enabled: false
     interval: 60
     monster_level: 30
-    adjust_level: true
+    adjust_level: false
     formation_name: '8'
     use_stamina: false
     stamina_can_limit: 800
@@ -63,7 +69,7 @@ tasks:
     interval: 120
     beast_level: 8
     default_beast_level: 1
-    adjust_level: true
+    adjust_level: false
     formation_name: '6'
     rally_duration_minutes: 5
     use_stamina: false
@@ -124,9 +130,9 @@ tasks:
   auto_mining:
     interval: 3600
     use_mining_hero: true
-    level_min: 5
+    level_min: 8
     level_max: 8
-    adjust_level: true
+    adjust_level: false
     enabled: false
     step_delay: 1.5
     hero_roi:
@@ -255,6 +261,16 @@ tasks:
       pet_confirm:
       - 356
       - 1092
+  auto_shop_exchange:
+    enabled: false
+    step_delay: 1.5
+    coords:
+      shop_open:
+      - 418
+      - 1220
+      dialog_cancel:
+      - 250
+      - 780
   auto_train_troops:
     enabled: false
     interval: 10800

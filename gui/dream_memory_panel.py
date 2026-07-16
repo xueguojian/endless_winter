@@ -278,7 +278,10 @@ def build_dream_tab(
     cmb_tap_interval.pack(side=tk.LEFT, padx=(8, 8))
     ttk.Label(
         row_interval,
-        text=f"固定=min({dm_cfg.tap_between_delay_min:g}s)，随机=min~max",
+        text=(
+            f"固定=min({dm_cfg.tap_between_delay_min:g}s)，"
+            f"随机={dm_cfg.tap_between_delay_min:g}~{dm_cfg.tap_between_delay_max:g}s"
+        ),
         foreground="#555",
     ).pack(side=tk.LEFT)
 

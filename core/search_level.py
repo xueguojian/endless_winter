@@ -92,7 +92,6 @@ def adjust_search_level(
     *,
     emit: Callable[[str], None] | None = None,
     interrupted: Callable[[], bool] | None = None,
-    on_first_tap: Callable[[], None] | None = None,
 ) -> None:
     """将搜索面板等级调到 target；识别失败则抛错，避免默默用错误等级出征。"""
     target = max(LEVEL_MIN, min(LEVEL_MAX, int(target)))
@@ -114,15 +113,13 @@ def adjust_search_level(
 
     diff = target - current
     _emit(f"调整等级：{current} → {target}")
-    for index in range(abs(diff)):
+    for _ in range(abs(diff)):
         if interrupted and interrupted():
             raise InterruptedError("任务已停止")
         if diff > 0:
             tap_level_plus(adb, interrupted=interrupted)
         else:
             tap_level_minus(adb, interrupted=interrupted)
-        if index == 0 and on_first_tap is not None:
-            on_first_tap()
         now = read_search_level(adb.screenshot())
         if now == target:
             _emit(f"已调整到 {target} 级")
@@ -155,26 +152,18 @@ def _full_resource_checkbox_roi(
 def is_full_resource_checked(screen: np.ndarray) -> bool:
     """判断「搜索资源为满的资源点」是否已勾选。
 
-    勾选后框内通常有深色勾选笔划；未勾选多为浅色空框。
+    未勾选：深蓝空框；勾选：框内出现亮绿色对勾。
     """
     x1, y1, x2, y2 = _full_resource_checkbox_roi(screen)
     crop = screen[y1:y2, x1:x2]
     if crop.size == 0:
         return False
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    # 去掉最外一圈边框，看中心是否有勾
-    ih, iw = gray.shape[:2]
-    inset = max(1, min(ih, iw) // 5)
-    core = gray[inset : ih - inset, inset : iw - inset]
-    if core.size == 0:
-        core = gray
-    dark_ratio = float((core < 100).mean())
-    bright_ratio = float((core > 200).mean())
-    # 勾选：深色笔画占比上升；未勾选：中心偏亮空心
-    checked = dark_ratio >= 0.10 and bright_ratio < 0.85
-    logger.debug(
-        f"满资源勾选 dark={dark_ratio:.3f} bright={bright_ratio:.3f} → {checked}"
-    )
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    # 绿色对勾：H≈35–95，较高饱和度与亮度
+    green = cv2.inRange(hsv, (35, 80, 80), (95, 255, 255))
+    green_ratio = float(green.mean()) / 255.0
+    checked = green_ratio >= 0.05
+    logger.debug(f"满资源勾选 green={green_ratio:.3f} → {checked}")
     return checked
 
 
