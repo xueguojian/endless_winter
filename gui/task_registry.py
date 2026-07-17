@@ -19,28 +19,8 @@ class TaskEntry:
 
 
 # available=False 的任务在界面显示为灰色「敬请期待」
+# 灯塔 / 打野 / 巨兽已改为底部「一键XX」启动，不在此列表勾选
 TASK_ENTRIES: tuple[TaskEntry, ...] = (
-    TaskEntry(
-        task_id="auto_lighthouse",
-        label="自动灯塔任务",
-        kind="once",
-        config_key="auto_lighthouse",
-        available=True,
-    ),
-    TaskEntry(
-        task_id="hunt_ice_beast",
-        label="冰原巨兽集结",
-        kind="loop",
-        config_key="hunt_ice_beast",
-        available=True,
-    ),
-    TaskEntry(
-        task_id="hunt_monster",
-        label="自动打野怪",
-        kind="loop",
-        config_key="hunt_monster",
-        available=True,
-    ),
     TaskEntry(
         task_id="donate_alliance_supplies",
         label="捐献联盟物资",
@@ -108,14 +88,13 @@ def once_tasks() -> list[TaskEntry]:
     return [e for e in TASK_ENTRIES if e.kind == "once"]
 
 
-# 一键辅助：按顺序各执行一次（与勾选无关）
+# 一键辅助：按顺序各执行一次（与勾选无关；灯塔改由「一键情报」单独执行）
 HOSTING_TASK_IDS: tuple[str, ...] = (
     "auto_mining",
     "auto_shop_exchange",
     "donate_alliance_supplies",
     "auto_train_troops",
     "collect_supplies",
-    "auto_lighthouse",
     "collect_commander_supplies",
     "collect_pet_supplies",
 )

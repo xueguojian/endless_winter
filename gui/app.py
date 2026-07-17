@@ -29,6 +29,7 @@ from core.dream_memory.ocr_engine import (
     resolve_ocr_engine,
     warmup_ocr,
 )
+from core.coords import PORTRAIT_HEIGHT, PORTRAIT_WIDTH
 from core.navigation import WildernessNavigator, return_to_main_screen
 from gui.coord_ruler import CoordRulerWindow
 from gui.dream_memory_calibrator import DreamMemoryCalibratorWindow
@@ -88,9 +89,6 @@ from tasks.hunt_monster import HuntMonsterTask
 
 ROOT = Path(__file__).parent.parent
 
-# 冰原巨兽 / 打野 与其余循环任务互斥；捐献/采集/练兵/领取探险物资 可同时勾选
-LOOP_COMBAT_EXCLUSIVE_TASK_IDS = frozenset({"hunt_ice_beast", "hunt_monster"})
-
 # 运行任务 Tab → 功能参数 Tab
 TASK_TAB_TO_PARAM_TAB: dict[str, str] = {
     "循环任务": "冰原巨兽",
@@ -138,6 +136,7 @@ MINING_LEVEL_MAX = 8
 MINING_LEVEL_DEFAULT_MIN = 8
 MINING_LEVEL_DEFAULT_MAX = 8
 
+DEFAULT_AUTO_CLICK_POINT = {"name": "联盟互助", "x": 532, "y": 1104}
 
 def _normalize_formation_slot(raw) -> int:
     """将配置中的编队槽位规范为 1~8。"""
@@ -168,6 +167,53 @@ def _normalize_mining_range(level_min, level_max) -> tuple[int, int]:
 
 def _configure_param_tab_grid(tab: ttk.Frame) -> None:
     tab.grid_columnconfigure(0, minsize=FORM_LABEL_COL_MINSIZE)
+
+
+def _normalize_auto_click_config(raw: dict | None) -> dict:
+    """规范化一键连点配置：interval / selected / points。"""
+    data = dict(raw or {})
+    try:
+        interval = max(0.01, float(data.get("interval", 0.1)))
+    except (TypeError, ValueError):
+        interval = 0.1
+
+    points: list[dict] = []
+    raw_points = data.get("points")
+    if isinstance(raw_points, list):
+        for item in raw_points:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            try:
+                x = int(item.get("x", PORTRAIT_WIDTH // 2))
+                y = int(item.get("y", PORTRAIT_HEIGHT // 2))
+            except (TypeError, ValueError):
+                continue
+            x = max(0, min(PORTRAIT_WIDTH - 1, x))
+            y = max(0, min(PORTRAIT_HEIGHT - 1, y))
+            points.append({"name": name, "x": x, "y": y})
+
+    if not points:
+        points = [dict(DEFAULT_AUTO_CLICK_POINT)]
+
+    # 同名保留首次
+    dedup: list[dict] = []
+    seen: set[str] = set()
+    for pt in points:
+        if pt["name"] in seen:
+            continue
+        seen.add(pt["name"])
+        dedup.append(pt)
+    points = dedup
+
+    selected = str(data.get("selected", "")).strip()
+    names = {pt["name"] for pt in points}
+    if selected not in names:
+        selected = points[0]["name"]
+
+    return {"interval": interval, "selected": selected, "points": points}
 
 
 def _bind_mousewheel_recursive(widget: tk.Misc, handler) -> None:
@@ -262,6 +308,8 @@ class EndlessWinterApp(tk.Tk):
         self._alliance_type_bg_vars: dict[str, dict[str, tk.BooleanVar]] = {}
         self._account_check_worker: threading.Thread | None = None
         self._account_check_stop_event = threading.Event()
+        self._auto_click_worker: threading.Thread | None = None
+        self._auto_click_stop_event = threading.Event()
 
         self._build_ui()
         self._poll_log_queue()
@@ -287,10 +335,6 @@ class EndlessWinterApp(tk.Tk):
 
     def _task_enabled_in_config(self, entry: TaskEntry) -> bool:
         task_cfg = self.config.get("tasks", {}).get(entry.config_key, {})
-        if entry.task_id == "hunt_ice_beast":
-            return bool(task_cfg.get("enabled", True))
-        if entry.task_id == "hunt_monster":
-            return bool(task_cfg.get("enabled", False))
         if entry.task_id == "donate_alliance_supplies":
             return bool(task_cfg.get("enabled", False))
         return bool(task_cfg.get("enabled", False))
@@ -335,14 +379,12 @@ class EndlessWinterApp(tk.Tk):
         apply_common_options(tasks, common_opts)
 
         ice = tasks.setdefault("hunt_ice_beast", {})
-        ice["enabled"] = bool(self._task_vars["hunt_ice_beast"].get())
         ice["interval"] = int(self.var_interval.get()) * 60
         ice["beast_level"] = int(self.var_level.get())
         ice["formation_name"] = str(_normalize_formation_slot(self.var_formation_slot.get()))
         ice["rally_duration_minutes"] = int(self.var_rally_duration.get())
 
         lighthouse = tasks.setdefault("auto_lighthouse", {})
-        lighthouse["enabled"] = bool(self._task_vars["auto_lighthouse"].get())
         lighthouse["interval"] = int(self.var_lighthouse_interval.get()) * 60
         lighthouse["formation_slot"] = int(
             _normalize_formation_slot(self.var_lighthouse_formation_slot.get())
@@ -354,7 +396,6 @@ class EndlessWinterApp(tk.Tk):
         lighthouse["coords"] = merged_lighthouse["coords"]
 
         monster = tasks.setdefault("hunt_monster", {})
-        monster["enabled"] = bool(self._task_vars["hunt_monster"].get())
         monster["interval"] = int(self.var_monster_interval.get()) * 60
         monster["monster_level"] = int(self.var_monster_level.get())
         monster["formation_name"] = str(
@@ -430,6 +471,18 @@ class EndlessWinterApp(tk.Tk):
             gui["account_name"] = account
         elif "account_name" not in gui:
             gui["account_name"] = ""
+        if hasattr(self, "var_auto_click_interval"):
+            auto_click = gui.setdefault("auto_click", {})
+            auto_click["interval"] = max(
+                0.01, float(self.var_auto_click_interval.get())
+            )
+            auto_click["selected"] = str(self.var_auto_click_selected.get()).strip()
+            auto_click["points"] = [
+                {"name": p["name"], "x": int(p["x"]), "y": int(p["y"])}
+                for p in getattr(self, "_auto_click_points", [])
+            ]
+            auto_click.pop("x", None)
+            auto_click.pop("y", None)
 
         if hasattr(self, "var_device_serial"):
             serial = self.var_device_serial.get().strip()
@@ -605,18 +658,8 @@ class EndlessWinterApp(tk.Tk):
             self._select_param_tab_by_name(param_tab)
 
     def _on_loop_checkbox_changed(self, task_id: str) -> None:
-        """冰原巨兽/打野与其他循环任务互斥；其余四个可同时勾选。"""
-        if not self._task_vars[task_id].get():
-            return
-        all_loop_ids = [entry.task_id for entry in loop_tasks()]
-        if task_id in LOOP_COMBAT_EXCLUSIVE_TASK_IDS:
-            for other_id in all_loop_ids:
-                if other_id != task_id and other_id in self._task_vars:
-                    self._task_vars[other_id].set(False)
-        else:
-            for combat_id in LOOP_COMBAT_EXCLUSIVE_TASK_IDS:
-                if combat_id in self._task_vars:
-                    self._task_vars[combat_id].set(False)
+        """循环任务勾选变更时保存配置。"""
+        _ = task_id
         try:
             self._save_config()
         except ValueError:
@@ -813,38 +856,68 @@ class EndlessWinterApp(tk.Tk):
         )
         self.lbl_account_name.pack(side=tk.LEFT, padx=(10, 0))
 
-        run_btn_row = ttk.Frame(run_frame)
-        run_btn_row.pack(fill=tk.X)
-        self.btn_start = ttk.Button(
-            run_btn_row, text="开始", command=self._start_from_current_tab, width=8
+        click_cfg = _normalize_auto_click_config(gui_cfg.get("auto_click"))
+        self._auto_click_points = list(click_cfg["points"])
+        self.var_auto_click_interval = tk.StringVar(value=str(click_cfg["interval"]))
+        self.var_auto_click_selected = tk.StringVar(value=str(click_cfg["selected"]))
+        selected_pt = next(
+            (p for p in self._auto_click_points if p["name"] == click_cfg["selected"]),
+            self._auto_click_points[0],
         )
-        self.btn_start.pack(side=tk.LEFT, padx=(0, 6))
+        self.var_auto_click_name = tk.StringVar(value=str(selected_pt["name"]))
+        self.var_auto_click_x = tk.IntVar(value=int(selected_pt["x"]))
+        self.var_auto_click_y = tk.IntVar(value=int(selected_pt["y"]))
+
+        # 按钮分两行，避免一行挤不下
+        run_btn_row1 = ttk.Frame(run_frame)
+        run_btn_row1.pack(fill=tk.X)
+        self.btn_start = ttk.Button(
+            run_btn_row1, text="开始", command=self._start_from_current_tab, width=7
+        )
+        self.btn_start.pack(side=tk.LEFT, padx=(0, 4))
         self.btn_stop = ttk.Button(
-            run_btn_row,
+            run_btn_row1,
             text="结束",
             command=self._stop_running_tasks,
-            width=8,
+            width=7,
             state=tk.DISABLED,
         )
-        self.btn_stop.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_stop.pack(side=tk.LEFT, padx=(0, 4))
         self.btn_hosting = ttk.Button(
-            run_btn_row, text="一键辅助", command=self._run_hosting_batch, width=8
+            run_btn_row1, text="一键辅助", command=self._run_hosting_batch, width=8
         )
-        self.btn_hosting.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_hosting.pack(side=tk.LEFT, padx=(0, 4))
+        self.btn_quick_lighthouse = ttk.Button(
+            run_btn_row1,
+            text="一键情报",
+            command=lambda: self._start_quick_once_task("auto_lighthouse"),
+            width=8,
+        )
+        self.btn_quick_lighthouse.pack(side=tk.LEFT, padx=(0, 4))
+
+        run_btn_row2 = ttk.Frame(run_frame)
+        run_btn_row2.pack(fill=tk.X, pady=(4, 0))
         self.btn_quick_monster = ttk.Button(
-            run_btn_row,
+            run_btn_row2,
             text="一键打野",
             command=lambda: self._start_quick_loop_task("hunt_monster"),
             width=8,
         )
-        self.btn_quick_monster.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_quick_monster.pack(side=tk.LEFT, padx=(0, 4))
         self.btn_quick_ice = ttk.Button(
-            run_btn_row,
+            run_btn_row2,
             text="一键集结巨兽",
             command=lambda: self._start_quick_loop_task("hunt_ice_beast"),
-            width=12,
+            width=11,
         )
-        self.btn_quick_ice.pack(side=tk.LEFT)
+        self.btn_quick_ice.pack(side=tk.LEFT, padx=(0, 4))
+        self.btn_auto_click = ttk.Button(
+            run_btn_row2,
+            text="一键连点",
+            command=self._start_auto_click,
+            width=8,
+        )
+        self.btn_auto_click.pack(side=tk.LEFT)
 
         status_row = ttk.Frame(run_frame)
         status_row.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -1111,6 +1184,96 @@ class EndlessWinterApp(tk.Tk):
             command=self._save_config,
         ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
 
+        tab_auto_click = ttk.Frame(notebook, padding=6)
+        notebook.add(tab_auto_click, text="一键连点")
+        _configure_param_tab_grid(tab_auto_click)
+
+        row = 0
+        ttk.Label(tab_auto_click, text="连点间隔").grid(
+            row=row, column=0, sticky=tk.W, pady=2
+        )
+        interval_row = ttk.Frame(tab_auto_click)
+        interval_row.grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
+        self.spn_auto_click_interval = ttk.Spinbox(
+            interval_row,
+            from_=0.05,
+            to=10.0,
+            increment=0.05,
+            textvariable=self.var_auto_click_interval,
+            width=6,
+            command=self._save_config,
+        )
+        self.spn_auto_click_interval.pack(side=tk.LEFT)
+        ttk.Label(interval_row, text="秒").pack(side=tk.LEFT, padx=(4, 0))
+        row += 1
+
+        ttk.Label(tab_auto_click, text="选用坐标").grid(
+            row=row, column=0, sticky=tk.W, pady=2
+        )
+        self.cmb_auto_click_selected_param = ttk.Combobox(
+            tab_auto_click,
+            textvariable=self.var_auto_click_selected,
+            values=[p["name"] for p in self._auto_click_points],
+            width=16,
+            state="readonly",
+        )
+        self.cmb_auto_click_selected_param.grid(
+            row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX
+        )
+        self.cmb_auto_click_selected_param.bind(
+            "<<ComboboxSelected>>", self._on_auto_click_selected_changed
+        )
+        row += 1
+
+        ttk.Label(tab_auto_click, text="坐标名称").grid(
+            row=row, column=0, sticky=tk.W, pady=2
+        )
+        ttk.Entry(
+            tab_auto_click, textvariable=self.var_auto_click_name, width=18
+        ).grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
+        row += 1
+
+        ttk.Label(tab_auto_click, text="点击坐标").grid(
+            row=row, column=0, sticky=tk.W, pady=2
+        )
+        coord_row = ttk.Frame(tab_auto_click)
+        coord_row.grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
+        self.spn_auto_click_x = ttk.Spinbox(
+            coord_row,
+            from_=0,
+            to=PORTRAIT_WIDTH - 1,
+            textvariable=self.var_auto_click_x,
+            width=6,
+        )
+        self.spn_auto_click_x.pack(side=tk.LEFT)
+        ttk.Label(coord_row, text=",").pack(side=tk.LEFT, padx=2)
+        self.spn_auto_click_y = ttk.Spinbox(
+            coord_row,
+            from_=0,
+            to=PORTRAIT_HEIGHT - 1,
+            textvariable=self.var_auto_click_y,
+            width=6,
+        )
+        self.spn_auto_click_y.pack(side=tk.LEFT)
+        row += 1
+
+        btn_row = ttk.Frame(tab_auto_click)
+        btn_row.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
+        ttk.Button(
+            btn_row, text="保存坐标", width=10, command=self._save_auto_click_point
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            btn_row, text="删除选中", width=10, command=self._delete_auto_click_point
+        ).pack(side=tk.LEFT)
+        row += 1
+
+        ttk.Label(
+            tab_auto_click,
+            text="可用「坐标标尺」查看坐标后填入并保存；一键连点使用上方选用项",
+            font=("", 8),
+            foreground="gray",
+        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
+
         tab_mining = ttk.Frame(notebook, padding=6)
         notebook.add(tab_mining, text="自动采集")
         _configure_param_tab_grid(tab_mining)
@@ -1236,7 +1399,7 @@ class EndlessWinterApp(tk.Tk):
             value=max(1, int(round(float(alliance_merged.get("scan_interval", 360)) / 60)))
         )
         self.var_alliance_admin_scan_minutes = tk.IntVar(
-            value=max(1, int(round(float(admin_merged.get("scan_interval", 360)) / 60)))
+            value=max(1, int(round(float(admin_merged.get("scan_interval", 600)) / 60)))
         )
 
         for type_id in GUI_ALLIANCE_TYPE_ORDER:
@@ -1973,6 +2136,11 @@ class EndlessWinterApp(tk.Tk):
             and self._account_check_worker.is_alive()
         )
 
+    def _is_auto_click_running(self) -> bool:
+        return (
+            self._auto_click_worker is not None and self._auto_click_worker.is_alive()
+        )
+
     def _is_any_running(self) -> bool:
         return (
             self._is_loop_running()
@@ -1980,6 +2148,7 @@ class EndlessWinterApp(tk.Tk):
             or self._is_any_dream_running()
             or self._is_alliance_running()
             or self._is_account_check_running()
+            or self._is_auto_click_running()
         )
 
     def _configure_once_action_buttons(self, *, enabled: bool) -> None:
@@ -1998,7 +2167,7 @@ class EndlessWinterApp(tk.Tk):
         return tasks
 
     def _update_run_control_buttons(self, *, running: bool | None = None) -> None:
-        """统一刷新开始/结束/一键辅助/打野/巨兽/检查账号按钮状态。"""
+        """统一刷新开始/结束/一键辅助/情报/打野/巨兽/连点/检查账号按钮状态。"""
         if running is None:
             running = self._is_any_running()
         if hasattr(self, "btn_start"):
@@ -2007,12 +2176,26 @@ class EndlessWinterApp(tk.Tk):
             self.btn_stop.configure(state=tk.NORMAL if running else tk.DISABLED)
         if hasattr(self, "btn_hosting"):
             self.btn_hosting.configure(state=tk.DISABLED if running else tk.NORMAL)
+        if hasattr(self, "btn_quick_lighthouse"):
+            self.btn_quick_lighthouse.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
         if hasattr(self, "btn_quick_monster"):
             self.btn_quick_monster.configure(
                 state=tk.DISABLED if running else tk.NORMAL
             )
         if hasattr(self, "btn_quick_ice"):
             self.btn_quick_ice.configure(state=tk.DISABLED if running else tk.NORMAL)
+        if hasattr(self, "btn_auto_click"):
+            self.btn_auto_click.configure(state=tk.DISABLED if running else tk.NORMAL)
+        if hasattr(self, "cmb_auto_click_selected_param"):
+            self.cmb_auto_click_selected_param.configure(
+                state=tk.DISABLED if running else "readonly"
+            )
+        if hasattr(self, "spn_auto_click_interval"):
+            self.spn_auto_click_interval.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
         if hasattr(self, "btn_check_account"):
             self.btn_check_account.configure(
                 state=tk.DISABLED if running else tk.NORMAL
@@ -2094,6 +2277,8 @@ class EndlessWinterApp(tk.Tk):
             self._stop_dream_session(pk=True)
         if self._is_account_check_running():
             self._stop_check_account_name()
+        if self._is_auto_click_running():
+            self._stop_auto_click()
 
     def _read_account_name_from_screen(self, screen) -> str:
         x1, y1, x2, y2 = ACCOUNT_NAME_ROI
@@ -2104,10 +2289,36 @@ class EndlessWinterApp(tk.Tk):
             return ""
         crop = screen[y1:y2, x1:x2]
         big = cv2.resize(crop, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-        text, engine = ocr_chip_text(big)
+        text, engine = ocr_chip_text(big, clean=False)
         cleaned = re.sub(r"\s+", "", (text or "").strip())
-        # 去掉常见 OCR 噪点符号，保留中文/字母/数字/下划线
-        cleaned = re.sub(r"[^\w\u4e00-\u9fff·•\-]", "", cleaned)
+        # 保留联盟简称括号（游戏字体常像缺角的 []），其余符号去掉
+        cleaned = re.sub(
+            r"[^\w\u4e00-\u9fff·•\-\[\]【】〔〕［］「」『』〖〗〈〉《》]",
+            "",
+            cleaned,
+        )
+        cleaned = cleaned.translate(
+            str.maketrans(
+                {
+                    "【": "[",
+                    "】": "]",
+                    "〔": "[",
+                    "〕": "]",
+                    "［": "[",
+                    "］": "]",
+                    "「": "[",
+                    "」": "]",
+                    "『": "[",
+                    "』": "]",
+                    "〖": "[",
+                    "〗": "]",
+                    "〈": "[",
+                    "〉": "]",
+                    "《": "[",
+                    "》": "]",
+                }
+            )
+        )
         self._on_status(f"账号名称 OCR({engine})：{cleaned or '空'}")
         return cleaned
 
@@ -2187,6 +2398,163 @@ class EndlessWinterApp(tk.Tk):
         self._account_check_worker = None
         self._update_run_control_buttons(running=False)
 
+    def _auto_click_point_names(self) -> list[str]:
+        return [str(p["name"]) for p in self._auto_click_points]
+
+    def _find_auto_click_point(self, name: str) -> dict | None:
+        name = name.strip()
+        for pt in self._auto_click_points:
+            if pt["name"] == name:
+                return pt
+        return None
+
+    def _refresh_auto_click_combos(self, *, selected: str | None = None) -> None:
+        names = self._auto_click_point_names()
+        if not names:
+            self._auto_click_points = [dict(DEFAULT_AUTO_CLICK_POINT)]
+            names = self._auto_click_point_names()
+        if selected is None:
+            selected = str(self.var_auto_click_selected.get()).strip()
+        if selected not in names:
+            selected = names[0]
+        self.var_auto_click_selected.set(selected)
+        if hasattr(self, "cmb_auto_click_selected_param"):
+            self.cmb_auto_click_selected_param.configure(values=names)
+            self.cmb_auto_click_selected_param.set(selected)
+        self._load_auto_click_point_to_editors(selected)
+
+    def _load_auto_click_point_to_editors(self, name: str) -> None:
+        pt = self._find_auto_click_point(name)
+        if pt is None:
+            return
+        self.var_auto_click_name.set(str(pt["name"]))
+        self.var_auto_click_x.set(int(pt["x"]))
+        self.var_auto_click_y.set(int(pt["y"]))
+
+    def _on_auto_click_selected_changed(self, _event=None) -> None:
+        name = str(self.var_auto_click_selected.get()).strip()
+        self._load_auto_click_point_to_editors(name)
+        try:
+            self._save_config()
+        except ValueError:
+            pass
+
+    def _save_auto_click_point(self) -> None:
+        name = str(self.var_auto_click_name.get()).strip()
+        if not name:
+            messagebox.showwarning("提示", "请填写坐标名称")
+            return
+        try:
+            x = int(self.var_auto_click_x.get())
+            y = int(self.var_auto_click_y.get())
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("参数错误", f"坐标无效：{exc}")
+            return
+        x = max(0, min(PORTRAIT_WIDTH - 1, x))
+        y = max(0, min(PORTRAIT_HEIGHT - 1, y))
+        self.var_auto_click_x.set(x)
+        self.var_auto_click_y.set(y)
+
+        existing = self._find_auto_click_point(name)
+        if existing is not None:
+            existing["x"] = x
+            existing["y"] = y
+        else:
+            self._auto_click_points.append({"name": name, "x": x, "y": y})
+        self._refresh_auto_click_combos(selected=name)
+        try:
+            self._save_config()
+        except ValueError as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+        self._on_status(f"已保存连点坐标：{name} ({x},{y})")
+
+    def _delete_auto_click_point(self) -> None:
+        name = str(self.var_auto_click_selected.get()).strip()
+        if not name:
+            messagebox.showwarning("提示", "没有可删除的坐标")
+            return
+        if len(self._auto_click_points) <= 1:
+            messagebox.showwarning("提示", "至少保留一个坐标")
+            return
+        if not messagebox.askyesno("确认", f"删除坐标「{name}」？"):
+            return
+        self._auto_click_points = [
+            p for p in self._auto_click_points if p["name"] != name
+        ]
+        self._refresh_auto_click_combos(selected=self._auto_click_points[0]["name"])
+        try:
+            self._save_config()
+        except ValueError as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+        self._on_status(f"已删除连点坐标：{name}")
+
+    def _resolve_auto_click_target(self) -> tuple[str, int, int]:
+        """优先使用下拉选中项对应坐标。"""
+        selected = str(self.var_auto_click_selected.get()).strip()
+        pt = self._find_auto_click_point(selected)
+        if pt is not None:
+            return str(pt["name"]), int(pt["x"]), int(pt["y"])
+        if self._auto_click_points:
+            pt = self._auto_click_points[0]
+            return str(pt["name"]), int(pt["x"]), int(pt["y"])
+        return (
+            str(DEFAULT_AUTO_CLICK_POINT["name"]),
+            int(DEFAULT_AUTO_CLICK_POINT["x"]),
+            int(DEFAULT_AUTO_CLICK_POINT["y"]),
+        )
+
+    def _start_auto_click(self) -> None:
+        """一键连点：按选用坐标持续点击，直到点「结束」。"""
+        if self._is_any_running():
+            messagebox.showwarning("提示", "已有任务在运行，请先点「结束」")
+            return
+
+        try:
+            self._save_config()
+            interval = max(0.01, float(self.var_auto_click_interval.get()))
+            name, x, y = self._resolve_auto_click_target()
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("参数错误", f"连点参数无效：{exc}")
+            return
+
+        self._auto_click_stop_event.clear()
+        self._update_run_control_buttons(running=True)
+        self._on_status(f"一键连点：{name} ({x},{y}) 间隔 {interval:g}s")
+
+        def work() -> None:
+            count = 0
+            try:
+                if not self._ensure_device():
+                    return
+                adb = self._get_adb()
+                while not self._auto_click_stop_event.is_set():
+                    adb.tap(x, y)
+                    count += 1
+                    if count == 1 or count % 100 == 0:
+                        self._on_status(
+                            f"一键连点中：{name} ({x},{y}) 已点击 {count} 次"
+                        )
+                    if self._auto_click_stop_event.wait(interval):
+                        break
+                self._on_status(f"一键连点已停止（共 {count} 次）")
+            except Exception as exc:
+                self._on_status(f"一键连点异常：{exc}")
+            finally:
+                self.after(0, self._on_auto_click_done)
+
+        self._auto_click_worker = threading.Thread(target=work, daemon=True)
+        self._auto_click_worker.start()
+
+    def _stop_auto_click(self) -> None:
+        self._auto_click_stop_event.set()
+        self._on_status("正在停止一键连点…")
+
+    def _on_auto_click_done(self) -> None:
+        self._auto_click_worker = None
+        self._update_run_control_buttons(running=False)
+
     def _ensure_device(self) -> bool:
         adb = self._get_adb()
         if adb.wait_for_device(retries=10, interval=2.0):
@@ -2196,6 +2564,9 @@ class EndlessWinterApp(tk.Tk):
         return False
 
     def _start_loop(self) -> None:
+        if self._is_auto_click_running():
+            messagebox.showwarning("提示", "一键连点正在运行，请先点「结束」")
+            return
         if self._is_account_check_running():
             messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
             return
@@ -2237,6 +2608,9 @@ class EndlessWinterApp(tk.Tk):
             "hunt_ice_beast": "一键集结巨兽",
         }
         label = labels.get(task_id, task_id)
+        if self._is_auto_click_running():
+            messagebox.showwarning("提示", "一键连点正在运行，请先点「结束」")
+            return
         if self._is_account_check_running():
             messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
             return
@@ -2253,15 +2627,19 @@ class EndlessWinterApp(tk.Tk):
             messagebox.showwarning("提示", "联盟总动员正在运行，请先点「结束」")
             return
 
-        entry = next((e for e in loop_tasks() if e.task_id == task_id), None)
-        if entry is None or not entry.available:
+        builders = {
+            "hunt_monster": self._build_monster_task,
+            "hunt_ice_beast": self._build_ice_beast_task,
+        }
+        builder = builders.get(task_id)
+        if builder is None:
             messagebox.showwarning("提示", f"「{label}」任务不可用")
             return
 
         try:
             self._save_config()
             self.config = self._load_config()
-            task = self._build_task_instance(entry)
+            task = builder()
         except Exception as exc:
             messagebox.showerror("参数错误", str(exc))
             return
@@ -2291,7 +2669,82 @@ class EndlessWinterApp(tk.Tk):
         self._loop_worker = threading.Thread(target=work, daemon=True)
         self._loop_worker.start()
 
+    def _start_quick_once_task(self, task_id: str) -> None:
+        """一键情报等：直接执行对应一次性任务（不依赖勾选）。"""
+        labels = {
+            "auto_lighthouse": "一键情报",
+        }
+        label = labels.get(task_id, task_id)
+        if self._is_auto_click_running():
+            messagebox.showwarning("提示", "一键连点正在运行，请先点「结束」")
+            return
+        if self._is_account_check_running():
+            messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
+            return
+        if self._is_once_running():
+            messagebox.showwarning("提示", "任务正在执行中")
+            return
+        if self._is_loop_running():
+            messagebox.showwarning("提示", "循环任务运行中，请先停止")
+            return
+        if self._is_any_dream_running():
+            messagebox.showwarning("提示", "寻梦记忆正在运行，请先点「结束」")
+            return
+        if self._is_alliance_running():
+            messagebox.showwarning("提示", "联盟总动员正在运行，请先点「结束」")
+            return
+
+        builders = {
+            "auto_lighthouse": self._build_auto_lighthouse_task,
+        }
+        builder = builders.get(task_id)
+        if builder is None:
+            messagebox.showwarning("提示", f"「{label}」任务不可用")
+            return
+
+        try:
+            self._save_config()
+            self.config = self._load_config()
+            task = builder()
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+
+        if task is None:
+            messagebox.showwarning("提示", f"「{label}」任务不可用")
+            return
+
+        self._once_tasks = [task]
+        self._once_stop_event.clear()
+        self._set_once_buttons(running=True)
+        self._on_status(f"{label}：{task.name}")
+
+        def work():
+            try:
+                if not self._ensure_device():
+                    return
+                if self._once_stop_event.is_set():
+                    self._on_status(f"{label}已取消")
+                    return
+                self._execute_hosting_task(task)
+                if self._once_stop_event.is_set():
+                    self._on_status(f"{label}已取消")
+                    return
+                self._on_status(f"{label}完成")
+            except InterruptedError:
+                self._on_status(f"{label}已停止")
+            except Exception as exc:
+                self._on_status(f"{label}异常：{exc}")
+            finally:
+                self.after(0, self._on_once_worker_done)
+
+        self._once_worker = threading.Thread(target=work, daemon=True)
+        self._once_worker.start()
+
     def _run_once_batch(self) -> None:
+        if self._is_auto_click_running():
+            messagebox.showwarning("提示", "一键连点正在运行，请先点「结束」")
+            return
         if self._is_once_running():
             messagebox.showwarning("提示", "一次性任务正在执行中")
             return
@@ -2353,6 +2806,9 @@ class EndlessWinterApp(tk.Tk):
         self._once_worker.start()
 
     def _run_hosting_batch(self) -> None:
+        if self._is_auto_click_running():
+            messagebox.showwarning("提示", "一键连点正在运行，请先点「结束」")
+            return
         if self._is_account_check_running():
             messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
             return
@@ -2536,6 +2992,7 @@ class EndlessWinterApp(tk.Tk):
             or self._is_once_running()
             or self._is_any_dream_running()
             or self._is_alliance_running()
+            or self._is_auto_click_running()
         ):
             messagebox.showwarning("提示", "请先停止其他任务")
             return
@@ -2640,6 +3097,7 @@ class EndlessWinterApp(tk.Tk):
             self._is_loop_running()
             or self._is_once_running()
             or self._is_any_dream_running()
+            or self._is_auto_click_running()
         ):
             messagebox.showwarning("提示", "请先停止其他任务")
             return
@@ -2715,6 +3173,7 @@ class EndlessWinterApp(tk.Tk):
             self._is_loop_running()
             or self._is_once_running()
             or self._is_any_dream_running()
+            or self._is_auto_click_running()
         ):
             messagebox.showwarning("提示", "请先停止其他任务")
             return
@@ -2801,6 +3260,7 @@ class EndlessWinterApp(tk.Tk):
                 self._stop_alliance_mobilization()
                 self._stop_alliance_admin()
                 self._stop_check_account_name()
+                self._stop_auto_click()
                 self.destroy()
         else:
             try:

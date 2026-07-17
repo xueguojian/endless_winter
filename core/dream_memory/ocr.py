@@ -55,9 +55,12 @@ def normalize_item_name_for_match(text: str) -> str:
     return clean_ocr_text(text)
 
 
-def clean_ocr_text(raw: str) -> str:
+def clean_ocr_text(raw: str, *, keep_brackets: bool = False) -> str:
     text = raw.replace("\n", "").replace(" ", "").strip()
-    text = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", text)
+    if keep_brackets:
+        text = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9\[\]【】〔〕［］「」『』]", "", text)
+    else:
+        text = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", text)
     return text
 
 
@@ -66,6 +69,7 @@ def ocr_chip(
     *,
     tesseract_cmd: Path | str | None = None,
     lang: str = "chi_sim",
+    keep_brackets: bool = False,
 ) -> str:
     if pytesseract is None:
         raise RuntimeError("pytesseract 未安装")
@@ -87,7 +91,7 @@ def ocr_chip(
             "未找到 tesseract.exe，请在 config_555x.yaml dream_memory.tesseract_cmd 配置路径"
         ) from exc
 
-    text = clean_ocr_text(raw)
+    text = clean_ocr_text(raw, keep_brackets=keep_brackets)
     if text:
         logger.debug(f"OCR chip: {raw!r} -> {text!r}")
     return text

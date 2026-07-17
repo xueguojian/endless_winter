@@ -67,21 +67,23 @@ def _prepare_chip(chip_bgr, *, scale: float = DEFAULT_SCALE):
     return cv2.resize(chip_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
 
-def _parse_rec_result(result) -> str:
+def _parse_rec_result(result, *, clean: bool = True) -> str:
     if not result:
         return ""
     line = result[0]
     if not line:
         return ""
     text = line[0]
-    if isinstance(text, str):
-        from core.dream_memory.ocr import clean_ocr_text
+    if not isinstance(text, str):
+        return ""
+    if not clean:
+        return text.replace("\n", "").strip()
+    from core.dream_memory.ocr import clean_ocr_text
 
-        return clean_ocr_text(text)
-    return ""
+    return clean_ocr_text(text)
 
 
-def ocr_chip_rapid(chip_bgr, *, scale: float = DEFAULT_SCALE) -> str:
+def ocr_chip_rapid(chip_bgr, *, scale: float = DEFAULT_SCALE, clean: bool = True) -> str:
     engine = _get_rec_engine()
     image = _prepare_chip(chip_bgr, scale=scale)
     if image.size == 0:
@@ -89,7 +91,7 @@ def ocr_chip_rapid(chip_bgr, *, scale: float = DEFAULT_SCALE) -> str:
     with _engine_lock:
         result, elapse = engine(image)
     total = sum(elapse) if elapse else 0.0
-    text = _parse_rec_result(result)
+    text = _parse_rec_result(result, clean=clean)
     if text:
         logger.debug(f"RapidOCR rec scale={scale}: {text!r} ({total:.3f}s)")
     return text

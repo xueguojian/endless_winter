@@ -26,14 +26,14 @@ DEFAULT_COORDS: dict[str, list[int]] = {
 # 「免费刷新」按钮文字区
 FREE_REFRESH_ROI = (504, 232, 676, 282)
 
-# 六个商品价格区（含货币图标 + 数量）
+# 六个商品价格区（含货币图标 + 数量）；略加宽以覆盖居中窄价签（煤/铁）
 PRICE_ROIS: tuple[tuple[int, int, int, int], ...] = (
-    (48, 634, 232, 680),
-    (264, 638, 454, 682),
-    (488, 628, 672, 678),
-    (46, 920, 234, 966),
-    (266, 930, 454, 970),
-    (486, 922, 672, 976),
+    (40, 628, 240, 686),
+    (256, 632, 462, 688),
+    (476, 622, 684, 686),
+    (40, 916, 240, 972),
+    (256, 924, 462, 976),
+    (476, 916, 684, 982),
 )
 
 DEFAULT_STEP_DELAY = 1.5
@@ -79,26 +79,57 @@ def is_free_refresh_available(screen: np.ndarray) -> bool:
     return ok
 
 
+def _content_column_segments(
+    col_ratio: np.ndarray, *, min_ratio: float = 0.18, max_gap: int = 2
+) -> list[tuple[int, int]]:
+    """把有内容的列合并成连续段 [(start, end), ...]。"""
+    xs = np.flatnonzero(col_ratio >= min_ratio)
+    if xs.size == 0:
+        return []
+    segments: list[tuple[int, int]] = []
+    start = prev = int(xs[0])
+    for x in xs[1:]:
+        xi = int(x)
+        if xi <= prev + max_gap:
+            prev = xi
+            continue
+        segments.append((start, prev))
+        start = prev = xi
+    segments.append((start, prev))
+    return segments
+
+
 def _extract_price_icon(crop: np.ndarray) -> np.ndarray | None:
     """从价格按钮中取出货币图标区域。
 
-    小数额时整块（图标+数字）会居中，左侧多为空白；先找非底色内容列，
-    再取内容块最左侧一段作为图标，避免漏识别铁矿等窄价签。
+    小数额时整块会居中；大额宽价签左侧是图标、右侧是长数字。
+    用暗色列定位起点后只取较短窗口，避免把深蓝数字吃进图标区。
     """
     if crop.size == 0:
         return None
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    sat = hsv[:, :, 1]
-    val = hsv[:, :, 2]
-    # 按钮底多为浅色低饱和；图标/数字更暗或更艳
-    interesting = (sat > 40) | (val < 170)
-    col_ratio = interesting.mean(axis=0)
-    # 忽略零星噪点，要求该列有足够内容像素
-    xs = np.flatnonzero(col_ratio >= 0.18)
-    if xs.size == 0:
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    dark_ratio = (gray < 135).mean(axis=0)
+    segments = _content_column_segments(dark_ratio, min_ratio=0.10)
+    if not segments:
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        vivid = (hsv[:, :, 1] > 90) & (hsv[:, :, 2] > 80)
+        segments = _content_column_segments(vivid.mean(axis=0), min_ratio=0.12)
+    if not segments:
         return None
-    left = int(xs[0])
-    right = min(crop.shape[1], left + 52)
+
+    left: int | None = None
+    for start, end in segments:
+        if end - start + 1 >= 3:
+            left = start
+            break
+    if left is None:
+        left = segments[0][0]
+
+    left = max(0, left - 4)
+    # 货币图标本身约 24~36px；宽价签切太长会把深蓝数字算进青色
+    right = min(crop.shape[1], left + 36)
+    if right - left < 10:
+        left = max(0, right - 28)
     if right - left < 8:
         return None
     return crop[:, left:right]
@@ -114,23 +145,23 @@ def _score_currency_masks(icon: np.ndarray) -> tuple[float, float]:
     if content_n < 12:
         return 0.0, 0.0
 
-    cyan_m = cv2.inRange(hsv, (85, 70, 100), (120, 255, 255)) > 0
+    # 钻石：亮青宝石。V 要够高，避免宽价签里深蓝数字被当成钻石
+    cyan_m = cv2.inRange(hsv, (85, 70, 150), (120, 255, 255)) > 0
     wood_m = cv2.inRange(hsv, (5, 45, 50), (30, 255, 255)) > 0
-    coal_m = (sat < 95) & (val > 25) & (val < 155)
+    # 煤矿：暗灰块
+    coal_m = (sat < 110) & (val > 20) & (val < 170)
+    # 铁矿：偏褐灰，不用冷蓝 Hue（易与价格数字撞车）
     iron_m = (
         (sat >= 12)
         & (sat < 120)
         & (val > 35)
         & (val < 180)
-        & (
-            ((hsv[:, :, 0] >= 0) & (hsv[:, :, 0] <= 28))
-            | ((hsv[:, :, 0] >= 90) & (hsv[:, :, 0] <= 140))
-        )
+        & (hsv[:, :, 0] >= 0)
+        & (hsv[:, :, 0] <= 35)
     )
     meat_m = (cv2.inRange(hsv, (0, 55, 55), (14, 255, 255)) > 0) | (
         cv2.inRange(hsv, (160, 55, 55), (180, 255, 255)) > 0
     )
-    # 排除青色宝石像素，避免钻石暗部被煤/铁矿掩码吃掉
     resource_m = (wood_m | coal_m | iron_m | meat_m) & ~cyan_m
 
     cyan = float((cyan_m & content).sum()) / content_n
@@ -138,21 +169,59 @@ def _score_currency_masks(icon: np.ndarray) -> tuple[float, float]:
     return cyan, resource
 
 
-def classify_price_kind(crop: np.ndarray) -> PriceKind:
-    """根据价格区货币图标颜色判断：钻石 / 资源 / 空。"""
-    icon = _extract_price_icon(crop)
-    if icon is None:
-        return "empty"
-
-    cyan, resource = _score_currency_masks(icon)
-    # 铁矿等资源色可能与冷灰接近，资源分优先于弱青色
-    if resource >= 0.12 and resource >= cyan * 0.75:
+def _decide_kind(cyan: float, resource: float) -> PriceKind:
+    """同一窗口内比较青色(钻石)与资源色。"""
+    if resource >= 0.14 and resource >= cyan * 0.5:
         return "resource"
-    if cyan >= 0.10:
+    if resource >= 0.10 and resource >= cyan * 0.75:
+        return "resource"
+    if cyan >= 0.12 and cyan >= resource * 1.15:
         return "diamond"
     if resource >= 0.08:
         return "resource"
+    if cyan >= 0.08:
+        return "diamond"
     return "empty"
+
+
+def classify_price_kind(crop: np.ndarray) -> PriceKind:
+    """根据价格区货币图标颜色判断：钻石 / 资源 / 空。"""
+    if crop.size == 0:
+        return "empty"
+
+    windows: list[np.ndarray] = []
+    icon = _extract_price_icon(crop)
+    if icon is not None:
+        windows.append(icon)
+    windows.append(crop)
+
+    w = crop.shape[1]
+    # 宽价签：优先看左侧图标区；窄价签：多扫几个居中位置
+    for x0 in (0, 8, 16, 24, 36, max(0, w // 2 - 40), max(0, w // 3)):
+        win = crop[:, x0 : min(w, x0 + 40)]
+        if win.shape[1] >= 12:
+            windows.append(win)
+
+    saw_resource = False
+    saw_diamond = False
+    best_resource = 0.0
+    best_cyan = 0.0
+    for win in windows:
+        cyan, resource = _score_currency_masks(win)
+        best_resource = max(best_resource, resource)
+        best_cyan = max(best_cyan, cyan)
+        kind = _decide_kind(cyan, resource)
+        if kind == "resource":
+            saw_resource = True
+        elif kind == "diamond":
+            saw_diamond = True
+
+    # 任一窗口明确是资源则买；避免「别的窗口青色更高」把宽价签打成钻石
+    if saw_resource:
+        return "resource"
+    if saw_diamond:
+        return "diamond"
+    return _decide_kind(best_cyan, best_resource)
 
 
 def list_resource_price_centers(
@@ -262,21 +331,25 @@ class AutoShopExchangeTask:
         self._emit("打开商店")
         self._tap("shop_open", delay=2.5)
 
+        # 无论是否免费刷新，先买光当前页资源价（避免漏掉煤/铁窄价签商品）
+        self._emit("扫描并购买当前页资源价商品…")
+        total_bought = self._buy_all_resource_items()
+
         screen = self.adb.screenshot()
         if not is_free_refresh_available(screen):
-            self._emit("当前不是「免费刷新」，结束任务")
+            self._emit("当前不是「免费刷新」，已处理本页资源价后结束")
+            self._emit(f"自动换资源完成，共购买 {total_bought} 次")
             return
 
-        self._emit("检测到免费刷新，开始换资源")
-        total_bought = 0
+        self._emit("检测到免费刷新，继续刷新换资源")
         for round_index in range(1, MAX_REFRESH_ROUNDS + 1):
             self._check_stop()
             self._emit(f"—— 刷新轮次 {round_index} ——")
+            self._tap_free_refresh()
             total_bought += self._buy_all_resource_items()
 
             screen = self.adb.screenshot()
             if is_free_refresh_available(screen):
-                self._tap_free_refresh()
                 continue
 
             self._emit("免费刷新已用尽，任务结束")

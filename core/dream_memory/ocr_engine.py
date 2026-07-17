@@ -40,20 +40,28 @@ def ocr_chip_text(
     *,
     engine: str | None = None,
     tesseract_cmd: Path | str | None = None,
+    clean: bool = True,
 ) -> tuple[str, str]:
-    """识别槽位文字，返回 (文本, 引擎标识)。"""
+    """识别槽位文字，返回 (文本, 引擎标识)。
+
+    clean=False 时保留括号等符号（用于账号名联盟简称）。
+    """
     if chip_bgr.size == 0:
         return "", ""
 
     resolved = resolve_ocr_engine(engine)
     if resolved == OCR_ENGINE_RAPID:
         try:
-            return ocr_chip_rapid(chip_bgr), OCR_ENGINE_RAPID
+            return ocr_chip_rapid(chip_bgr, clean=clean), OCR_ENGINE_RAPID
         except Exception as exc:
             logger.warning(f"RapidOCR 失败，回退 Tesseract: {exc}")
             resolved = OCR_ENGINE_TESSERACT
 
-    text = ocr_chip(chip_bgr, tesseract_cmd=tesseract_cmd)
+    text = ocr_chip(
+        chip_bgr,
+        tesseract_cmd=tesseract_cmd,
+        keep_brackets=not clean,
+    )
     return text, OCR_ENGINE_TESSERACT
 
 

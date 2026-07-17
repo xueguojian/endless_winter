@@ -18,6 +18,13 @@ gui:
   show_console: true
   log_visible: true
   account_name: ''
+  auto_click:
+    interval: 0.1
+    selected: 联盟互助
+    points:
+    - name: 联盟互助
+      x: 532
+      y: 1104
 tasks:
   common:
     use_formation: true
@@ -355,7 +362,7 @@ alliance_mobilization_admin:
   target_types:
   - train
   score_threshold: 400
-  scan_interval: 360
+  scan_interval: 600
   step_delay: 1.0
   match_threshold: 0.66
   countdown_threshold: 0.62
