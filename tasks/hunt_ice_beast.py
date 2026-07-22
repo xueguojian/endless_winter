@@ -30,6 +30,11 @@ from core.stamina_use import (
     use_stamina_cans_batch,
 )
 from core.vision import MatchResult, Vision
+from core.common_task_opts import (
+    DEFAULT_ICE_BEAST_TAB,
+    resolve_search_tab_step,
+    shift_search_tab_xy,
+)
 
 StatusCallback = Callable[[str], None]
 
@@ -152,6 +157,7 @@ class HuntIceBeastTask:
         stamina_can_limit: int = DEFAULT_STAMINA_CAN_LIMIT,
         use_formation: bool = True,
         adjust_level: bool = False,
+        beast_icon_index: int = 0,
         on_status: StatusCallback | None = None,
     ):
         self.adb = adb
@@ -162,6 +168,8 @@ class HuntIceBeastTask:
         self.formation_name = str(formation_name).strip()
         self.use_formation = use_formation
         self.adjust_level = adjust_level
+        self.beast_icon_index = max(0, int(beast_icon_index))
+        self._search_tab_step = resolve_search_tab_step(coords)
         if rally_duration_minutes not in RALLY_TIME_COORDS:
             raise ValueError(
                 f"集结时长仅支持 {list(RALLY_DURATION_OPTIONS)} 分钟，"
@@ -360,15 +368,17 @@ class HuntIceBeastTask:
             time.sleep(0.25)
 
     def _ice_beast_tab_fallback_xy(self) -> tuple[int, int]:
-        """滚到最右端后，从左起第 2 个 tab（冰原巨兽）的点击坐标。"""
+        """滚到最右端后，冰原巨兽 tab 的点击坐标（按野兽图标位置右移）。"""
         if "ice_beast_tab" in self.coords:
             x, y = self.coords["ice_beast_tab"]
-            return int(x), int(y)
-
-        x1, y1, x2, y2 = SEARCH_TAB_ROI
-        cy = (y1 + y2) // 2
-        cx = TAB_FIRST_CENTER_X + (ICE_BEAST_TAB_SLOT - 1) * TAB_ICON_SPACING
-        return cx, cy
+        else:
+            x, y = DEFAULT_ICE_BEAST_TAB
+        return shift_search_tab_xy(
+            int(x),
+            int(y),
+            beast_icon_index=self.beast_icon_index,
+            step=self._search_tab_step,
+        )
 
     def _select_ice_beast_tab(self) -> None:
         """滚到 tab 栏最右端后，点击从左起第 2 个 tab「冰原巨兽」。"""
@@ -426,7 +436,12 @@ class HuntIceBeastTask:
             tx, ty = self._ice_beast_tab_fallback_xy()
             logger.warning(
                 f"冰原巨兽 tab 模板未匹配（最高 {conf:.2f}），"
-                f"使用第 {ICE_BEAST_TAB_SLOT} 个槽位坐标 ({tx}, {ty})"
+                f"使用坐标 ({tx}, {ty})"
+                + (
+                    f"（野兽图标位置={self.beast_icon_index}）"
+                    if self.beast_icon_index
+                    else ""
+                )
             )
             self._tap_xy(tx, ty, delay=1.0)
 

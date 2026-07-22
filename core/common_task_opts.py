@@ -4,11 +4,68 @@ from __future__ import annotations
 
 from typing import Any
 
+# 搜索面板 tab：野兽(84) → 巨兽(205)，步径 121（活动期左侧多图标时按 index*步径右移）
+DEFAULT_BEAST_TAB = (84, 916)
+DEFAULT_ICE_BEAST_TAB = (205, 915)
+DEFAULT_SEARCH_TAB_STEP = DEFAULT_ICE_BEAST_TAB[0] - DEFAULT_BEAST_TAB[0]  # 121
+DEFAULT_BEAST_ICON_INDEX = 0
+
 
 def _section_bool(section: dict[str, Any], key: str, default: bool) -> bool | None:
     if key not in section:
         return None
     return bool(section[key])
+
+
+def resolve_beast_icon_index(tasks: dict[str, Any] | None = None, raw: Any = None) -> int:
+    """野兽图标位置（活动期左侧插入的图标个数），默认 0。"""
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return DEFAULT_BEAST_ICON_INDEX
+    tasks = tasks or {}
+    common = tasks.get("common") or {}
+    if "beast_icon_index" in common:
+        try:
+            return max(0, int(common["beast_icon_index"]))
+        except (TypeError, ValueError):
+            return DEFAULT_BEAST_ICON_INDEX
+    for key in ("hunt_monster", "hunt_ice_beast"):
+        sec = tasks.get(key) or {}
+        if "beast_icon_index" in sec:
+            try:
+                return max(0, int(sec["beast_icon_index"]))
+            except (TypeError, ValueError):
+                return DEFAULT_BEAST_ICON_INDEX
+    return DEFAULT_BEAST_ICON_INDEX
+
+
+def resolve_search_tab_step(coords: dict[str, Any] | None = None) -> int:
+    """从野兽/巨兽基准坐标推步径；缺省用 121。"""
+    coords = coords or {}
+    try:
+        beast_x = int((coords.get("beast_tab") or DEFAULT_BEAST_TAB)[0])
+        ice_x = int((coords.get("ice_beast_tab") or DEFAULT_ICE_BEAST_TAB)[0])
+        step = abs(ice_x - beast_x)
+        if step > 0:
+            return step
+    except (TypeError, ValueError, IndexError):
+        pass
+    return DEFAULT_SEARCH_TAB_STEP
+
+
+def shift_search_tab_xy(
+    x: int,
+    y: int,
+    *,
+    beast_icon_index: int = 0,
+    step: int | None = None,
+) -> tuple[int, int]:
+    """活动期 tab 右移：x' = x + index * step，y 不变。"""
+    index = max(0, int(beast_icon_index))
+    tab_step = DEFAULT_SEARCH_TAB_STEP if step is None else max(1, int(step))
+    return int(x) + index * tab_step, int(y)
 
 
 def resolve_common_options(tasks: dict[str, Any]) -> dict[str, Any]:
@@ -71,6 +128,7 @@ def resolve_common_options(tasks: dict[str, Any]) -> dict[str, Any]:
             default=800,
             sections=march_sections,
         ),
+        "beast_icon_index": resolve_beast_icon_index(tasks),
     }
 
 
@@ -81,11 +139,13 @@ def apply_common_options(tasks: dict[str, Any], opts: dict[str, Any]) -> None:
     adjust_level = bool(opts["adjust_level"])
     use_stamina = bool(opts["use_stamina"])
     stamina_can_limit = int(opts["stamina_can_limit"])
+    beast_icon_index = resolve_beast_icon_index(raw=opts.get("beast_icon_index", 0))
 
     common["use_formation"] = use_formation
     common["adjust_level"] = adjust_level
     common["use_stamina"] = use_stamina
     common["stamina_can_limit"] = stamina_can_limit
+    common["beast_icon_index"] = beast_icon_index
 
     for key in ("hunt_ice_beast", "hunt_monster"):
         sec = tasks.setdefault(key, {})
@@ -93,6 +153,7 @@ def apply_common_options(tasks: dict[str, Any], opts: dict[str, Any]) -> None:
         sec["use_stamina"] = use_stamina
         sec["stamina_can_limit"] = stamina_can_limit
         sec["adjust_level"] = adjust_level
+        sec["beast_icon_index"] = beast_icon_index
         sec.pop("check_march_heroes", None)
 
     mining = tasks.setdefault("auto_mining", {})

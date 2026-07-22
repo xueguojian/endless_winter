@@ -29,6 +29,10 @@ from core.stamina_use import (
     use_stamina_cans_batch,
 )
 from core.vision import MatchResult, Vision
+from core.common_task_opts import (
+    resolve_search_tab_step,
+    shift_search_tab_xy,
+)
 from tasks.hunt_ice_beast import (
     BTN_TOWN_LABEL,
     BTN_WILDERNESS_LABEL,
@@ -99,6 +103,7 @@ class HuntMonsterTask:
         stamina_can_limit: int = DEFAULT_STAMINA_CAN_LIMIT,
         use_formation: bool = True,
         adjust_level: bool = False,
+        beast_icon_index: int = 0,
         on_status: StatusCallback | None = None,
     ):
         self.adb = adb
@@ -114,6 +119,8 @@ class HuntMonsterTask:
         )
         self.use_formation = use_formation
         self.adjust_level = adjust_level
+        self.beast_icon_index = max(0, int(beast_icon_index))
+        self._search_tab_step = resolve_search_tab_step(self.coords)
         self.on_status = on_status
         self.vision = Vision(TEMPLATE_DIR, threshold=0.72)
 
@@ -265,16 +272,29 @@ class HuntMonsterTask:
             time.sleep(0.25)
 
     def _select_beast_tab(self) -> None:
-        """滚到 tab 栏最右端后，点击从左起第 1 个 tab「野兽」。"""
+        """滚到 tab 栏最右端后，点击「野兽」tab（按野兽图标位置右移）。"""
         if self._tab_bar_already_scrolled:
             self._emit("上次已是野兽任务，跳过 tab 栏拖动")
         else:
             self._scroll_search_tab_bar_to_rightmost()
             self._tab_bar_already_scrolled = True
 
-        tx, ty = self.coords["beast_tab"]
-        self._emit(f"选中野兽 tab @ ({tx},{ty})")
-        self._tap_xy(int(tx), int(ty), delay=1.0)
+        bx, by = self.coords["beast_tab"]
+        tx, ty = shift_search_tab_xy(
+            int(bx),
+            int(by),
+            beast_icon_index=self.beast_icon_index,
+            step=self._search_tab_step,
+        )
+        if self.beast_icon_index:
+            self._emit(
+                f"选中野兽 tab @ ({tx},{ty})"
+                f"（基准 {int(bx)},{int(by)} + 位置{self.beast_icon_index}"
+                f"×步径{self._search_tab_step}）"
+            )
+        else:
+            self._emit(f"选中野兽 tab @ ({tx},{ty})")
+        self._tap_xy(tx, ty, delay=1.0)
 
     def _tap_search_confirm(self) -> None:
         tx, ty = self.coords["search_confirm"]

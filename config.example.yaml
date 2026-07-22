@@ -18,19 +18,13 @@ gui:
   show_console: true
   log_visible: true
   account_name: ''
-  auto_click:
-    interval: 0.1
-    selected: 联盟互助
-    points:
-    - name: 联盟互助
-      x: 532
-      y: 1104
 tasks:
   common:
     use_formation: true
     adjust_level: false
     use_stamina: false
     stamina_can_limit: 800
+    beast_icon_index: 0
   hunt_monster:
     enabled: false
     interval: 60

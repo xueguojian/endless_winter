@@ -31,7 +31,9 @@ from core.dream_memory.ocr_engine import (
 )
 from core.coords import PORTRAIT_HEIGHT, PORTRAIT_WIDTH
 from core.navigation import WildernessNavigator, return_to_main_screen
+from gui.auto_clicker import AutoClickerWindow
 from gui.coord_ruler import CoordRulerWindow
+from gui.region_monitor import RegionMonitorWindow
 from gui.dream_memory_calibrator import DreamMemoryCalibratorWindow
 from gui.dream_memory_panel import (
     DreamTabWidgets,
@@ -93,12 +95,12 @@ ROOT = Path(__file__).parent.parent
 TASK_TAB_TO_PARAM_TAB: dict[str, str] = {
     "循环任务": "冰原巨兽",
     "一次性任务": "灯塔任务",
-    "联盟总动员自动刷新": "联盟总动员",
-    "联盟管理员刷新": "联盟总动员",
+    "联盟刷新": "联盟总动员",
+    "管理员刷新": "联盟总动员",
 }
 
-MAIN_WIDTH = 580
-MAIN_HEIGHT = 700
+MAIN_WIDTH = 760
+MAIN_HEIGHT = 820
 LOG_WIDTH = 300
 ONCE_TASK_GAP_SEC = 3
 ONCE_TASK_COLUMNS = 2
@@ -137,6 +139,8 @@ MINING_LEVEL_DEFAULT_MIN = 8
 MINING_LEVEL_DEFAULT_MAX = 8
 
 DEFAULT_AUTO_CLICK_POINT = {"name": "联盟互助", "x": 532, "y": 1104}
+DEFAULT_AUTO_CLICK_INTERVAL = 0.1
+
 
 def _normalize_formation_slot(raw) -> int:
     """将配置中的编队槽位规范为 1~8。"""
@@ -170,50 +174,41 @@ def _configure_param_tab_grid(tab: ttk.Frame) -> None:
 
 
 def _normalize_auto_click_config(raw: dict | None) -> dict:
-    """规范化一键连点配置：interval / selected / points。"""
+    """规范化连点器配置：interval / x / y。兼容旧版 points/selected。"""
     data = dict(raw or {})
     try:
-        interval = max(0.01, float(data.get("interval", 0.1)))
+        interval = max(0.01, float(data.get("interval", DEFAULT_AUTO_CLICK_INTERVAL)))
     except (TypeError, ValueError):
-        interval = 0.1
+        interval = DEFAULT_AUTO_CLICK_INTERVAL
 
-    points: list[dict] = []
-    raw_points = data.get("points")
-    if isinstance(raw_points, list):
-        for item in raw_points:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).strip()
-            if not name:
-                continue
-            try:
-                x = int(item.get("x", PORTRAIT_WIDTH // 2))
-                y = int(item.get("y", PORTRAIT_HEIGHT // 2))
-            except (TypeError, ValueError):
-                continue
-            x = max(0, min(PORTRAIT_WIDTH - 1, x))
-            y = max(0, min(PORTRAIT_HEIGHT - 1, y))
-            points.append({"name": name, "x": x, "y": y})
-
-    if not points:
-        points = [dict(DEFAULT_AUTO_CLICK_POINT)]
-
-    # 同名保留首次
-    dedup: list[dict] = []
-    seen: set[str] = set()
-    for pt in points:
-        if pt["name"] in seen:
-            continue
-        seen.add(pt["name"])
-        dedup.append(pt)
-    points = dedup
-
-    selected = str(data.get("selected", "")).strip()
-    names = {pt["name"] for pt in points}
-    if selected not in names:
-        selected = points[0]["name"]
-
-    return {"interval": interval, "selected": selected, "points": points}
+    x = data.get("x")
+    y = data.get("y")
+    if x is None or y is None:
+        points = data.get("points")
+        selected = str(data.get("selected", "")).strip()
+        if isinstance(points, list):
+            chosen = None
+            for item in points:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).strip()
+                if selected and name == selected:
+                    chosen = item
+                    break
+                if chosen is None:
+                    chosen = item
+            if chosen is not None:
+                x = chosen.get("x", DEFAULT_AUTO_CLICK_POINT["x"])
+                y = chosen.get("y", DEFAULT_AUTO_CLICK_POINT["y"])
+    try:
+        x = int(x if x is not None else DEFAULT_AUTO_CLICK_POINT["x"])
+        y = int(y if y is not None else DEFAULT_AUTO_CLICK_POINT["y"])
+    except (TypeError, ValueError):
+        x = int(DEFAULT_AUTO_CLICK_POINT["x"])
+        y = int(DEFAULT_AUTO_CLICK_POINT["y"])
+    x = max(0, min(PORTRAIT_WIDTH - 1, x))
+    y = max(0, min(PORTRAIT_HEIGHT - 1, y))
+    return {"interval": interval, "x": x, "y": y}
 
 
 def _bind_mousewheel_recursive(widget: tk.Misc, handler) -> None:
@@ -273,6 +268,7 @@ class EndlessWinterApp(tk.Tk):
         super().__init__()
         self.config_path = ensure_config_file(resolve_config_path(config_path))
         self.config = self._load_config()
+        self._cool_title = random.choice(WINDOW_TITLE_POOL)
 
         self._update_window_title()
         self.geometry(f"{MAIN_WIDTH}x{MAIN_HEIGHT}")
@@ -289,6 +285,8 @@ class EndlessWinterApp(tk.Tk):
         self._adb: AdbClient | None = None
         self._log_visible = True
         self._coord_ruler_window: CoordRulerWindow | None = None
+        self._auto_clicker_window: AutoClickerWindow | None = None
+        self._region_monitor_window: RegionMonitorWindow | None = None
         self._dream_memory_calibrator: DreamMemoryCalibratorWindow | None = None
         self._dream_pk_calibrator: DreamMemoryCalibratorWindow | None = None
         self._dream_widgets: DreamTabWidgets | None = None
@@ -325,13 +323,58 @@ class EndlessWinterApp(tk.Tk):
         name = str(gui.get("account_name", "")).strip()
         return name
 
+    def _adb_port_value(self) -> int:
+        dev = self.config.get("device", {})
+        try:
+            port = int(dev.get("adb_port", 0) or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if port:
+            return port
+        from core.config_path import infer_adb_port_from_stem
+
+        inferred = infer_adb_port_from_stem(self.config_path.stem)
+        return int(inferred or 5555)
+
     def _update_window_title(self) -> None:
-        self.title(random.choice(WINDOW_TITLE_POOL))
+        parts: list[str] = []
+        # 仅展示本会话已检查到的账号，启动时不读配置里的旧账号名
+        if hasattr(self, "lbl_account_name"):
+            shown = str(self.lbl_account_name.cget("text") or "").strip()
+            if shown and shown not in ("未知", "未识别"):
+                parts.append(shown)
+        parts.append(str(self._adb_port_value()))
+        cool = getattr(self, "_cool_title", None) or random.choice(WINDOW_TITLE_POOL)
+        parts.append(cool)
+        self.title(" · ".join(parts))
 
     def _set_account_name_display(self, name: str) -> None:
         text = name.strip() if name and name.strip() else "未知"
         if hasattr(self, "lbl_account_name"):
             self.lbl_account_name.configure(text=text)
+        self._update_window_title()
+        self._sync_auto_clicker_account_info()
+
+    def _displayed_account_name(self) -> str:
+        if hasattr(self, "lbl_account_name"):
+            shown = str(self.lbl_account_name.cget("text") or "").strip()
+            if shown and shown not in ("未知", "未识别"):
+                return shown
+        return ""
+
+    def _sync_auto_clicker_account_info(self) -> None:
+        win = getattr(self, "_auto_clicker_window", None)
+        if win is None:
+            return
+        try:
+            if not win.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        win.set_account_info(
+            account_name=self._displayed_account_name(),
+            port=self._adb_port_value(),
+        )
 
     def _task_enabled_in_config(self, entry: TaskEntry) -> bool:
         task_cfg = self.config.get("tasks", {}).get(entry.config_key, {})
@@ -375,6 +418,7 @@ class EndlessWinterApp(tk.Tk):
             "adjust_level": bool(self.var_common_adjust_level.get()),
             "use_stamina": bool(self.var_common_use_stamina.get()),
             "stamina_can_limit": int(self.var_common_stamina_can_limit.get()),
+            "beast_icon_index": int(self.var_beast_icon_index.get()),
         }
         apply_common_options(tasks, common_opts)
 
@@ -471,18 +515,14 @@ class EndlessWinterApp(tk.Tk):
             gui["account_name"] = account
         elif "account_name" not in gui:
             gui["account_name"] = ""
-        if hasattr(self, "var_auto_click_interval"):
+        # 连点器配置由连点器窗口写入，不在主面板编辑
+        if hasattr(self, "_auto_click_state"):
             auto_click = gui.setdefault("auto_click", {})
-            auto_click["interval"] = max(
-                0.01, float(self.var_auto_click_interval.get())
-            )
-            auto_click["selected"] = str(self.var_auto_click_selected.get()).strip()
-            auto_click["points"] = [
-                {"name": p["name"], "x": int(p["x"]), "y": int(p["y"])}
-                for p in getattr(self, "_auto_click_points", [])
-            ]
-            auto_click.pop("x", None)
-            auto_click.pop("y", None)
+            auto_click["interval"] = float(self._auto_click_state["interval"])
+            auto_click["x"] = int(self._auto_click_state["x"])
+            auto_click["y"] = int(self._auto_click_state["y"])
+            auto_click.pop("selected", None)
+            auto_click.pop("points", None)
 
         if hasattr(self, "var_device_serial"):
             serial = self.var_device_serial.get().strip()
@@ -857,74 +897,59 @@ class EndlessWinterApp(tk.Tk):
         self.lbl_account_name.pack(side=tk.LEFT, padx=(10, 0))
 
         click_cfg = _normalize_auto_click_config(gui_cfg.get("auto_click"))
-        self._auto_click_points = list(click_cfg["points"])
-        self.var_auto_click_interval = tk.StringVar(value=str(click_cfg["interval"]))
-        self.var_auto_click_selected = tk.StringVar(value=str(click_cfg["selected"]))
-        selected_pt = next(
-            (p for p in self._auto_click_points if p["name"] == click_cfg["selected"]),
-            self._auto_click_points[0],
-        )
-        self.var_auto_click_name = tk.StringVar(value=str(selected_pt["name"]))
-        self.var_auto_click_x = tk.IntVar(value=int(selected_pt["x"]))
-        self.var_auto_click_y = tk.IntVar(value=int(selected_pt["y"]))
+        self._auto_click_state = {
+            "interval": float(click_cfg["interval"]),
+            "x": int(click_cfg["x"]),
+            "y": int(click_cfg["y"]),
+        }
 
-        # 按钮分两行，避免一行挤不下
-        run_btn_row1 = ttk.Frame(run_frame)
-        run_btn_row1.pack(fill=tk.X)
+        # 运行控制按钮同一排
+        run_btn_row = ttk.Frame(run_frame)
+        run_btn_row.pack(fill=tk.X)
         self.btn_start = ttk.Button(
-            run_btn_row1, text="开始", command=self._start_from_current_tab, width=7
+            run_btn_row, text="开始", command=self._start_from_current_tab, width=8
         )
         self.btn_start.pack(side=tk.LEFT, padx=(0, 4))
         self.btn_stop = ttk.Button(
-            run_btn_row1,
+            run_btn_row,
             text="结束",
             command=self._stop_running_tasks,
-            width=7,
+            width=8,
             state=tk.DISABLED,
         )
         self.btn_stop.pack(side=tk.LEFT, padx=(0, 4))
         self.btn_hosting = ttk.Button(
-            run_btn_row1, text="一键辅助", command=self._run_hosting_batch, width=8
+            run_btn_row, text="一键辅助", command=self._run_hosting_batch, width=10
         )
         self.btn_hosting.pack(side=tk.LEFT, padx=(0, 4))
         self.btn_quick_lighthouse = ttk.Button(
-            run_btn_row1,
+            run_btn_row,
             text="一键情报",
             command=lambda: self._start_quick_once_task("auto_lighthouse"),
-            width=8,
+            width=10,
         )
         self.btn_quick_lighthouse.pack(side=tk.LEFT, padx=(0, 4))
-
-        run_btn_row2 = ttk.Frame(run_frame)
-        run_btn_row2.pack(fill=tk.X, pady=(4, 0))
         self.btn_quick_monster = ttk.Button(
-            run_btn_row2,
+            run_btn_row,
             text="一键打野",
             command=lambda: self._start_quick_loop_task("hunt_monster"),
-            width=8,
+            width=10,
         )
         self.btn_quick_monster.pack(side=tk.LEFT, padx=(0, 4))
         self.btn_quick_ice = ttk.Button(
-            run_btn_row2,
-            text="一键集结巨兽",
+            run_btn_row,
+            text="一键巨兽",
             command=lambda: self._start_quick_loop_task("hunt_ice_beast"),
-            width=11,
+            width=10,
         )
-        self.btn_quick_ice.pack(side=tk.LEFT, padx=(0, 4))
-        self.btn_auto_click = ttk.Button(
-            run_btn_row2,
-            text="一键连点",
-            command=self._start_auto_click,
-            width=8,
-        )
-        self.btn_auto_click.pack(side=tk.LEFT)
+        self.btn_quick_ice.pack(side=tk.LEFT)
 
         status_row = ttk.Frame(run_frame)
         status_row.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         self._status_lines: list[str] = ["待命"]
         self.txt_status = tk.Text(
             status_row,
-            height=2,
+            height=3,
             wrap=tk.WORD,
             font=("", 9),
             foreground="#555555",
@@ -952,7 +977,7 @@ class EndlessWinterApp(tk.Tk):
         self.cmb_device = ttk.Combobox(
             dev_row,
             textvariable=self.var_device_serial,
-            width=24,
+            width=20,
             state="readonly",
         )
         self.cmb_device.pack(side=tk.LEFT, padx=(6, 0))
@@ -961,13 +986,13 @@ class EndlessWinterApp(tk.Tk):
         ttk.Button(
             dev_row,
             text="刷新设备",
-            width=8,
+            width=9,
             command=lambda: self._refresh_devices(probe=True),
         ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(
             dev_row,
             text="坐标标尺",
-            width=8,
+            width=9,
             command=self._open_coord_ruler,
         ).pack(side=tk.LEFT, padx=(6, 0))
         self.btn_check_account = ttk.Button(
@@ -1007,6 +1032,9 @@ class EndlessWinterApp(tk.Tk):
         self.var_common_stamina_can_limit = tk.IntVar(
             value=int(common_opts["stamina_can_limit"])
         )
+        self.var_beast_icon_index = tk.IntVar(
+            value=int(common_opts.get("beast_icon_index", 0))
+        )
 
         common_frame = ttk.LabelFrame(param_outer, text="通用出征 / 搜索", padding=6)
         common_frame.pack(fill=tk.X, pady=(0, 6))
@@ -1043,6 +1071,23 @@ class EndlessWinterApp(tk.Tk):
         self.spn_common_stamina_can_limit.pack(side=tk.LEFT, padx=(6, 0))
         self._update_common_stamina_limit_state()
 
+        common_row2 = ttk.Frame(common_frame)
+        common_row2.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(common_row2, text="野兽图标位置").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            common_row2,
+            from_=0,
+            to=5,
+            textvariable=self.var_beast_icon_index,
+            width=4,
+            command=self._save_config,
+        ).pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Label(
+            common_row2,
+            text="活动期左侧多出的图标个数；0=无活动（打野/巨兽 tab 右移）",
+            font=("", 8),
+            foreground="gray",
+        ).pack(side=tk.LEFT)
         self.var_interval = tk.IntVar(value=hunt_cfg.get("interval", 120) // 60)
         self.var_lighthouse_interval = tk.IntVar(
             value=max(1, int(lighthouse_cfg.get("interval", 60) // 60))
@@ -1183,96 +1228,6 @@ class EndlessWinterApp(tk.Tk):
             variable=self.var_lighthouse_event_period,
             command=self._save_config,
         ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
-
-        tab_auto_click = ttk.Frame(notebook, padding=6)
-        notebook.add(tab_auto_click, text="一键连点")
-        _configure_param_tab_grid(tab_auto_click)
-
-        row = 0
-        ttk.Label(tab_auto_click, text="连点间隔").grid(
-            row=row, column=0, sticky=tk.W, pady=2
-        )
-        interval_row = ttk.Frame(tab_auto_click)
-        interval_row.grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
-        self.spn_auto_click_interval = ttk.Spinbox(
-            interval_row,
-            from_=0.05,
-            to=10.0,
-            increment=0.05,
-            textvariable=self.var_auto_click_interval,
-            width=6,
-            command=self._save_config,
-        )
-        self.spn_auto_click_interval.pack(side=tk.LEFT)
-        ttk.Label(interval_row, text="秒").pack(side=tk.LEFT, padx=(4, 0))
-        row += 1
-
-        ttk.Label(tab_auto_click, text="选用坐标").grid(
-            row=row, column=0, sticky=tk.W, pady=2
-        )
-        self.cmb_auto_click_selected_param = ttk.Combobox(
-            tab_auto_click,
-            textvariable=self.var_auto_click_selected,
-            values=[p["name"] for p in self._auto_click_points],
-            width=16,
-            state="readonly",
-        )
-        self.cmb_auto_click_selected_param.grid(
-            row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX
-        )
-        self.cmb_auto_click_selected_param.bind(
-            "<<ComboboxSelected>>", self._on_auto_click_selected_changed
-        )
-        row += 1
-
-        ttk.Label(tab_auto_click, text="坐标名称").grid(
-            row=row, column=0, sticky=tk.W, pady=2
-        )
-        ttk.Entry(
-            tab_auto_click, textvariable=self.var_auto_click_name, width=18
-        ).grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
-        row += 1
-
-        ttk.Label(tab_auto_click, text="点击坐标").grid(
-            row=row, column=0, sticky=tk.W, pady=2
-        )
-        coord_row = ttk.Frame(tab_auto_click)
-        coord_row.grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
-        self.spn_auto_click_x = ttk.Spinbox(
-            coord_row,
-            from_=0,
-            to=PORTRAIT_WIDTH - 1,
-            textvariable=self.var_auto_click_x,
-            width=6,
-        )
-        self.spn_auto_click_x.pack(side=tk.LEFT)
-        ttk.Label(coord_row, text=",").pack(side=tk.LEFT, padx=2)
-        self.spn_auto_click_y = ttk.Spinbox(
-            coord_row,
-            from_=0,
-            to=PORTRAIT_HEIGHT - 1,
-            textvariable=self.var_auto_click_y,
-            width=6,
-        )
-        self.spn_auto_click_y.pack(side=tk.LEFT)
-        row += 1
-
-        btn_row = ttk.Frame(tab_auto_click)
-        btn_row.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
-        ttk.Button(
-            btn_row, text="保存坐标", width=10, command=self._save_auto_click_point
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
-            btn_row, text="删除选中", width=10, command=self._delete_auto_click_point
-        ).pack(side=tk.LEFT)
-        row += 1
-
-        ttk.Label(
-            tab_auto_click,
-            text="可用「坐标标尺」查看坐标后填入并保存；一键连点使用上方选用项",
-            font=("", 8),
-            foreground="gray",
-        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
 
         tab_mining = ttk.Frame(notebook, padding=6)
         notebook.add(tab_mining, text="自动采集")
@@ -1516,17 +1471,17 @@ class EndlessWinterApp(tk.Tk):
         )
 
         tab_alliance_run = ttk.Frame(task_notebook, padding=6)
-        task_notebook.add(tab_alliance_run, text="联盟总动员自动刷新")
+        task_notebook.add(tab_alliance_run, text="联盟刷新")
 
         tab_alliance_admin_run = ttk.Frame(task_notebook, padding=6)
-        task_notebook.add(tab_alliance_admin_run, text="联盟管理员刷新")
+        task_notebook.add(tab_alliance_admin_run, text="管理员刷新")
 
         tab_dream = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_dream, text="寻梦记忆")
         self._build_dream_memory_tab(tab_dream)
 
         tab_dream_pk = ttk.Frame(task_notebook, padding=6)
-        task_notebook.add(tab_dream_pk, text="寻梦记忆PK")
+        task_notebook.add(tab_dream_pk, text="寻梦PK")
         self._build_dream_pk_tab(tab_dream_pk)
 
         self._task_notebook.bind("<<NotebookTabChanged>>", self._on_task_notebook_changed)
@@ -1559,6 +1514,8 @@ class EndlessWinterApp(tk.Tk):
             command=self._save_config,
         )
         system_menu.add_separator()
+        system_menu.add_command(label="连点器", command=self._open_auto_clicker)
+        system_menu.add_command(label="区域监控", command=self._open_region_monitor)
         system_menu.add_command(label="测试连接", command=self._test_connection_with_dialog)
 
     def _sync_log_menu_check(self) -> None:
@@ -1597,7 +1554,7 @@ class EndlessWinterApp(tk.Tk):
         self._test_connection(show_dialog=True)
 
     def _set_status_text(self, message: str) -> None:
-        """运行控制区状态：保留最近两行。"""
+        """运行控制区状态：保留最近三行。"""
         text = (message or "").strip()
         if text.startswith("状态："):
             text = text[3:].strip()
@@ -1610,7 +1567,7 @@ class EndlessWinterApp(tk.Tk):
         if lines and lines[-1] == text:
             return
         lines.append(text)
-        del lines[:-2]
+        del lines[:-3]
         body = "\n".join(f"状态：{line}" for line in lines)
         widget = getattr(self, "txt_status", None) or getattr(self, "lbl_status", None)
         if widget is None:
@@ -1816,6 +1773,30 @@ class EndlessWinterApp(tk.Tk):
             )
         self._coord_ruler_window.show_window()
 
+    def _open_region_monitor(self) -> None:
+        """系统菜单 → 区域监控：本机 DXGI/mss 抓雷电窗口 ROI。"""
+        dev = self.config.get("device", {})
+        touch_w = int(dev.get("touch_width", PORTRAIT_WIDTH))
+        touch_h = int(dev.get("touch_height", PORTRAIT_HEIGHT))
+
+        def tap_cb(x: int, y: int) -> None:
+            if not self._ensure_device():
+                raise RuntimeError("模拟器未连接")
+            self._get_adb().tap(int(x), int(y))
+            self._on_status(f"区域监控点击：({x},{y})")
+
+        if (
+            self._region_monitor_window is None
+            or not self._region_monitor_window.winfo_exists()
+        ):
+            self._region_monitor_window = RegionMonitorWindow(
+                self,
+                touch_width=touch_w,
+                touch_height=touch_h,
+                tap_cb=tap_cb,
+            )
+        self._region_monitor_window.show_window()
+
     def _on_dream_map_saved(self, map_id: str | None, *, pk: bool) -> None:
         self._refresh_dream_maps(pk=pk)
         if map_id:
@@ -1966,6 +1947,7 @@ class EndlessWinterApp(tk.Tk):
             stamina_can_limit=int(self.var_common_stamina_can_limit.get()),
             use_formation=bool(self.var_common_use_formation.get()),
             adjust_level=bool(self.var_common_adjust_level.get()),
+            beast_icon_index=int(self.var_beast_icon_index.get()),
             on_status=self._on_status,
         )
 
@@ -1983,6 +1965,7 @@ class EndlessWinterApp(tk.Tk):
             stamina_can_limit=int(self.var_common_stamina_can_limit.get()),
             use_formation=bool(self.var_common_use_formation.get()),
             adjust_level=bool(self.var_common_adjust_level.get()),
+            beast_icon_index=int(self.var_beast_icon_index.get()),
             on_status=self._on_status,
         )
 
@@ -2186,16 +2169,6 @@ class EndlessWinterApp(tk.Tk):
             )
         if hasattr(self, "btn_quick_ice"):
             self.btn_quick_ice.configure(state=tk.DISABLED if running else tk.NORMAL)
-        if hasattr(self, "btn_auto_click"):
-            self.btn_auto_click.configure(state=tk.DISABLED if running else tk.NORMAL)
-        if hasattr(self, "cmb_auto_click_selected_param"):
-            self.cmb_auto_click_selected_param.configure(
-                state=tk.DISABLED if running else "readonly"
-            )
-        if hasattr(self, "spn_auto_click_interval"):
-            self.spn_auto_click_interval.configure(
-                state=tk.DISABLED if running else tk.NORMAL
-            )
         if hasattr(self, "btn_check_account"):
             self.btn_check_account.configure(
                 state=tk.DISABLED if running else tk.NORMAL
@@ -2246,10 +2219,10 @@ class EndlessWinterApp(tk.Tk):
         dispatch = {
             "循环任务": self._start_loop,
             "一次性任务": self._run_once_batch,
-            "联盟总动员自动刷新": self._start_alliance_mobilization,
-            "联盟管理员刷新": self._start_alliance_admin,
+            "联盟刷新": self._start_alliance_mobilization,
+            "管理员刷新": self._start_alliance_admin,
             "寻梦记忆": lambda: self._start_dream_session(pk=False),
-            "寻梦记忆PK": lambda: self._start_dream_session(pk=True),
+            "寻梦PK": lambda: self._start_dream_session(pk=True),
         }
         handler = dispatch.get(tab_name)
         if handler is None:
@@ -2365,7 +2338,6 @@ class EndlessWinterApp(tk.Tk):
                     except ValueError:
                         pass
                     self._on_status(f"账号名称：{name}")
-                    messagebox.showinfo("检查账号名称", f"当前账号：{name}")
 
                 self.after(0, apply)
                 try:
@@ -2381,7 +2353,6 @@ class EndlessWinterApp(tk.Tk):
 
                 def fail(msg=err):
                     self._on_status(f"检查账号名称失败：{msg}")
-                    messagebox.showerror("检查账号名称", msg)
 
                 self.after(0, fail)
             finally:
@@ -2398,130 +2369,99 @@ class EndlessWinterApp(tk.Tk):
         self._account_check_worker = None
         self._update_run_control_buttons(running=False)
 
-    def _auto_click_point_names(self) -> list[str]:
-        return [str(p["name"]) for p in self._auto_click_points]
+    def _open_auto_clicker(self) -> None:
+        """系统菜单 → 连点器：截图点选坐标并连点。"""
+        click_cfg = _normalize_auto_click_config(
+            {
+                **(self.config.get("gui", {}).get("auto_click") or {}),
+                **getattr(self, "_auto_click_state", {}),
+            }
+        )
+        self._auto_click_state = {
+            "interval": float(click_cfg["interval"]),
+            "x": int(click_cfg["x"]),
+            "y": int(click_cfg["y"]),
+        }
 
-    def _find_auto_click_point(self, name: str) -> dict | None:
-        name = name.strip()
-        for pt in self._auto_click_points:
-            if pt["name"] == name:
-                return pt
-        return None
+        dev = self.config.get("device", {})
+        touch_w = int(dev.get("touch_width", PORTRAIT_WIDTH))
+        touch_h = int(dev.get("touch_height", PORTRAIT_HEIGHT))
 
-    def _refresh_auto_click_combos(self, *, selected: str | None = None) -> None:
-        names = self._auto_click_point_names()
-        if not names:
-            self._auto_click_points = [dict(DEFAULT_AUTO_CLICK_POINT)]
-            names = self._auto_click_point_names()
-        if selected is None:
-            selected = str(self.var_auto_click_selected.get()).strip()
-        if selected not in names:
-            selected = names[0]
-        self.var_auto_click_selected.set(selected)
-        if hasattr(self, "cmb_auto_click_selected_param"):
-            self.cmb_auto_click_selected_param.configure(values=names)
-            self.cmb_auto_click_selected_param.set(selected)
-        self._load_auto_click_point_to_editors(selected)
+        if (
+            self._auto_clicker_window is None
+            or not self._auto_clicker_window.winfo_exists()
+        ):
+            self._auto_clicker_window = AutoClickerWindow(
+                self,
+                touch_width=touch_w,
+                touch_height=touch_h,
+                screenshot_cb=self._capture_for_coord_ruler,
+                on_point_changed=self._on_auto_clicker_point_changed,
+                on_start=self._start_auto_click_at,
+                on_stop=self._stop_auto_click,
+                is_running=self._is_auto_click_running,
+                initial_x=int(self._auto_click_state["x"]),
+                initial_y=int(self._auto_click_state["y"]),
+                initial_interval=float(self._auto_click_state["interval"]),
+                account_name=self._displayed_account_name(),
+                port=self._adb_port_value(),
+            )
+        else:
+            self._auto_clicker_window.set_point(
+                int(self._auto_click_state["x"]),
+                int(self._auto_click_state["y"]),
+                notify=False,
+            )
+            self._auto_clicker_window.var_interval.set(
+                str(self._auto_click_state["interval"])
+            )
+            self._sync_auto_clicker_account_info()
+        self._auto_clicker_window.show_window()
 
-    def _load_auto_click_point_to_editors(self, name: str) -> None:
-        pt = self._find_auto_click_point(name)
-        if pt is None:
-            return
-        self.var_auto_click_name.set(str(pt["name"]))
-        self.var_auto_click_x.set(int(pt["x"]))
-        self.var_auto_click_y.set(int(pt["y"]))
-
-    def _on_auto_click_selected_changed(self, _event=None) -> None:
-        name = str(self.var_auto_click_selected.get()).strip()
-        self._load_auto_click_point_to_editors(name)
+    def _persist_auto_click_state(
+        self, *, x: int | None = None, y: int | None = None, interval: float | None = None
+    ) -> None:
+        state = getattr(self, "_auto_click_state", None)
+        if state is None:
+            state = {
+                "interval": DEFAULT_AUTO_CLICK_INTERVAL,
+                "x": int(DEFAULT_AUTO_CLICK_POINT["x"]),
+                "y": int(DEFAULT_AUTO_CLICK_POINT["y"]),
+            }
+            self._auto_click_state = state
+        if x is not None:
+            state["x"] = max(0, min(PORTRAIT_WIDTH - 1, int(x)))
+        if y is not None:
+            state["y"] = max(0, min(PORTRAIT_HEIGHT - 1, int(y)))
+        if interval is not None:
+            state["interval"] = max(0.01, float(interval))
         try:
             self._save_config()
         except ValueError:
             pass
 
-    def _save_auto_click_point(self) -> None:
-        name = str(self.var_auto_click_name.get()).strip()
-        if not name:
-            messagebox.showwarning("提示", "请填写坐标名称")
-            return
-        try:
-            x = int(self.var_auto_click_x.get())
-            y = int(self.var_auto_click_y.get())
-        except (TypeError, ValueError) as exc:
-            messagebox.showerror("参数错误", f"坐标无效：{exc}")
-            return
-        x = max(0, min(PORTRAIT_WIDTH - 1, x))
-        y = max(0, min(PORTRAIT_HEIGHT - 1, y))
-        self.var_auto_click_x.set(x)
-        self.var_auto_click_y.set(y)
+    def _on_auto_clicker_point_changed(
+        self, x: int, y: int, interval: float
+    ) -> None:
+        self._persist_auto_click_state(x=x, y=y, interval=interval)
+        self._on_status(f"连点坐标已选定：({x},{y})")
 
-        existing = self._find_auto_click_point(name)
-        if existing is not None:
-            existing["x"] = x
-            existing["y"] = y
-        else:
-            self._auto_click_points.append({"name": name, "x": x, "y": y})
-        self._refresh_auto_click_combos(selected=name)
-        try:
-            self._save_config()
-        except ValueError as exc:
-            messagebox.showerror("参数错误", str(exc))
+    def _start_auto_click_at(self, x: int, y: int, interval: float) -> None:
+        """连点器开始：按指定坐标持续点击，直到停止。"""
+        if self._is_auto_click_running():
             return
-        self._on_status(f"已保存连点坐标：{name} ({x},{y})")
-
-    def _delete_auto_click_point(self) -> None:
-        name = str(self.var_auto_click_selected.get()).strip()
-        if not name:
-            messagebox.showwarning("提示", "没有可删除的坐标")
-            return
-        if len(self._auto_click_points) <= 1:
-            messagebox.showwarning("提示", "至少保留一个坐标")
-            return
-        if not messagebox.askyesno("确认", f"删除坐标「{name}」？"):
-            return
-        self._auto_click_points = [
-            p for p in self._auto_click_points if p["name"] != name
-        ]
-        self._refresh_auto_click_combos(selected=self._auto_click_points[0]["name"])
-        try:
-            self._save_config()
-        except ValueError as exc:
-            messagebox.showerror("参数错误", str(exc))
-            return
-        self._on_status(f"已删除连点坐标：{name}")
-
-    def _resolve_auto_click_target(self) -> tuple[str, int, int]:
-        """优先使用下拉选中项对应坐标。"""
-        selected = str(self.var_auto_click_selected.get()).strip()
-        pt = self._find_auto_click_point(selected)
-        if pt is not None:
-            return str(pt["name"]), int(pt["x"]), int(pt["y"])
-        if self._auto_click_points:
-            pt = self._auto_click_points[0]
-            return str(pt["name"]), int(pt["x"]), int(pt["y"])
-        return (
-            str(DEFAULT_AUTO_CLICK_POINT["name"]),
-            int(DEFAULT_AUTO_CLICK_POINT["x"]),
-            int(DEFAULT_AUTO_CLICK_POINT["y"]),
-        )
-
-    def _start_auto_click(self) -> None:
-        """一键连点：按选用坐标持续点击，直到点「结束」。"""
         if self._is_any_running():
             messagebox.showwarning("提示", "已有任务在运行，请先点「结束」")
             return
 
-        try:
-            self._save_config()
-            interval = max(0.01, float(self.var_auto_click_interval.get()))
-            name, x, y = self._resolve_auto_click_target()
-        except (TypeError, ValueError) as exc:
-            messagebox.showerror("参数错误", f"连点参数无效：{exc}")
-            return
+        x = max(0, min(PORTRAIT_WIDTH - 1, int(x)))
+        y = max(0, min(PORTRAIT_HEIGHT - 1, int(y)))
+        interval = max(0.01, float(interval))
+        self._persist_auto_click_state(x=x, y=y, interval=interval)
 
         self._auto_click_stop_event.clear()
         self._update_run_control_buttons(running=True)
-        self._on_status(f"一键连点：{name} ({x},{y}) 间隔 {interval:g}s")
+        self._on_status(f"连点器：({x},{y}) 间隔 {interval:g}s")
 
         def work() -> None:
             count = 0
@@ -2534,13 +2474,13 @@ class EndlessWinterApp(tk.Tk):
                     count += 1
                     if count == 1 or count % 100 == 0:
                         self._on_status(
-                            f"一键连点中：{name} ({x},{y}) 已点击 {count} 次"
+                            f"连点器运行中：({x},{y}) 已点击 {count} 次"
                         )
                     if self._auto_click_stop_event.wait(interval):
                         break
-                self._on_status(f"一键连点已停止（共 {count} 次）")
+                self._on_status(f"连点器已停止（共 {count} 次）")
             except Exception as exc:
-                self._on_status(f"一键连点异常：{exc}")
+                self._on_status(f"连点器异常：{exc}")
             finally:
                 self.after(0, self._on_auto_click_done)
 
@@ -2549,7 +2489,7 @@ class EndlessWinterApp(tk.Tk):
 
     def _stop_auto_click(self) -> None:
         self._auto_click_stop_event.set()
-        self._on_status("正在停止一键连点…")
+        self._on_status("正在停止连点器…")
 
     def _on_auto_click_done(self) -> None:
         self._auto_click_worker = None
@@ -2565,7 +2505,7 @@ class EndlessWinterApp(tk.Tk):
 
     def _start_loop(self) -> None:
         if self._is_auto_click_running():
-            messagebox.showwarning("提示", "一键连点正在运行，请先点「结束」")
+            messagebox.showwarning("提示", "连点器正在运行，请先点「结束」")
             return
         if self._is_account_check_running():
             messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
@@ -2602,14 +2542,14 @@ class EndlessWinterApp(tk.Tk):
         self._launch_loop_worker(status=f"启动循环任务：{names}")
 
     def _start_quick_loop_task(self, task_id: str) -> None:
-        """一键打野 / 一键集结巨兽：直接启动对应循环任务（不依赖勾选）。"""
+        """一键打野 / 一键巨兽：直接启动对应循环任务（不依赖勾选）。"""
         labels = {
             "hunt_monster": "一键打野",
-            "hunt_ice_beast": "一键集结巨兽",
+            "hunt_ice_beast": "一键巨兽",
         }
         label = labels.get(task_id, task_id)
         if self._is_auto_click_running():
-            messagebox.showwarning("提示", "一键连点正在运行，请先点「结束」")
+            messagebox.showwarning("提示", "连点器正在运行，请先点「结束」")
             return
         if self._is_account_check_running():
             messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
@@ -2676,7 +2616,7 @@ class EndlessWinterApp(tk.Tk):
         }
         label = labels.get(task_id, task_id)
         if self._is_auto_click_running():
-            messagebox.showwarning("提示", "一键连点正在运行，请先点「结束」")
+            messagebox.showwarning("提示", "连点器正在运行，请先点「结束」")
             return
         if self._is_account_check_running():
             messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
@@ -2743,7 +2683,7 @@ class EndlessWinterApp(tk.Tk):
 
     def _run_once_batch(self) -> None:
         if self._is_auto_click_running():
-            messagebox.showwarning("提示", "一键连点正在运行，请先点「结束」")
+            messagebox.showwarning("提示", "连点器正在运行，请先点「结束」")
             return
         if self._is_once_running():
             messagebox.showwarning("提示", "一次性任务正在执行中")
@@ -2807,7 +2747,7 @@ class EndlessWinterApp(tk.Tk):
 
     def _run_hosting_batch(self) -> None:
         if self._is_auto_click_running():
-            messagebox.showwarning("提示", "一键连点正在运行，请先点「结束」")
+            messagebox.showwarning("提示", "连点器正在运行，请先点「结束」")
             return
         if self._is_account_check_running():
             messagebox.showwarning("提示", "正在检查账号名称，请先点「结束」")
