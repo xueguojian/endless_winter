@@ -1,13 +1,17 @@
-"""领主体力道具：批量点击 + 罐头用量上限。"""
+"""领主体力道具：批量点击 + 罐头用量上限；体力不足弹窗标题 OCR。"""
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Callable
 
+import cv2
+import numpy as np
 from loguru import logger
 
 from core.adb_client import AdbClient
+from core.dream_memory.ocr_engine import ocr_chip_text
 
 # 体力不足弹窗一次连点次数（减少反复弹窗）
 STAMINA_BATCH_CLICKS = 20
@@ -15,6 +19,41 @@ DEFAULT_STAMINA_CAN_LIMIT = 800
 STAMINA_USE_XY = (576, 522)
 STAMINA_TAP_INTERVAL = 0.12
 STAMINA_AFTER_BATCH_DELAY = 0.5
+
+# 「获取更多」标题区域（720×1280）；出征后延迟再 OCR 一次
+STAMINA_TITLE_ROI = (242, 100, 494, 162)
+STAMINA_TITLE_KEYWORDS = ("获取更多",)
+MARCH_OUTCOME_DELAY_SEC = 2.5
+
+
+def _normalize_stamina_title(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "").strip())
+
+
+def is_stamina_get_more_title(screen: np.ndarray) -> bool:
+    """ROI 内 OCR：识别到「获取更多」则判定为体力不足弹窗。"""
+    x1, y1, x2, y2 = STAMINA_TITLE_ROI
+    h, w = screen.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        logger.info(
+            f"体力弹窗 OCR: ROI 无效 ({x1},{y1},{x2},{y2}) size={w}x{h}"
+        )
+        return False
+
+    crop = screen[y1:y2, x1:x2]
+    big = cv2.resize(crop, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    text, engine = ocr_chip_text(big)
+    normalized = _normalize_stamina_title(text)
+    hit = any(key in normalized for key in STAMINA_TITLE_KEYWORDS) or (
+        "获取" in normalized and "更多" in normalized
+    )
+    logger.info(
+        f"体力弹窗 OCR: text={text!r} normalized={normalized!r} "
+        f"engine={engine} hit={hit} ROI=({x1},{y1},{x2},{y2})"
+    )
+    return hit
 
 
 class StaminaCanLimitReached(InterruptedError):

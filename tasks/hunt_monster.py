@@ -10,22 +10,20 @@ from typing import Callable
 
 from loguru import logger
 
-from core.adb_client import AdbClient, AdbUnavailableError
+from core.adb_client import AdbBusyError, AdbClient, AdbUnavailableError
 from core.deploy_march import (
-    DEPLOY_WAIT_POLL_SEC,
     DEPLOY_WAIT_SETTLE_SEC,
-    DEPLOY_WAIT_TIMEOUT,
-    MARCH_RESOLVE_ATTEMPTS,
-    MARCH_RESOLVE_POLL_SEC,
     find_march_button,
 )
 from core.navigation import WildernessNavigator
 from core.search_level import adjust_search_level
 from core.stamina_use import (
     DEFAULT_STAMINA_CAN_LIMIT,
+    MARCH_OUTCOME_DELAY_SEC,
     STAMINA_USE_XY,
     StaminaCanBudget,
     StaminaCanLimitReached,
+    is_stamina_get_more_title,
     use_stamina_cans_batch,
 )
 from core.vision import MatchResult, Vision
@@ -42,14 +40,9 @@ from tasks.hunt_ice_beast import (
     NoStaminaError,
     SCENE_TOGGLE_ROI,
     SEARCH_CONFIRM_BTN,
-    SEARCH_ICON,
-    SEARCH_ICON_ROI,
     SEARCH_PANEL_MARKER,
     SEARCH_TAB_ROI,
-    STAMINA_GET_MORE_TITLE,
     STAMINA_MATCH_THRESHOLD,
-    STAMINA_TITLE_ROI,
-    STAMINA_TITLE_THRESHOLD,
     STAMINA_USE_BTN,
     STAMINA_USE_ROW_ROI,
     STAMINA_USE_Y_MAX,
@@ -70,7 +63,7 @@ SEARCH_PANEL_TEMPLATES = (
     BEAST_TAB_TEMPLATE,
 )
 
-DEFAULT_BEAST_TAB = (84, 916)
+DEFAULT_BEAST_TAB = (84, 914)
 DEFAULT_SEARCH_CONFIRM = (366, 1216)
 DEFAULT_TARGET_TAP = (360, 640)
 
@@ -238,22 +231,11 @@ class HuntMonsterTask:
         self._wilderness.ensure_wilderness()
 
     def _open_search_panel(self) -> None:
+        """在野外点击左下角放大镜，打开搜索面板（固定坐标，不截图匹配）。"""
         self._ensure_wilderness()
-        screen = self.adb.screenshot()
-        if self._is_search_panel_visible(screen):
-            return
-
-        result = self._match_in_roi(screen, SEARCH_ICON, SEARCH_ICON_ROI)
-        if result.found:
-            tx, ty = result.center
-            self._tap_xy(tx, ty, delay=1.5)
-        else:
-            logger.warning("放大镜模板未匹配，使用配置坐标")
-            self._tap("search_open", delay=1.5)
-
-        if not self._is_search_panel_visible():
-            raise RuntimeError("搜索面板未打开，请确认已在野外地图")
-        self._emit("已打开搜索面板")
+        sx, sy = self.coords["search_open"]
+        self._emit(f"打开搜索面板 @ ({int(sx)},{int(sy)})")
+        self._tap("search_open", delay=1.5)
 
     def _scroll_search_tab_bar_to_rightmost(self) -> None:
         x1, y1, x2, y2 = SEARCH_TAB_ROI
@@ -317,91 +299,82 @@ class HuntMonsterTask:
             )
         return slot
 
-    def _is_deploy_screen(self, screen) -> bool:
-        return find_march_button(screen).found
-
-    def _wait_for_deploy_screen(self, timeout: float = DEPLOY_WAIT_TIMEOUT) -> None:
-        time.sleep(DEPLOY_WAIT_SETTLE_SEC)
-        deadline = time.time() + timeout
-        best_conf = 0.0
-        while time.time() < deadline:
-            if self._interrupted():
-                raise InterruptedError("任务已停止")
-            result = find_march_button(self.adb.screenshot())
-            best_conf = max(best_conf, result.confidence)
-            if result.found:
-                cx, cy = result.center
-                self._emit(
-                    f"出征界面就绪（出征按钮 {result.confidence:.2f} @ ({cx},{cy})）"
-                )
-                return
-            time.sleep(DEPLOY_WAIT_POLL_SEC)
-        raise RuntimeError(
-            "未检测到出征界面（右下角「出征」按钮）。"
-            f"最高匹配 {best_conf:.2f}。请确认上一步已定位目标。"
-        )
-
-    def _select_formation(self) -> None:
+    def _tap_formation_slot(self) -> None:
+        if not self.use_formation:
+            self._emit("未启用编队，跳过编队选择")
+            return
         if not self.formation_name:
             self._emit("未配置编队槽位，沿用当前编队")
             return
         slot = self._require_formation_slot()
-        self._emit(f"正在选择编队槽位 {slot}…")
-        self._wait_for_deploy_screen()
         sx, sy = FORMATION_SLOTS[slot]
         self._emit(f"点击编队槽位 {slot} @ ({sx},{sy})")
         self._tap_xy(sx, sy, delay=1.0)
         self._emit(f"已选择编队槽位 {slot}")
 
-    def _prepare_march(self) -> None:
+    def _analyze_deploy_and_resolve_march(self, screen) -> tuple[int, int, float]:
         if self.use_formation:
-            self._select_formation()
-            return
-        self._emit("未启用编队，跳过编队选择与英雄校验")
-        self._wait_for_deploy_screen()
+            self._emit("检查出征英雄…")
+            empty_slots = HuntIceBeastTask._find_empty_march_hero_slots(screen)
+            if empty_slots:
+                slots_text = "、".join(str(i) for i in empty_slots)
+                raise MarchHeroCheckError(f"第 {slots_text} 个英雄位为空，跳过本轮")
+            self._emit("出征英雄已配满（3/3）")
 
-    def _check_march_heroes(self) -> None:
-        if not self.use_formation:
-            return
-        # 编队选择后界面已确认；避免二次严格等待因体力数字变化误杀
-        time.sleep(0.5)
-        self._emit("检查出征英雄…")
-        screen = self.adb.screenshot()
-        empty_slots = HuntIceBeastTask._find_empty_march_hero_slots(screen)
-        if empty_slots:
-            slots_text = "、".join(str(i) for i in empty_slots)
-            raise MarchHeroCheckError(f"第 {slots_text} 个英雄位为空，跳过本轮")
-        self._emit("出征英雄已配满（3/3）")
-
-    def _resolve_march_button(self) -> tuple[int, int, float, bool]:
-        cx, cy = (
-            tuple(self.coords["march"])
-            if "march" in self.coords
-            else MARCH_CENTER
-        )
-        matched = False
-        match_conf = 0.0
-        for attempt in range(MARCH_RESOLVE_ATTEMPTS):
-            result = find_march_button(self.adb.screenshot())
-            if result.found:
-                cx, cy = result.center
-                matched = True
-                match_conf = result.confidence
-                break
-            time.sleep(MARCH_RESOLVE_POLL_SEC)
-            logger.debug(
-                f"等待出征按钮 {attempt + 1}/{MARCH_RESOLVE_ATTEMPTS}"
-                f"（当前最高 {result.confidence:.2f}）"
+        result = find_march_button(screen)
+        if not result.found:
+            raise RuntimeError(
+                "未检测到出征界面（右下角「出征」按钮）。"
+                f"最高匹配 {result.confidence:.2f}。请确认上一步已定位目标。"
             )
-        return cx, cy, match_conf, matched
+        cx, cy = result.center
+        self._emit(f"出征按钮就绪（{result.confidence:.2f} @ ({cx},{cy})）")
+        return cx, cy, result.confidence
 
-    def _click_march_button(self) -> None:
-        cx, cy, match_conf, matched = self._resolve_march_button()
-        if matched:
+    def _march_tap_xy(self) -> tuple[int, int]:
+        if "march" in self.coords:
+            return tuple(self.coords["march"])
+        return MARCH_CENTER
+
+    def _click_march_at(self, cx: int, cy: int, *, match_conf: float | None = None) -> None:
+        if match_conf is not None:
             self._emit(f"点击出征 @ ({cx},{cy})（匹配 {match_conf:.2f}）")
         else:
             self._emit(f"点击出征 @ ({cx},{cy})（固定坐标）")
         self._tap_xy(cx, cy, delay=0.6)
+
+    def _prepare_and_tap_march(self):
+        """定位目标后：延迟 → 点编队(可选) → 截一张验英雄+出征按钮 → 点出征并判结果。"""
+        time.sleep(DEPLOY_WAIT_SETTLE_SEC)
+        if self._interrupted():
+            raise InterruptedError("任务已停止")
+
+        self._tap_formation_slot()
+
+        screen = self.adb.screenshot()
+        cx, cy, match_conf = self._analyze_deploy_and_resolve_march(screen)
+        self._click_march_at(cx, cy, match_conf=match_conf)
+        time.sleep(0.8)
+
+        is_popup, outcome = self._wait_march_outcome()
+        if not is_popup:
+            self._emit("队伍已出征")
+            return outcome
+
+        self._emit("检测到体力不足弹窗，出征未成功")
+        if not self.use_stamina:
+            raise NoStaminaError("体力不足，任务结束")
+        self._emit("自动使用领主体力道具…")
+        self._use_stamina_items()
+        mx, my = self._march_tap_xy()
+        self._click_march_at(mx, my)
+        time.sleep(0.8)
+        is_popup, outcome = self._wait_march_outcome()
+        if is_popup:
+            self._emit("使用体力后仍出现体力不足弹窗，已停止")
+            raise NoStaminaError("没有体力，已停止")
+        self._emit("队伍已出征")
+        return outcome
 
     def _find_stamina_use_button(self, screen) -> MatchResult:
         if not (TEMPLATE_DIR / STAMINA_USE_BTN).exists():
@@ -427,30 +400,16 @@ class HuntMonsterTask:
         return MatchResult(found=False, confidence=result.confidence)
 
     def _is_stamina_popup(self, screen) -> bool:
-        title_path = TEMPLATE_DIR / STAMINA_GET_MORE_TITLE
-        if title_path.exists():
-            x1, y1, x2, y2 = STAMINA_TITLE_ROI
-            title_vision = Vision(TEMPLATE_DIR, threshold=STAMINA_TITLE_THRESHOLD)
-            title = title_vision.match_template_multiscale(
-                screen[y1:y2, x1:x2], STAMINA_GET_MORE_TITLE
-            )
-            return title.found and title.confidence >= STAMINA_TITLE_THRESHOLD
-        btn = self._find_stamina_use_button(screen)
-        return btn.found and btn.confidence >= STAMINA_MATCH_THRESHOLD
+        return is_stamina_get_more_title(screen)
 
-    def _wait_march_outcome(self, timeout: float = 4.0) -> bool:
-        """出征后少量截图判体力弹窗（双开减负）。"""
+    def _wait_march_outcome(self, delay: float = MARCH_OUTCOME_DELAY_SEC):
+        """出征后延迟，再 OCR 一次。返回 (是否弹窗, 截图)。"""
         self._emit("正在检测出征结果…")
-        time.sleep(2.5)
-        deadline = time.time() + timeout
-        interval = 0.9
-        while time.time() < deadline:
-            if self._interrupted():
-                raise InterruptedError("任务已停止")
-            if self._is_stamina_popup(self.adb.screenshot()):
-                return True
-            time.sleep(interval)
-        return False
+        time.sleep(delay)
+        if self._interrupted():
+            raise InterruptedError("任务已停止")
+        screen = self.adb.screenshot()
+        return self._is_stamina_popup(screen), screen
 
     def _use_stamina_items(self) -> None:
         use_stamina_cans_batch(
@@ -462,27 +421,11 @@ class HuntMonsterTask:
             close_with_back=True,
         )
 
-    def _tap_march_button(self) -> None:
-        self._click_march_button()
-        time.sleep(0.8)
-        if not self._wait_march_outcome():
-            self._emit("队伍已出征")
-            return
-        self._emit("检测到体力不足弹窗，出征未成功")
-        if not self.use_stamina:
-            raise NoStaminaError("体力不足，任务结束")
-        self._emit("自动使用领主体力道具…")
-        self._use_stamina_items()
-        self._click_march_button()
-        time.sleep(0.8)
-        if self._wait_march_outcome():
-            self._emit("使用体力后仍出现体力不足弹窗，已停止")
-            raise NoStaminaError("没有体力，已停止")
-        self._emit("队伍已出征")
-
-    def _finish_after_march(self) -> None:
-        time.sleep(1.0)
-        screen = self.adb.screenshot()
+    def _finish_after_march(self, screen=None) -> None:
+        """优先复用出征结果截图判断主界面，避免再截一张。"""
+        if screen is None:
+            time.sleep(1.0)
+            screen = self.adb.screenshot()
         if self._is_on_main_map(screen) and not self._is_search_panel_visible(screen):
             if self._is_in_wilderness(screen):
                 self._emit("出征完成，已在野外主界面")
@@ -507,10 +450,8 @@ class HuntMonsterTask:
         self._tap("target_tap", delay=2.0)
         self._emit("已定位目标")
 
-        self._prepare_march()
-        self._check_march_heroes()
-        self._tap_march_button()
-        self._finish_after_march()
+        march_screen = self._prepare_and_tap_march()
+        self._finish_after_march(march_screen)
 
     def _set_monster_level(self) -> None:
         if not self.adjust_level:
@@ -554,6 +495,10 @@ class HuntMonsterTask:
             self._emit(str(exc))
             self._emit("退回野外，等待下次循环")
             self._wilderness.try_return_to_wilderness()
+            return False
+        except AdbBusyError as exc:
+            logger.warning(f"[{self.name}] {exc}")
+            self._emit(f"ADB 正忙，跳过本轮（{exc}）")
             return False
         except AdbUnavailableError as exc:
             logger.exception(f"[{self.name}] ADB 不可用，延长等待后继续循环")

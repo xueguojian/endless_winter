@@ -17,10 +17,10 @@ sys.path.insert(0, str(ROOT))
 
 from core.adb_client import AdbClient
 from core.config_path import PRIMARY_CONFIG_PATH, ensure_config_file, resolve_config_path
+from core.stamina_use import STAMINA_TITLE_ROI
 from core.vision import Vision
 from tasks.hunt_ice_beast import (
     STAMINA_GET_MORE_TITLE,
-    STAMINA_TITLE_ROI,
     STAMINA_TITLE_THRESHOLD,
     STAMINA_USE_BTN,
     STAMINA_USE_ROW_ROI,

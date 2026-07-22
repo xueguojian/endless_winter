@@ -43,7 +43,7 @@ tasks:
       - 880
       beast_tab:
       - 84
-      - 916
+      - 914
       search_confirm:
       - 366
       - 1216
@@ -87,8 +87,8 @@ tasks:
       - 55
       - 880
       ice_beast_tab:
-      - 205
-      - 915
+      - 244
+      - 918
       level_minus:
       - 66
       - 1050

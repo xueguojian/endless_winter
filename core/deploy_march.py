@@ -14,8 +14,10 @@ from loguru import logger
 from core.adb_client import AdbClient
 from core.stamina_use import (
     DEFAULT_STAMINA_CAN_LIMIT,
+    MARCH_OUTCOME_DELAY_SEC,
     STAMINA_USE_XY,
     StaminaCanBudget,
+    is_stamina_get_more_title,
     use_stamina_cans_batch,
 )
 from core.vision import MatchResult, Vision
@@ -25,15 +27,12 @@ TEMPLATE_DIR = Path(__file__).parent.parent / "assets" / "templates"
 MARCH_BTN = "march_btn.png"
 MARCH_BTN_LABEL = "march_btn_label.png"
 STAMINA_USE_BTN = "stamina_use_btn.png"
-STAMINA_GET_MORE_TITLE = "stamina_get_more_title.png"
 
-STAMINA_TITLE_ROI = (150, 120, 570, 280)
 STAMINA_USE_ROW_ROI = (500, 520, 710, 660)
 STAMINA_USE_CENTER = (576, 522)
 STAMINA_USE_Y_MIN = 520
 STAMINA_USE_Y_MAX = 660
 STAMINA_MATCH_THRESHOLD = 0.58
-STAMINA_TITLE_THRESHOLD = 0.62
 
 # 用「出征」标签模板；完整 march_btn 含体力数字/行军时间，换编队后极易掉置信度
 MARCH_MATCH_THRESHOLD = 0.62
@@ -167,28 +166,8 @@ class DeployMarchHelper:
         time.sleep(delay if delay is not None else self.step_delay)
 
     def is_stamina_popup(self, screen) -> bool:
-        """是否出现「获取更多」体力不足弹窗（与冰原巨兽逻辑一致，仅认标题）。"""
-        title_path = TEMPLATE_DIR / STAMINA_GET_MORE_TITLE
-        if title_path.exists():
-            x1, y1, x2, y2 = STAMINA_TITLE_ROI
-            title_vision = Vision(TEMPLATE_DIR, threshold=STAMINA_TITLE_THRESHOLD)
-            title = title_vision.match_template(screen[y1:y2, x1:x2], STAMINA_GET_MORE_TITLE)
-            if title.found and title.confidence >= STAMINA_TITLE_THRESHOLD:
-                logger.info(
-                    f"体力弹窗：标题「获取更多」匹配 {title.confidence:.2f} "
-                    f"(阈值 {STAMINA_TITLE_THRESHOLD})"
-                )
-                return True
-            return False
-
-        btn = self._find_stamina_use_button(screen)
-        if btn.found and btn.confidence >= STAMINA_MATCH_THRESHOLD:
-            logger.info(
-                f"体力弹窗：使用按钮匹配 {btn.confidence:.2f} "
-                f"(阈值 {STAMINA_MATCH_THRESHOLD}，无标题模板时的兜底)"
-            )
-            return True
-        return False
+        """是否出现「获取更多」体力不足弹窗（ROI OCR）。"""
+        return is_stamina_get_more_title(screen)
 
     def _find_stamina_use_button(self, screen) -> MatchResult:
         if not (TEMPLATE_DIR / STAMINA_USE_BTN).exists():
@@ -295,15 +274,11 @@ class DeployMarchHelper:
             self._emit(f"点击出征 @ ({cx},{cy})（固定坐标）")
         self._tap_xy(cx, cy, delay=0.6)
 
-    def _wait_march_stamina_popup(self, timeout: float = 4.0) -> bool:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self._interrupted():
-                raise InterruptedError("任务已停止")
-            if self.is_stamina_popup(self.adb.screenshot()):
-                return True
-            time.sleep(0.9)
-        return False
+    def _wait_march_stamina_popup(self, delay: float = MARCH_OUTCOME_DELAY_SEC) -> bool:
+        time.sleep(delay)
+        if self._interrupted():
+            raise InterruptedError("任务已停止")
+        return self.is_stamina_popup(self.adb.screenshot())
 
     def tap_march(self) -> None:
         """出征；体力不足时按配置处理。"""

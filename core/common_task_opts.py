@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-# 搜索面板 tab：野兽(84) → 巨兽(205)，步径 121（活动期左侧多图标时按 index*步径右移）
-DEFAULT_BEAST_TAB = (84, 916)
-DEFAULT_ICE_BEAST_TAB = (205, 915)
-DEFAULT_SEARCH_TAB_STEP = DEFAULT_ICE_BEAST_TAB[0] - DEFAULT_BEAST_TAB[0]  # 121
+# 搜索面板 tab：野兽(84,914) → 巨兽(244,918)，步径 160（活动期左侧多图标时按 index*步径右移）
+DEFAULT_BEAST_TAB = (84, 914)
+DEFAULT_ICE_BEAST_TAB = (244, 918)
+DEFAULT_SEARCH_TAB_STEP = DEFAULT_ICE_BEAST_TAB[0] - DEFAULT_BEAST_TAB[0]  # 160
 DEFAULT_BEAST_ICON_INDEX = 0
 
 
@@ -42,7 +42,7 @@ def resolve_beast_icon_index(tasks: dict[str, Any] | None = None, raw: Any = Non
 
 
 def resolve_search_tab_step(coords: dict[str, Any] | None = None) -> int:
-    """从野兽/巨兽基准坐标推步径；缺省用 121。"""
+    """从野兽/巨兽基准坐标推步径；缺省用 160。"""
     coords = coords or {}
     try:
         beast_x = int((coords.get("beast_tab") or DEFAULT_BEAST_TAB)[0])

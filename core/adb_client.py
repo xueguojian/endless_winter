@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -13,18 +12,31 @@ import numpy as np
 from loguru import logger
 from PIL import Image
 
+from core.adb_lock import (
+    DEFAULT_ADB_LOCK_TIMEOUT_SEC,
+    AdbBusyError,
+    hold_adb_lock,
+)
+
 _WIN_SUBPROCESS_FLAGS = 0
 if sys.platform == "win32":
     _WIN_SUBPROCESS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-# 同进程内串行，避免多线程同时 spawn 过多 adb.exe
-_THREAD_ADB_LOCK = threading.RLock()
 _ADB_RETRY_COUNT = 4
 _ADB_RETRY_BASE_DELAY = 0.6
 
 
 class AdbUnavailableError(RuntimeError):
     """ADB 进程/连接不可用（含长时间双开后的 0xc0000142）。"""
+
+
+# 兼容旧 import：from core.adb_client import AdbBusyError
+__all__ = [
+    "AdbBusyError",
+    "AdbClient",
+    "AdbUnavailableError",
+    "DEFAULT_ADB_LOCK_TIMEOUT_SEC",
+]
 
 
 class AdbClient:
@@ -63,6 +75,7 @@ class AdbClient:
         self.touch_width = touch_width
         self.touch_height = touch_height
         self._fail_streak = 0
+        self._screenshot_count = 0
 
     @classmethod
     def resolve_adb_path(cls, adb_path: str = "") -> str:
@@ -209,7 +222,7 @@ class AdbClient:
         last_error: Exception | None = None
         last_result: subprocess.CompletedProcess[str] | None = None
 
-        with _THREAD_ADB_LOCK:
+        with hold_adb_lock(who=f"run:{self.address}"):
             for attempt in range(1, _ADB_RETRY_COUNT + 1):
                 try:
                     result = self._run_once(*args, timeout=timeout)
@@ -276,9 +289,21 @@ class AdbClient:
         """截取屏幕，返回 BGR 数组，shape=(height, width)，与 input tap 同一竖屏坐标系。"""
         last_error: Exception | None = None
 
-        with _THREAD_ADB_LOCK:
+        with hold_adb_lock(who=f"screenshot:{self.address}"):
+            self._screenshot_count += 1
+            shot_no = self._screenshot_count
             for attempt in range(1, _ADB_RETRY_COUNT + 1):
                 try:
+                    cmd_preview = (
+                        f"{self.adb} -s {self.address} exec-out screencap -p"
+                    )
+                    if attempt == 1:
+                        logger.debug(f"ADB: {cmd_preview}  # screenshot #{shot_no}")
+                    else:
+                        logger.debug(
+                            f"ADB: {cmd_preview}  # screenshot #{shot_no}"
+                            f" retry {attempt}/{_ADB_RETRY_COUNT}"
+                        )
                     proc = self._spawn(
                         ["-s", self.address, "exec-out", "screencap", "-p"],
                         timeout=15,
