@@ -37,8 +37,10 @@ PRICE_ROIS: tuple[tuple[int, int, int, int], ...] = (
 )
 
 DEFAULT_STEP_DELAY = 1.5
-BUY_TAP_DELAY = 1.2
-REFRESH_TAP_DELAY = 2.0
+BUY_TAP_DELAY = 1.5
+REFRESH_TAP_DELAY = 2.2
+# 打开商店 / 刷新 / 购买后，等界面落定再截图识别
+SCAN_SETTLE_DELAY = 0.6
 MAX_BUY_PASSES = 12
 MAX_REFRESH_ROUNDS = 20
 
@@ -136,56 +138,64 @@ def _extract_price_icon(crop: np.ndarray) -> np.ndarray | None:
 
 
 def _score_currency_masks(icon: np.ndarray) -> tuple[float, float]:
-    """返回 (cyan_ratio, resource_ratio)，仅统计非底色像素。"""
+    """返回 (gem_ratio, resource_ratio)，仅统计非底色像素。
+
+    gem = 高饱和青色钻石；resource = 肉/木/煤/铁。
+    不用低饱和浅蓝价签底当钻石，否则铁矿会被误判。
+    """
     hsv = cv2.cvtColor(icon, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
-    content = (sat > 35) | (val < 175)
+    content = (sat > 30) | (val < 200)
     content_n = int(content.sum())
     if content_n < 12:
         return 0.0, 0.0
 
-    # 钻石：亮青宝石。V 要够高，避免宽价签里深蓝数字被当成钻石
-    cyan_m = cv2.inRange(hsv, (85, 70, 150), (120, 255, 255)) > 0
-    wood_m = cv2.inRange(hsv, (5, 45, 50), (30, 255, 255)) > 0
-    # 煤矿：暗灰块
-    coal_m = (sat < 110) & (val > 20) & (val < 170)
-    # 铁矿：偏褐灰，不用冷蓝 Hue（易与价格数字撞车）
-    iron_m = (
-        (sat >= 12)
-        & (sat < 120)
-        & (val > 35)
-        & (val < 180)
-        & (hsv[:, :, 0] >= 0)
-        & (hsv[:, :, 0] <= 35)
-    )
-    meat_m = (cv2.inRange(hsv, (0, 55, 55), (14, 255, 255)) > 0) | (
-        cv2.inRange(hsv, (160, 55, 55), (180, 255, 255)) > 0
-    )
-    resource_m = (wood_m | coal_m | iron_m | meat_m) & ~cyan_m
+    # 钻石宝石：高饱和青绿，排除价签浅蓝底
+    gem_m = (hue >= 88) & (hue <= 115) & (sat >= 95) & (val >= 150)
+    pale_btn = (hue >= 85) & (hue <= 120) & (sat < 95) & (val >= 170)
 
-    cyan = float((cyan_m & content).sum()) / content_n
+    wood_m = cv2.inRange(hsv, (5, 40, 45), (32, 255, 255)) > 0
+    meat_m = (cv2.inRange(hsv, (0, 40, 40), (18, 255, 255)) > 0) | (
+        cv2.inRange(hsv, (160, 40, 40), (180, 255, 255)) > 0
+    )
+    # 铁矿：灰银色块，排除宝石与浅蓝底
+    iron_m = (sat < 75) & (val > 50) & (val < 190) & ~gem_m & ~pale_btn
+    # 煤矿：更暗的灰黑
+    coal_m = (
+        (sat < 55)
+        & (val > 25)
+        & (val < 145)
+        & ((hue < 75) | (hue > 135))
+        & ~gem_m
+    )
+    resource_m = (wood_m | meat_m | iron_m | coal_m) & ~gem_m
+
+    gem = float((gem_m & content).sum()) / content_n
     resource = float((resource_m & content).sum()) / content_n
-    return cyan, resource
+    return gem, resource
 
 
-def _decide_kind(cyan: float, resource: float) -> PriceKind:
-    """同一窗口内比较青色(钻石)与资源色。"""
-    if resource >= 0.14 and resource >= cyan * 0.5:
+def _decide_kind(gem: float, resource: float) -> PriceKind:
+    """同一窗口内比较钻石宝石色与资源色。"""
+    if resource >= 0.10 and resource >= gem * 0.45:
         return "resource"
-    if resource >= 0.10 and resource >= cyan * 0.75:
-        return "resource"
-    if cyan >= 0.12 and cyan >= resource * 1.15:
+    if gem >= 0.14 and gem >= resource * 1.2:
         return "diamond"
     if resource >= 0.08:
         return "resource"
-    if cyan >= 0.08:
+    if gem >= 0.10:
         return "diamond"
     return "empty"
 
 
 def classify_price_kind(crop: np.ndarray) -> PriceKind:
-    """根据价格区货币图标颜色判断：钻石 / 资源 / 空。"""
+    """根据价格区货币图标颜色判断：钻石 / 资源 / 空。
+
+    多扫左侧到中部图标带（窄价签/铁矿图标会偏右）；
+    任一窗口资源信号够强则买，避免铁矿被价签浅蓝底判成钻石。
+    """
     if crop.size == 0:
         return "empty"
 
@@ -193,35 +203,32 @@ def classify_price_kind(crop: np.ndarray) -> PriceKind:
     icon = _extract_price_icon(crop)
     if icon is not None:
         windows.append(icon)
-    windows.append(crop)
 
     w = crop.shape[1]
-    # 宽价签：优先看左侧图标区；窄价签：多扫几个居中位置
-    for x0 in (0, 8, 16, 24, 36, max(0, w // 2 - 40), max(0, w // 3)):
-        win = crop[:, x0 : min(w, x0 + 40)]
+    for x0 in (0, 8, 16, 24, 36, 48, 60, 72):
+        win = crop[:, x0 : min(w, x0 + 44)]
         if win.shape[1] >= 12:
             windows.append(win)
 
     saw_resource = False
     saw_diamond = False
     best_resource = 0.0
-    best_cyan = 0.0
+    best_gem = 0.0
     for win in windows:
-        cyan, resource = _score_currency_masks(win)
+        gem, resource = _score_currency_masks(win)
         best_resource = max(best_resource, resource)
-        best_cyan = max(best_cyan, cyan)
-        kind = _decide_kind(cyan, resource)
+        best_gem = max(best_gem, gem)
+        kind = _decide_kind(gem, resource)
         if kind == "resource":
             saw_resource = True
         elif kind == "diamond":
             saw_diamond = True
 
-    # 任一窗口明确是资源则买；避免「别的窗口青色更高」把宽价签打成钻石
     if saw_resource:
         return "resource"
     if saw_diamond:
         return "diamond"
-    return _decide_kind(best_cyan, best_resource)
+    return _decide_kind(best_gem, best_resource)
 
 
 def list_resource_price_centers(
@@ -235,7 +242,18 @@ def list_resource_price_centers(
         xb, yb = min(w, x2), min(h, y2)
         crop = screen[ya:yb, xa:xb]
         kind = classify_price_kind(crop)
-        logger.debug(f"商店价格格{index} → {kind}")
+        best_gem = best_res = 0.0
+        for x0 in (0, 24, 48, 72):
+            win = crop[:, x0 : min(crop.shape[1], x0 + 44)]
+            if win.shape[1] < 12:
+                continue
+            g, r = _score_currency_masks(win)
+            best_gem = max(best_gem, g)
+            best_res = max(best_res, r)
+        logger.info(
+            f"商店价格格{index} → {kind} "
+            f"(gem={best_gem:.2f} res={best_res:.2f})"
+        )
         if kind == "resource":
             found.append((index, (x1 + x2) // 2, (y1 + y2) // 2))
     return found
@@ -302,6 +320,7 @@ class AutoShopExchangeTask:
         bought = 0
         for pass_index in range(1, MAX_BUY_PASSES + 1):
             self._check_stop()
+            time.sleep(SCAN_SETTLE_DELAY)
             screen = self.adb.screenshot()
             targets = list_resource_price_centers(screen)
             if not targets:
@@ -330,11 +349,13 @@ class AutoShopExchangeTask:
 
         self._emit("打开商店")
         self._tap("shop_open", delay=2.5)
+        time.sleep(SCAN_SETTLE_DELAY)
 
         # 无论是否免费刷新，先买光当前页资源价（避免漏掉煤/铁窄价签商品）
         self._emit("扫描并购买当前页资源价商品…")
         total_bought = self._buy_all_resource_items()
 
+        time.sleep(SCAN_SETTLE_DELAY)
         screen = self.adb.screenshot()
         if not is_free_refresh_available(screen):
             self._emit("当前不是「免费刷新」，已处理本页资源价后结束")
@@ -348,6 +369,7 @@ class AutoShopExchangeTask:
             self._tap_free_refresh()
             total_bought += self._buy_all_resource_items()
 
+            time.sleep(SCAN_SETTLE_DELAY)
             screen = self.adb.screenshot()
             if is_free_refresh_available(screen):
                 continue
