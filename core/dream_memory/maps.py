@@ -10,7 +10,12 @@ from pathlib import Path
 import yaml
 from loguru import logger
 
-from core.dream_memory.config import MAPS_DIR, PREVIEWS_DIR
+from core.dream_memory.config import (
+    CURRENT_MAP_PERIOD,
+    DEFAULT_MAP_PERIOD,
+    MAPS_DIR,
+    PREVIEWS_DIR,
+)
 
 
 def _ensure_writable(path: Path) -> None:
@@ -104,6 +109,7 @@ class DreamMemoryMap:
     name: str
     items: dict[str, list[int]] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)
+    period: int = 4
     source_path: Path | None = None
 
     def resolve_label(self, label: str) -> str:
@@ -157,7 +163,11 @@ class DreamMemoryMap:
         return None
 
 
-def list_maps(maps_dir: Path | None = None) -> list[DreamMemoryMap]:
+def list_maps(
+    maps_dir: Path | None = None,
+    *,
+    period: int | None = None,
+) -> list[DreamMemoryMap]:
     root = maps_dir or MAPS_DIR
     if not root.is_dir():
         return []
@@ -166,11 +176,22 @@ def list_maps(maps_dir: Path | None = None) -> list[DreamMemoryMap]:
         if path.name.startswith("_"):
             continue
         try:
-            maps.append(load_map(path))
+            dream_map = load_map(path)
         except (OSError, yaml.YAMLError, ValueError):
             continue
-    maps.sort(key=lambda m: m.name)
+        if period is not None and dream_map.period != int(period):
+            continue
+        maps.append(dream_map)
+    maps.sort(key=lambda m: (m.period, m.name, m.map_id))
     return maps
+
+
+def list_map_periods(maps_dir: Path | None = None) -> list[int]:
+    """已有地图出现过的期数（升序）；至少包含当前活动期。"""
+    periods = {m.period for m in list_maps(maps_dir)}
+    periods.add(CURRENT_MAP_PERIOD)
+    periods.add(DEFAULT_MAP_PERIOD)
+    return sorted(periods)
 
 
 def load_map(map_id_or_path: str | Path, *, maps_dir: Path | None = None) -> DreamMemoryMap:
@@ -189,6 +210,13 @@ def load_map(map_id_or_path: str | Path, *, maps_dir: Path | None = None) -> Dre
 
     map_id = str(raw.get("id") or target.stem)
     name = str(raw.get("name") or map_id)
+    try:
+        period = int(raw.get("period", DEFAULT_MAP_PERIOD))
+    except (TypeError, ValueError):
+        period = DEFAULT_MAP_PERIOD
+    if period < 1:
+        period = DEFAULT_MAP_PERIOD
+
     items_raw = raw.get("items") or {}
     items: dict[str, list[int]] = {}
     for label, coord in items_raw.items():
@@ -204,6 +232,7 @@ def load_map(map_id_or_path: str | Path, *, maps_dir: Path | None = None) -> Dre
         name=name,
         items=items,
         aliases=aliases,
+        period=period,
         source_path=target,
     )
 
@@ -215,6 +244,25 @@ def format_map_choice(dream_map: DreamMemoryMap) -> str:
     return dream_map.map_id
 
 
+def format_period_choice(period: int) -> str:
+    return f"第 {int(period)} 期"
+
+
+def parse_period_choice(label: str, *, default: int = CURRENT_MAP_PERIOD) -> int:
+    text = (label or "").strip()
+    if not text:
+        return int(default)
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if digits:
+        try:
+            value = int(digits)
+            if value >= 1:
+                return value
+        except ValueError:
+            pass
+    return int(default)
+
+
 def save_map(
     dream_map: DreamMemoryMap,
     *,
@@ -224,9 +272,12 @@ def save_map(
     root.mkdir(parents=True, exist_ok=True)
     out = root / f"{dream_map.map_id}.yaml"
     dream_map.aliases = _sanitize_aliases(dream_map.aliases, dream_map.items)
+    period = max(1, int(dream_map.period or DEFAULT_MAP_PERIOD))
+    dream_map.period = period
     payload = {
         "id": dream_map.map_id,
         "name": dream_map.name,
+        "period": period,
         "items": dict(dream_map.items),
     }
     if dream_map.aliases:

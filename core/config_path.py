@@ -72,8 +72,8 @@ def _apply_port_from_stem(path: Path, cfg: dict) -> dict:
 
 
 def ensure_config_file(path: Path) -> Path:
-    """实例配置不存在时，从 config.example.yaml 复制并按文件名写入 device.adb_port。"""
-    if path.is_file():
+    """实例配置不存在或为空时，从 config.example.yaml 复制并按文件名写入 device.adb_port。"""
+    if path.is_file() and path.stat().st_size > 0:
         return path
     if not EXAMPLE_CONFIG_PATH.is_file():
         raise FileNotFoundError(

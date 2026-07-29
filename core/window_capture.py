@@ -157,6 +157,48 @@ def client_to_touch(
     return tx, ty
 
 
+def touch_to_client(
+    x: float,
+    y: float,
+    *,
+    client_w: int,
+    client_h: int,
+    touch_w: int = 720,
+    touch_h: int = 1280,
+) -> tuple[int, int]:
+    """720×1280 触控坐标 → 窗口客户区像素。"""
+    if client_w <= 0 or client_h <= 0:
+        raise ValueError("客户区尺寸无效")
+    if touch_w <= 0 or touch_h <= 0:
+        raise ValueError("触控尺寸无效")
+    cx = int(round(x / touch_w * client_w))
+    cy = int(round(y / touch_h * client_h))
+    cx = max(0, min(client_w - 1, cx))
+    cy = max(0, min(client_h - 1, cy))
+    return cx, cy
+
+
+def touch_roi_to_client_xywh(
+    roi: tuple[int, int, int, int],
+    *,
+    client_w: int,
+    client_h: int,
+    touch_w: int = 720,
+    touch_h: int = 1280,
+) -> tuple[int, int, int, int]:
+    """触控 ROI (x1,y1,x2,y2) → 客户区 (x,y,w,h)。"""
+    x1, y1, x2, y2 = roi
+    cx1, cy1 = touch_to_client(
+        x1, y1, client_w=client_w, client_h=client_h, touch_w=touch_w, touch_h=touch_h
+    )
+    cx2, cy2 = touch_to_client(
+        x2, y2, client_w=client_w, client_h=client_h, touch_w=touch_w, touch_h=touch_h
+    )
+    left, top = min(cx1, cx2), min(cy1, cy2)
+    right, bottom = max(cx1, cx2), max(cy1, cy2)
+    return left, top, max(1, right - left), max(1, bottom - top)
+
+
 def _bgr_from_rgb(rgb: np.ndarray) -> np.ndarray:
     if rgb.ndim != 3 or rgb.shape[2] < 3:
         raise ValueError("截图格式无效")

@@ -15,7 +15,7 @@ try:
 except ImportError:
     HAS_PIL = False
 
-from core.dream_memory.config import load_dream_memory_config
+from core.dream_memory.config import CURRENT_MAP_PERIOD, load_dream_memory_config
 from core.dream_memory.maps import DreamMemoryMap, delete_map, load_map, rename_map_name, save_map
 from gui.coord_ruler import CANVAS_MAX_H, CANVAS_MAX_W, GRID_STEP_DEFAULT, RULER_MARGIN
 
@@ -31,6 +31,7 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         *,
         config_path: Path,
         get_map_id: callable,
+        get_period: callable | None = None,
         screenshot_cb=None,
         on_saved: callable | None = None,
         touch_width: int = 720,
@@ -44,6 +45,7 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
 
         self.config_path = Path(config_path)
         self._get_map_id = get_map_id
+        self._get_period = get_period
         self._screenshot_cb = screenshot_cb
         self._on_saved = on_saved
         self.touch_width = touch_width
@@ -64,10 +66,12 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         self.var_item_name = tk.StringVar(value="")
         self.var_map_label = tk.StringVar(value="")
         self.var_hint = tk.StringVar(value="先截图，再点击物品中心")
+        self.var_item_filter = tk.StringVar(value="")
 
         self._pending_tx = 0
         self._pending_ty = 0
         self._saved_markers: dict[str, tuple[int, int]] = {}
+        self._item_rows: list[tuple[str, int, int]] = []
 
         self._build_ui()
         self._refresh_map_label()
@@ -155,7 +159,20 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
             wraplength=PANEL_WIDTH - 16,
         ).pack(anchor=tk.W, pady=(0, 8))
 
-        ttk.Label(panel, text="已标定物品").pack(anchor=tk.W)
+        list_header = ttk.Frame(panel)
+        list_header.pack(fill=tk.X)
+        ttk.Label(list_header, text="已标定物品").pack(side=tk.LEFT)
+        ttk.Label(list_header, text="(按名称排序)", foreground="#888", font=("", 8)).pack(
+            side=tk.LEFT, padx=(4, 0)
+        )
+
+        filter_row = ttk.Frame(panel)
+        filter_row.pack(fill=tk.X, pady=(4, 2))
+        ttk.Label(filter_row, text="筛选").pack(side=tk.LEFT)
+        ttk.Entry(filter_row, textvariable=self.var_item_filter).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0)
+        )
+
         list_frame = ttk.Frame(panel)
         list_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 6))
         self.list_items = tk.Listbox(list_frame, height=14, font=("Consolas", 9))
@@ -164,6 +181,7 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         self.list_items.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.list_items.bind("<<ListboxSelect>>", self._on_list_select)
+        self.var_item_filter.trace_add("write", lambda *_: self._apply_item_filter())
 
         ttk.Button(panel, text="删除选中", command=self._delete_selected_item, width=16).pack(
             fill=tk.X
@@ -216,30 +234,52 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         except FileNotFoundError:
             self.var_map_label.set(f"{map_id}（文件不存在）")
 
+    def _current_period(self) -> int:
+        if self._get_period is not None:
+            try:
+                period = int(self._get_period())
+                if period >= 1:
+                    return period
+            except (TypeError, ValueError):
+                pass
+        return CURRENT_MAP_PERIOD
+
     def _reload_item_list(self) -> None:
         self._refresh_map_label()
         map_id = self._current_map_id()
-        self.list_items.delete(0, tk.END)
+        self._item_rows = []
         self._saved_markers.clear()
         if not map_id:
+            self._apply_item_filter()
             self._redraw_markers()
             return
         try:
             dream_map = load_map(map_id, maps_dir=self._dm_cfg().maps_dir)
         except FileNotFoundError:
+            self._apply_item_filter()
             self._redraw_markers()
             return
-        for name, coord in sorted(dream_map.items.items()):
+        for name, coord in sorted(dream_map.items.items(), key=lambda kv: kv[0]):
             if len(coord) >= 2:
                 x, y = int(coord[0]), int(coord[1])
                 self._saved_markers[name] = (x, y)
-                self.list_items.insert(tk.END, f"{name}  ({x}, {y})")
+                self._item_rows.append((name, x, y))
+        self._apply_item_filter()
         self._redraw_markers()
 
+    def _apply_item_filter(self) -> None:
+        keyword = self.var_item_filter.get().strip().lower()
+        self.list_items.delete(0, tk.END)
+        for name, x, y in self._item_rows:
+            if keyword and keyword not in name.lower():
+                continue
+            self.list_items.insert(tk.END, f"{name}  ({x}, {y})")
+
     def _create_map_dialog(self) -> None:
+        period = self._current_period()
         map_id = simpledialog.askstring(
             "新建地图",
-            "地图 ID（英文/数字，如 gazebo_snow）:",
+            f"将创建到第 {period} 期\n地图 ID（英文/数字，如 gazebo_snow）:",
             parent=self,
         )
         if not map_id:
@@ -257,14 +297,23 @@ class DreamMemoryCalibratorWindow(tk.Toplevel):
         if not name:
             return
         path = save_map(
-            DreamMemoryMap(map_id=map_id, name=name.strip(), items={}),
+            DreamMemoryMap(
+                map_id=map_id,
+                name=name.strip(),
+                items={},
+                period=period,
+            ),
             maps_dir=self._dm_cfg().maps_dir,
         )
         if self._on_saved:
             self._on_saved(map_id)
         self._refresh_map_label()
         self._reload_item_list()
-        messagebox.showinfo("已创建", f"地图已创建:\n{path}", parent=self)
+        messagebox.showinfo(
+            "已创建",
+            f"第 {period} 期地图已创建:\n{path}",
+            parent=self,
+        )
 
     def _rename_map_dialog(self) -> None:
         map_id = self._current_map_id()

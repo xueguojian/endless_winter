@@ -37,8 +37,17 @@ DEFAULT_PK_TARGET_SLOTS: tuple[tuple[int, int, int, int], ...] = (
 
 DEFAULT_PK_TARGET_BAR: tuple[int, int, int, int] = (22, 1116, 698, 1256)
 
+# 极速 PK：窗口抓屏轮询（未见字快扫，见字后放慢）
+TURBO_PK_SCAN_FAST = 0.1
+TURBO_PK_SCAN_SLOW = 0.5
+TURBO_PK_TAP_BETWEEN = 0.09
+
 DEFAULT_TESSERACT_CMD = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
 DEFAULT_OCR_ENGINE = "rapidocr"
+
+# 寻梦地图期数：旧 YAML 无 period 时默认第 4 期；当前活动第 5 期
+DEFAULT_MAP_PERIOD = 4
+CURRENT_MAP_PERIOD = 5
 
 TAP_INTERVAL_FIXED = "fixed"
 TAP_INTERVAL_RANDOM = "random"
@@ -79,6 +88,7 @@ def default_pk_target_slots() -> tuple[tuple[int, int, int, int], ...]:
 class DreamMemoryConfig:
     tesseract_cmd: Path = field(default_factory=lambda: DEFAULT_TESSERACT_CMD)
     selected_map: str = ""
+    selected_period: int = CURRENT_MAP_PERIOD
     tap_delay: float = 1.2
     tap_between_delay: float = 0.2
     tap_between_delay_min: float = 0.2
@@ -140,6 +150,14 @@ def _parse_optional_path(raw: str | None, default: Path) -> Path:
     return path_obj if path_obj.is_absolute() else ROOT / path_obj
 
 
+def _parse_period(raw) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return CURRENT_MAP_PERIOD
+    return value if value >= 1 else CURRENT_MAP_PERIOD
+
+
 def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
     tesseract_raw = raw.get("tesseract_cmd") or DEFAULT_TESSERACT_CMD
     if pk:
@@ -190,6 +208,7 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
     cfg = DreamMemoryConfig(
         tesseract_cmd=Path(str(tesseract_raw)),
         selected_map=str(raw.get("selected_map") or ""),
+        selected_period=_parse_period(raw.get("selected_period")),
         tap_delay=float(raw.get("tap_delay", 1.2)),
         tap_between_delay=float(raw.get("tap_between_delay", timing["tap_between_delay"])),
         tap_between_delay_min=float(

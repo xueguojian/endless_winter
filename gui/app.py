@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import tkinter as tk
+from dataclasses import replace
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
@@ -21,8 +22,20 @@ from core.config_path import (
     ensure_config_file,
     resolve_config_path,
 )
-from core.dream_memory.config import load_dream_memory_config, load_dream_memory_pk_config
-from core.dream_memory.maps import delete_map, list_maps, load_map, rename_map_name
+from core.dream_memory.config import (
+    CURRENT_MAP_PERIOD,
+    TURBO_PK_TAP_BETWEEN,
+    load_dream_memory_config,
+    load_dream_memory_pk_config,
+)
+from core.dream_memory.maps import (
+    delete_map,
+    format_period_choice,
+    list_map_periods,
+    list_maps,
+    load_map,
+    rename_map_name,
+)
 from core.dream_memory.ocr_engine import (
     ocr_chip_text,
     ocr_engine_available,
@@ -37,12 +50,16 @@ from gui.region_monitor import RegionMonitorWindow
 from gui.dream_memory_calibrator import DreamMemoryCalibratorWindow
 from gui.dream_memory_panel import (
     DreamTabWidgets,
+    TurboPkControls,
     build_dream_tab,
+    build_turbo_pk_controls,
     get_selected_map_id,
+    get_selected_period,
     get_tap_interval_mode,
     load_dream_cfg,
     rebuild_map_index,
     set_map_selection,
+    set_period_selection,
     update_summary,
 )
 from gui.task_registry import TaskEntry, HOSTING_TASK_IDS, loop_tasks, once_tasks, TASK_ENTRIES
@@ -291,14 +308,18 @@ class EndlessWinterApp(tk.Tk):
         self._dream_pk_calibrator: DreamMemoryCalibratorWindow | None = None
         self._dream_widgets: DreamTabWidgets | None = None
         self._dream_pk_widgets: DreamTabWidgets | None = None
+        self._dream_turbo_pk_widgets: DreamTabWidgets | None = None
+        self._dream_turbo_pk_controls: TurboPkControls | None = None
         self._dream_memory_worker: threading.Thread | None = None
         self._dream_pk_worker: threading.Thread | None = None
         self._dream_memory_stop_event = threading.Event()
         self._dream_pk_stop_event = threading.Event()
         self._dream_memory_session: DreamMemorySession | None = None
         self._dream_pk_session: DreamMemorySession | None = None
+        self._dream_pk_turbo_active = False
         self._dream_preview_window: tk.Toplevel | None = None
         self._dream_pk_preview_window: tk.Toplevel | None = None
+        self._dream_turbo_pk_preview_window: tk.Toplevel | None = None
         self._alliance_worker: threading.Thread | None = None
         self._alliance_session: AllianceMobilizationSession | None = None
         self._alliance_admin_worker: threading.Thread | None = None
@@ -535,11 +556,28 @@ class EndlessWinterApp(tk.Tk):
         if self._dream_widgets is not None:
             dm = cfg.setdefault("dream_memory", {})
             dm["selected_map"] = get_selected_map_id(self._dream_widgets)
+            dm["selected_period"] = get_selected_period(self._dream_widgets)
             dm["tap_between_delay_interval"] = get_tap_interval_mode(self._dream_widgets)
         if self._dream_pk_widgets is not None:
             pk = cfg.setdefault("dream_memory_pk", {})
             pk["selected_map"] = get_selected_map_id(self._dream_pk_widgets)
+            pk["selected_period"] = get_selected_period(self._dream_pk_widgets)
             pk["tap_between_delay_interval"] = get_tap_interval_mode(self._dream_pk_widgets)
+        if self._dream_turbo_pk_widgets is not None:
+            turbo = cfg.setdefault("dream_memory_turbo_pk", {})
+            turbo["selected_map"] = get_selected_map_id(self._dream_turbo_pk_widgets)
+            turbo["selected_period"] = get_selected_period(self._dream_turbo_pk_widgets)
+            turbo["tap_between_delay_interval"] = get_tap_interval_mode(
+                self._dream_turbo_pk_widgets
+            )
+            if self._dream_turbo_pk_controls is not None:
+                hwnd = self._dream_turbo_pk_controls.selected_hwnd()
+                if hwnd is not None:
+                    for win in self._dream_turbo_pk_controls.windows:
+                        if int(win.hwnd) == int(hwnd):
+                            turbo["window_title"] = win.title
+                            break
+                turbo["bar_roi"] = list(self._dream_turbo_pk_controls.bar_roi())
 
         alliance = cfg.setdefault("alliance_mobilization", {})
         type_keep_rules = self._collect_alliance_type_keep_rules()
@@ -749,16 +787,31 @@ class EndlessWinterApp(tk.Tk):
             if col >= columns:
                 col = 0
 
-    def _dream_widgets_for(self, pk: bool) -> DreamTabWidgets:
+    def _dream_widgets_for(self, pk: bool = False, *, turbo: bool = False) -> DreamTabWidgets:
+        if turbo:
+            widgets = self._dream_turbo_pk_widgets
+            if widgets is None:
+                raise RuntimeError("极速寻梦PK Tab 尚未初始化")
+            return widgets
         widgets = self._dream_pk_widgets if pk else self._dream_widgets
         if widgets is None:
             raise RuntimeError("寻梦记忆 Tab 尚未初始化")
         return widgets
 
-    def _refresh_dream_maps(self, pk: bool = False) -> None:
-        widgets = self._dream_widgets_for(pk)
-        dm_cfg = load_dream_cfg(self, pk)
-        maps = list_maps(dm_cfg.maps_dir)
+    def _refresh_dream_maps(
+        self, pk: bool = False, *, turbo: bool = False, notify_empty: bool = False
+    ) -> None:
+        widgets = self._dream_widgets_for(pk, turbo=turbo)
+        dm_cfg = load_dream_cfg(self, pk or turbo)
+        periods = list_map_periods(dm_cfg.maps_dir)
+        period_labels = [format_period_choice(p) for p in periods]
+        widgets.cmb_period.configure(values=period_labels, state="readonly")
+        period = get_selected_period(widgets)
+        if period not in periods:
+            period = periods[-1] if periods else CURRENT_MAP_PERIOD
+            set_period_selection(widgets, period)
+
+        maps = list_maps(dm_cfg.maps_dir, period=period)
         label_to_id, id_to_label = rebuild_map_index(maps)
         widgets.label_to_id = label_to_id
         widgets.id_to_label = id_to_label
@@ -777,8 +830,6 @@ class EndlessWinterApp(tk.Tk):
             widgets.var_map.set("")
         update_summary(self, widgets)
 
-        from core.dream_memory.ocr_engine import ocr_engine_available, resolve_ocr_engine
-
         ocr_engine = resolve_ocr_engine(dm_cfg.ocr_engine)
         ocr_ok = ocr_engine_available(dm_cfg.ocr_engine)
         if ocr_engine == "rapidocr":
@@ -789,13 +840,12 @@ class EndlessWinterApp(tk.Tk):
             text=ocr_text,
             foreground="green" if ocr_ok else "red",
         )
-        if not map_ids:
+        if notify_empty and not map_ids:
             title = "寻梦记忆PK" if pk else "寻梦记忆"
             messagebox.showinfo(
                 title,
-                "暂无地图配置。\n"
-                "请点「标定地图」新建，或运行:\n"
-                "  tools/calibrate_dream_memory_map.py --create 地图ID --name 显示名",
+                f"第 {period} 期暂无地图配置。\n"
+                "请点「标定地图」新建，或切换其他期数查看旧地图。",
             )
 
     def _build_dream_memory_tab(self, parent: ttk.Frame) -> None:
@@ -804,9 +854,13 @@ class EndlessWinterApp(tk.Tk):
             parent,
             pk=False,
             on_map_changed=lambda: (update_summary(self, self._dream_widgets), self._save_config()),
+            on_period_changed=lambda: (
+                self._refresh_dream_maps(pk=False),
+                self._save_config(),
+            ),
             on_start=lambda: self._start_dream_session(pk=False),
             on_stop=lambda: self._stop_dream_session(pk=False),
-            on_refresh=lambda: self._refresh_dream_maps(pk=False),
+            on_refresh=lambda: self._refresh_dream_maps(pk=False, notify_empty=True),
             on_calibrate=lambda: self._open_dream_calibrator(pk=False),
             on_rename=lambda: self._rename_dream_map(pk=False),
             on_delete=lambda: self._delete_dream_map(pk=False),
@@ -832,15 +886,48 @@ class EndlessWinterApp(tk.Tk):
                 update_summary(self, self._dream_pk_widgets),
                 self._save_config(),
             ),
+            on_period_changed=lambda: (
+                self._refresh_dream_maps(pk=True),
+                self._save_config(),
+            ),
             on_start=lambda: self._start_dream_session(pk=True),
             on_stop=lambda: self._stop_dream_session(pk=True),
-            on_refresh=lambda: self._refresh_dream_maps(pk=True),
+            on_refresh=lambda: self._refresh_dream_maps(pk=True, notify_empty=True),
             on_calibrate=lambda: self._open_dream_calibrator(pk=True),
             on_rename=lambda: self._rename_dream_map(pk=True),
             on_delete=lambda: self._delete_dream_map(pk=True),
         )
         self.btn_dream_pk_start = self._dream_pk_widgets.btn_start
         self.btn_dream_pk_stop = self._dream_pk_widgets.btn_stop
+
+    def _build_dream_turbo_pk_tab(self, parent: ttk.Frame) -> None:
+        self._dream_turbo_pk_controls = build_turbo_pk_controls(self, parent)
+        self._dream_turbo_pk_widgets = build_dream_tab(
+            self,
+            parent,
+            pk=True,
+            config_section="dream_memory_turbo_pk",
+            show_map_tools=False,
+            show_summary=False,
+            on_map_changed=lambda: (
+                update_summary(self, self._dream_turbo_pk_widgets),
+                self._save_config(),
+            ),
+            on_period_changed=lambda: (
+                self._refresh_dream_maps(pk=True, turbo=True),
+                self._save_config(),
+            ),
+            on_start=lambda: self._start_dream_session(pk=True, turbo=True),
+            on_stop=lambda: self._stop_dream_session(pk=True),
+            on_refresh=lambda: self._refresh_dream_maps(
+                pk=True, turbo=True, notify_empty=True
+            ),
+            on_calibrate=lambda: None,
+            on_rename=lambda: None,
+            on_delete=lambda: None,
+        )
+        self.btn_dream_turbo_pk_start = self._dream_turbo_pk_widgets.btn_start
+        self.btn_dream_turbo_pk_stop = self._dream_turbo_pk_widgets.btn_stop
 
     def _refresh_dream_memory_maps(self) -> None:
         self._refresh_dream_maps(pk=False)
@@ -1484,6 +1571,10 @@ class EndlessWinterApp(tk.Tk):
         task_notebook.add(tab_dream_pk, text="寻梦PK")
         self._build_dream_pk_tab(tab_dream_pk)
 
+        tab_dream_turbo_pk = ttk.Frame(task_notebook, padding=6)
+        task_notebook.add(tab_dream_turbo_pk, text="极速寻梦PK")
+        self._build_dream_turbo_pk_tab(tab_dream_turbo_pk)
+
         self._task_notebook.bind("<<NotebookTabChanged>>", self._on_task_notebook_changed)
 
         self._log_frame = ttk.LabelFrame(self._container, text="运行日志", padding=8)
@@ -1799,20 +1890,24 @@ class EndlessWinterApp(tk.Tk):
 
     def _on_dream_map_saved(self, map_id: str | None, *, pk: bool) -> None:
         self._refresh_dream_maps(pk=pk)
+        if pk and self._dream_turbo_pk_widgets is not None:
+            self._refresh_dream_maps(pk=True, turbo=True)
         if map_id:
             set_map_selection(self._dream_widgets_for(pk), map_id)
+            if pk and self._dream_turbo_pk_widgets is not None:
+                set_map_selection(self._dream_widgets_for(pk=True, turbo=True), map_id)
             try:
                 self._save_config()
             except ValueError:
                 pass
 
-    def _rename_dream_map(self, pk: bool = False) -> None:
-        widgets = self._dream_widgets_for(pk)
+    def _rename_dream_map(self, pk: bool = False, *, turbo: bool = False) -> None:
+        widgets = self._dream_widgets_for(pk, turbo=turbo)
         map_id = get_selected_map_id(widgets)
         if not map_id:
             messagebox.showwarning("提示", "请先选择要重命名的地图")
             return
-        dm_cfg = load_dream_cfg(self, pk)
+        dm_cfg = load_dream_cfg(self, pk or turbo)
         try:
             dream_map = load_map(map_id, maps_dir=dm_cfg.maps_dir)
         except FileNotFoundError:
@@ -1830,17 +1925,19 @@ class EndlessWinterApp(tk.Tk):
         except (FileNotFoundError, ValueError) as exc:
             messagebox.showerror("重命名失败", str(exc))
             return
-        self._refresh_dream_maps(pk=pk)
+        self._refresh_dream_maps(pk=pk, turbo=turbo)
+        if pk and not turbo and self._dream_turbo_pk_widgets is not None:
+            self._refresh_dream_maps(pk=True, turbo=True)
         set_map_selection(widgets, map_id)
         messagebox.showinfo("完成", f"已重命名为「{new_name.strip()}」")
 
-    def _delete_dream_map(self, pk: bool = False) -> None:
-        widgets = self._dream_widgets_for(pk)
+    def _delete_dream_map(self, pk: bool = False, *, turbo: bool = False) -> None:
+        widgets = self._dream_widgets_for(pk, turbo=turbo)
         map_id = get_selected_map_id(widgets)
         if not map_id:
             messagebox.showwarning("提示", "请先选择要删除的地图")
             return
-        dm_cfg = load_dream_cfg(self, pk)
+        dm_cfg = load_dream_cfg(self, pk or turbo)
         try:
             dream_map = load_map(map_id, maps_dir=dm_cfg.maps_dir)
         except FileNotFoundError:
@@ -1861,7 +1958,9 @@ class EndlessWinterApp(tk.Tk):
         except FileNotFoundError as exc:
             messagebox.showerror("删除失败", str(exc))
             return
-        self._refresh_dream_maps(pk=pk)
+        self._refresh_dream_maps(pk=pk, turbo=turbo)
+        if pk and not turbo and self._dream_turbo_pk_widgets is not None:
+            self._refresh_dream_maps(pk=True, turbo=True)
         messagebox.showinfo("已删除", f"地图「{dream_map.name}」已删除")
 
     def _open_dream_calibrator(self, pk: bool = False) -> None:
@@ -1876,6 +1975,7 @@ class EndlessWinterApp(tk.Tk):
                 self,
                 config_path=self.config_path,
                 get_map_id=lambda: get_selected_map_id(widgets),
+                get_period=lambda: get_selected_period(widgets),
                 screenshot_cb=self._capture_for_coord_ruler,
                 on_saved=lambda mid, p=pk: self._on_dream_map_saved(mid, pk=p),
                 touch_width=touch_w,
@@ -2173,7 +2273,11 @@ class EndlessWinterApp(tk.Tk):
             self.btn_check_account.configure(
                 state=tk.DISABLED if running else tk.NORMAL
             )
-        for widgets in (self._dream_widgets, self._dream_pk_widgets):
+        for widgets in (
+            self._dream_widgets,
+            self._dream_pk_widgets,
+            self._dream_turbo_pk_widgets,
+        ):
             if widgets is None:
                 continue
             widgets.btn_start.configure(state=tk.DISABLED if running else tk.NORMAL)
@@ -2223,6 +2327,7 @@ class EndlessWinterApp(tk.Tk):
             "管理员刷新": self._start_alliance_admin,
             "寻梦记忆": lambda: self._start_dream_session(pk=False),
             "寻梦PK": lambda: self._start_dream_session(pk=True),
+            "极速寻梦PK": lambda: self._start_dream_session(pk=True, turbo=True),
         }
         handler = dispatch.get(tab_name)
         if handler is None:
@@ -2922,9 +3027,11 @@ class EndlessWinterApp(tk.Tk):
                 task.stop()
         self._on_status("正在停止一次性任务…")
 
-    def _start_dream_session(self, pk: bool = False) -> None:
+    def _start_dream_session(self, pk: bool = False, *, turbo: bool = False) -> None:
+        if turbo:
+            pk = True
         if self._is_dream_memory_running() if not pk else self._is_dream_pk_running():
-            title = "寻梦记忆PK" if pk else "寻梦记忆"
+            title = "极速寻梦PK" if turbo else ("寻梦记忆PK" if pk else "寻梦记忆")
             messagebox.showwarning("提示", f"{title}已在运行")
             return
         if (
@@ -2937,15 +3044,49 @@ class EndlessWinterApp(tk.Tk):
             messagebox.showwarning("提示", "请先停止其他任务")
             return
 
-        widgets = self._dream_widgets_for(pk)
+        widgets = self._dream_widgets_for(pk, turbo=turbo)
         map_id = get_selected_map_id(widgets)
         if not map_id:
             messagebox.showwarning("提示", "请先选择或创建地图")
             return
 
+        window_hwnd: int | None = None
+        turbo_bar_roi: tuple[int, int, int, int] | None = None
+        if turbo:
+            controls = self._dream_turbo_pk_controls
+            if controls is None:
+                messagebox.showerror("错误", "极速寻梦PK 控件未初始化")
+                return
+            window_hwnd = controls.selected_hwnd()
+            if window_hwnd is None:
+                messagebox.showwarning("提示", "请先选择雷电窗口")
+                return
+            turbo_bar_roi = controls.bar_roi()
+            if turbo_bar_roi[2] <= 0 or turbo_bar_roi[3] <= 0:
+                messagebox.showwarning("提示", "请设置底栏 ROI，或点「默认底栏」")
+                return
+
         try:
             self._save_config()
             dm_cfg = load_dream_cfg(self, pk)
+            if turbo:
+                turbo_raw = self.config.get("dream_memory_turbo_pk", {})
+                if not isinstance(turbo_raw, dict):
+                    turbo_raw = {}
+                tap = float(turbo_raw.get("tap_between_delay", TURBO_PK_TAP_BETWEEN))
+                dm_cfg = replace(
+                    dm_cfg,
+                    tap_between_delay=tap,
+                    tap_between_delay_min=float(
+                        turbo_raw.get("tap_between_delay_min", tap)
+                    ),
+                    tap_between_delay_max=float(
+                        turbo_raw.get("tap_between_delay_max", tap)
+                    ),
+                    tap_between_delay_mode=float(
+                        turbo_raw.get("tap_between_delay_mode", tap)
+                    ),
+                )
             game_map = load_map(map_id, maps_dir=dm_cfg.maps_dir)
         except FileNotFoundError as exc:
             messagebox.showerror("地图错误", str(exc))
@@ -2969,7 +3110,8 @@ class EndlessWinterApp(tk.Tk):
                 )
             return
 
-        title = "寻梦记忆PK" if pk else "寻梦记忆"
+        title = "极速寻梦PK" if turbo else ("寻梦记忆PK" if pk else "寻梦记忆")
+        self._dream_pk_turbo_active = bool(turbo)
         self._set_dream_buttons(running=True, pk=pk)
         self._on_status(f"{title}：{game_map.name}")
 
@@ -2982,6 +3124,9 @@ class EndlessWinterApp(tk.Tk):
                     game_map,
                     config=dm_cfg,
                     on_status=self._on_status,
+                    turbo_pk=turbo,
+                    window_hwnd=window_hwnd,
+                    turbo_bar_roi=turbo_bar_roi,
                 )
                 if pk:
                     self._dream_pk_session = session
@@ -2994,6 +3139,7 @@ class EndlessWinterApp(tk.Tk):
             finally:
                 if pk:
                     self._dream_pk_session = None
+                    self._dream_pk_turbo_active = False
                     self.after(0, lambda: self._on_dream_session_done(pk=True))
                 else:
                     self._dream_memory_session = None
@@ -3007,7 +3153,11 @@ class EndlessWinterApp(tk.Tk):
         worker.start()
 
     def _stop_dream_session(self, pk: bool = False) -> None:
-        title = "寻梦记忆PK" if pk else "寻梦记忆"
+        title = (
+            "极速寻梦PK"
+            if pk and self._dream_pk_turbo_active
+            else ("寻梦记忆PK" if pk else "寻梦记忆")
+        )
         session = self._dream_pk_session if pk else self._dream_memory_session
         if session is not None:
             session.stop()

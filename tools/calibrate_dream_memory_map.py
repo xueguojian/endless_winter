@@ -25,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from core.dream_memory.config import CURRENT_MAP_PERIOD
 from core.dream_memory.maps import DreamMemoryMap, delete_map, list_maps, load_map, rename_map_name, save_map
 
 
@@ -33,6 +34,12 @@ def main() -> None:
     parser.add_argument("--list", action="store_true", help="列出已有地图")
     parser.add_argument("--create", metavar="MAP_ID", help="新建地图 ID")
     parser.add_argument("--name", default="", help="地图显示名称（配合 --create）")
+    parser.add_argument(
+        "--period",
+        type=int,
+        default=CURRENT_MAP_PERIOD,
+        help=f"地图期数（默认第 {CURRENT_MAP_PERIOD} 期）",
+    )
     parser.add_argument("--map", metavar="MAP_ID", help="要编辑的地图 ID")
     parser.add_argument(
         "--add",
@@ -50,10 +57,10 @@ def main() -> None:
         if not maps:
             print("（暂无地图，使用 --create 新建）")
             return
-        print(f"{'ID':<20} {'名称':<20} 物品数")
-        print("-" * 52)
+        print(f"{'期数':<6} {'ID':<20} {'名称':<20} 物品数")
+        print("-" * 60)
         for item in maps:
-            print(f"{item.map_id:<20} {item.name:<20} {len(item.items)}")
+            print(f"{item.period:<6} {item.map_id:<20} {item.name:<20} {len(item.items)}")
         return
 
     if args.create:
@@ -61,8 +68,11 @@ def main() -> None:
         if not map_id:
             parser.error("--create 需要非空 ID")
         name = args.name.strip() or map_id
-        path = save_map(DreamMemoryMap(map_id=map_id, name=name, items={}))
-        print(f"已创建: {path}")
+        period = max(1, int(args.period))
+        path = save_map(
+            DreamMemoryMap(map_id=map_id, name=name, items={}, period=period)
+        )
+        print(f"已创建第 {period} 期: {path}")
         return
 
     if not args.map:

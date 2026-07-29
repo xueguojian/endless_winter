@@ -180,6 +180,34 @@ def split_bar_into_slots(
     return tuple(rois)
 
 
+def split_bar_grid_slots(
+    width: int,
+    height: int,
+    *,
+    rows: int = 2,
+    cols: int = 3,
+) -> tuple[tuple[int, int, int, int], ...]:
+    """将底栏图像按 rows×cols 均分为槽位 ROI（相对左上角）。
+
+    PK 六字栏为上 3 + 下 3，顺序与 DEFAULT_PK_TARGET_SLOTS 一致。
+    """
+    rows = max(1, int(rows))
+    cols = max(1, int(cols))
+    width = max(1, int(width))
+    height = max(1, int(height))
+    cell_w = width / cols
+    cell_h = height / rows
+    slots: list[tuple[int, int, int, int]] = []
+    for row in range(rows):
+        for col in range(cols):
+            x1 = int(round(col * cell_w))
+            y1 = int(round(row * cell_h))
+            x2 = int(round((col + 1) * cell_w))
+            y2 = int(round((row + 1) * cell_h))
+            slots.append((x1, y1, max(x1 + 1, x2), max(y1 + 1, y2)))
+    return tuple(slots)
+
+
 def estimate_slot_count(
     bar_bgr: np.ndarray,
     *,

@@ -437,6 +437,7 @@ alliance_mobilization_admin:
     scroll_to_top_max: 10
 dream_memory:
   tesseract_cmd: C:\Program Files\Tesseract-OCR\tesseract.exe
+  selected_period: 5
   selected_map: example_gazebo
   tap_delay: 1.2
   tap_between_delay: 0.2
@@ -456,6 +457,7 @@ dream_memory:
     - [250, 1142, 462, 1196]
     - [468, 1136, 674, 1200]
 dream_memory_pk:
+  selected_period: 5
   selected_map: ''
   enable_misclick: false
   tap_between_delay: 0.09
@@ -476,3 +478,14 @@ dream_memory_pk:
     - [22, 1188, 226, 1256]
     - [240, 1186, 464, 1256]
     - [476, 1188, 688, 1254]
+dream_memory_turbo_pk:
+  selected_period: 5
+  selected_map: ''
+  tap_between_delay: 0.09
+  tap_between_delay_min: 0.09
+  tap_between_delay_max: 0.09
+  tap_between_delay_mode: 0.09
+  tap_between_delay_interval: fixed
+  window_title: ''
+  # 客户区相对坐标 x,y,w,h；空则启动时按默认 PK 底栏换算
+  bar_roi: [0, 0, 0, 0]

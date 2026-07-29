@@ -11,7 +11,10 @@ from loguru import logger
 
 from core.adb_client import AdbClient
 from core.dream_memory.config import (
+    DEFAULT_PK_TARGET_BAR,
     DreamMemoryConfig,
+    TURBO_PK_SCAN_FAST,
+    TURBO_PK_SCAN_SLOW,
     format_tap_interval_hint,
     load_dream_memory_config,
     sample_tap_between_delay,
@@ -19,7 +22,13 @@ from core.dream_memory.config import (
 from core.dream_memory.maps import DreamMemoryMap, load_map
 from core.dream_memory.misclick import PseudoRandomMisclickScheduler
 from core.dream_memory.ocr_engine import ocr_engine_available, resolve_ocr_engine, warmup_ocr
-from core.dream_memory.vision import chip_is_active, read_target_chips, resolve_item_coord
+from core.dream_memory.vision import (
+    chip_is_active,
+    read_target_chips,
+    resolve_item_coord,
+    split_bar_grid_slots,
+)
+from core.window_capture import WindowCapture, touch_roi_to_client_xywh
 
 StatusCallback = Callable[[str], None]
 
@@ -77,13 +86,41 @@ class DreamMemorySession:
         *,
         config: DreamMemoryConfig | None = None,
         on_status: StatusCallback | None = None,
+        turbo_pk: bool = False,
+        window_hwnd: int | None = None,
+        turbo_bar_roi: tuple[int, int, int, int] | None = None,
+        turbo_scan_fast: float = TURBO_PK_SCAN_FAST,
+        turbo_scan_slow: float = TURBO_PK_SCAN_SLOW,
     ):
         self.adb = adb
         self.game_map = game_map
         self.config = config or load_dream_memory_config()
         self.on_status = on_status
         self._stop_event = threading.Event()
-        if self.config.pk_mode:
+        self.turbo_pk = bool(turbo_pk) and bool(self.config.pk_mode)
+        self._turbo_capture: WindowCapture | None = None
+        self._turbo_bar_roi: tuple[int, int, int, int] | None = None
+        self._turbo_scan_fast = max(0.0, float(turbo_scan_fast))
+        self._turbo_scan_slow = max(0.0, float(turbo_scan_slow))
+        if self.turbo_pk:
+            self.name = "极速寻梦PK"
+            if window_hwnd is None:
+                raise ValueError("极速寻梦PK 需要选择雷电窗口")
+            self._turbo_capture = WindowCapture()
+            self._turbo_capture.set_window(int(window_hwnd))
+            if turbo_bar_roi is not None:
+                x, y, w, h = (int(v) for v in turbo_bar_roi)
+                if w <= 0 or h <= 0:
+                    raise ValueError("极速寻梦PK 底栏 ROI 无效")
+                self._turbo_bar_roi = (x, y, w, h)
+            else:
+                crect = self._turbo_capture.client_rect()
+                self._turbo_bar_roi = touch_roi_to_client_xywh(
+                    DEFAULT_PK_TARGET_BAR,
+                    client_w=crect.width,
+                    client_h=crect.height,
+                )
+        elif self.config.pk_mode:
             self.name = "寻梦记忆PK"
         self._misclick: PseudoRandomMisclickScheduler | None = None
         if self.config.enable_misclick:
@@ -141,10 +178,26 @@ class DreamMemorySession:
             return self.game_map.lookup_strict(label)
         return resolve_item_coord(self.game_map, label)
 
-    def _scan_batch(self, screen) -> list[_BatchTap]:
+    def _grab_pk_frame(self) -> tuple[object, tuple[tuple[int, int, int, int], ...]]:
+        """返回 (图像, 槽位ROI)。极速模式抓窗口底栏并均分六格。"""
+        if self.turbo_pk and self._turbo_capture is not None and self._turbo_bar_roi is not None:
+            x, y, w, h = self._turbo_bar_roi
+            bar = self._turbo_capture.grab_region(x, y, w, h)
+            if bar is None or getattr(bar, "size", 0) == 0:
+                raise RuntimeError("窗口抓屏为空（窗口是否最小化？）")
+            height, width = bar.shape[:2]
+            slots = split_bar_grid_slots(width, height, rows=2, cols=3)
+            return bar, slots
+        return self.adb.screenshot(), self.config.target_slots
+
+    def _scan_batch(
+        self,
+        screen,
+        slots: tuple[tuple[int, int, int, int], ...] | None = None,
+    ) -> list[_BatchTap]:
         chips = read_target_chips(
             screen,
-            self.config.target_slots,
+            slots if slots is not None else self.config.target_slots,
             map_keys=self._map_keys(),
             map_aliases=self.game_map.aliases,
             tesseract_cmd=self.config.tesseract_cmd,
@@ -281,13 +334,13 @@ class DreamMemorySession:
         """PK 扫描线程：定时 OCR，仅首次见到的物品入队。"""
         while not self._interrupted():
             try:
-                screen = self.adb.screenshot()
+                screen, slots = self._grab_pk_frame()
             except Exception as exc:
                 self._emit(f"截图失败: {exc}")
                 time.sleep(0.5)
                 continue
 
-            batch = self._scan_batch(screen)
+            batch = self._scan_batch(screen, slots=slots)
             fresh = self._pk_filter_new_items(batch, seen)
             if fresh:
                 added = queue.extend(fresh)
@@ -297,11 +350,15 @@ class DreamMemorySession:
                         f"已见 {len(seen)}，队列 {len(queue)}）"
                     )
 
-            # 首帧未识别到任何物品时不等待 scan_interval，连续重扫直到底栏就绪
-            if not seen:
+            if self.turbo_pk:
+                # 未见字：0.1s 快扫；识别出文字后：0.5s
+                interval = self._turbo_scan_fast if not seen else self._turbo_scan_slow
+            elif not seen:
+                # 普通 PK：首帧未识别到任何物品时不等待，连续重扫
                 continue
+            else:
+                interval = max(0.0, self.config.scan_interval)
 
-            interval = max(0.0, self.config.scan_interval)
             if interval > 0:
                 deadline = time.time() + interval
                 while time.time() < deadline:
@@ -357,41 +414,60 @@ class DreamMemorySession:
 
         engine = resolve_ocr_engine(self.config.ocr_engine)
         warmup_ocr(self.config.ocr_engine)
-        mode_hint = "PK·队列" if self.config.pk_mode else "普通"
-        tap_hint = format_tap_interval_hint(self.config)
+        if self.turbo_pk:
+            mode_hint = "极速PK·窗口抓屏"
+            roi = self._turbo_bar_roi
+            backend = self._turbo_capture.backend if self._turbo_capture else "?"
+            pk_hint = (
+                f"·ROI {roi}·{backend}"
+                f"·快扫 {self._turbo_scan_fast:g}s / 慢扫 {self._turbo_scan_slow:g}s"
+                f"·{format_tap_interval_hint(self.config)}"
+            )
+        elif self.config.pk_mode:
+            mode_hint = "PK·队列"
+            pk_hint = (
+                f"·扫描/点击解耦（扫描 {self.config.scan_interval:g}s，"
+                f"{format_tap_interval_hint(self.config)}）"
+            )
+        else:
+            mode_hint = "普通"
+            pk_hint = f"·{format_tap_interval_hint(self.config)}·扫描 {self.config.scan_interval:g}s"
         misclick_hint = "·含误点" if self.config.enable_misclick else ""
-        pk_hint = (
-            f"·扫描/点击解耦（扫描 {self.config.scan_interval:g}s，{tap_hint}）"
-            if self.config.pk_mode
-            else f"·{tap_hint}·扫描 {self.config.scan_interval:g}s"
-        )
         self._emit(
             f"开始({mode_hint}{misclick_hint}{pk_hint}) — 地图「{self.game_map.name}」"
             f"（{len(self.game_map.items)} 个标定物品，"
             f"识别区 {len(self.config.target_slots)} 槽，OCR={engine}）"
         )
 
-        if self.config.pk_mode:
-            self._run_pk_dual_loop()
+        try:
+            if self.config.pk_mode:
+                self._run_pk_dual_loop()
+                self._emit("已结束")
+                return
+
+            while not self._interrupted():
+                try:
+                    screen = self.adb.screenshot()
+                except Exception as exc:
+                    self._emit(f"截图失败: {exc}")
+                    time.sleep(0.5)
+                    continue
+
+                batch = self._scan_batch(screen)
+                if not batch:
+                    time.sleep(self.config.scan_interval)
+                    continue
+
+                before_means = self._slot_fingerprints(screen, batch)
+                self._click_batch(batch, before_means=before_means)
+                if self._interrupted():
+                    break
+
             self._emit("已结束")
-            return
-
-        while not self._interrupted():
-            try:
-                screen = self.adb.screenshot()
-            except Exception as exc:
-                self._emit(f"截图失败: {exc}")
-                time.sleep(0.5)
-                continue
-
-            batch = self._scan_batch(screen)
-            if not batch:
-                time.sleep(self.config.scan_interval)
-                continue
-
-            before_means = self._slot_fingerprints(screen, batch)
-            self._click_batch(batch, before_means=before_means)
-            if self._interrupted():
-                break
-
-        self._emit("已结束")
+        finally:
+            if self._turbo_capture is not None:
+                try:
+                    self._turbo_capture.close()
+                except Exception:
+                    pass
+                self._turbo_capture = None
