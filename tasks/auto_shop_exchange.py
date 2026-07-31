@@ -105,15 +105,25 @@ def _extract_price_icon(crop: np.ndarray) -> np.ndarray | None:
     """从价格按钮中取出货币图标区域。
 
     小数额时整块会居中；大额宽价签左侧是图标、右侧是长数字。
-    用暗色列定位起点后只取较短窗口，避免把深蓝数字吃进图标区。
+    优先找木/肉色列作起点；否则用暗色列。窗口宜短，避免吃进深蓝数字。
     """
     if crop.size == 0:
         return None
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    dark_ratio = (gray < 135).mean(axis=0)
-    segments = _content_column_segments(dark_ratio, min_ratio=0.10)
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    # 木/肉暖色：大额「4000万」时数字很暗，暗色列会从数字起算，必须先抓暖色图标
+    wood_m = cv2.inRange(hsv, (5, 35, 40), (35, 255, 255)) > 0
+    meat_m = (cv2.inRange(hsv, (0, 35, 35), (18, 255, 255)) > 0) | (
+        cv2.inRange(hsv, (160, 35, 35), (180, 255, 255)) > 0
+    )
+    warm_ratio = (wood_m | meat_m).mean(axis=0)
+    segments = _content_column_segments(warm_ratio, min_ratio=0.08)
+
     if not segments:
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        dark_ratio = (gray < 135).mean(axis=0)
+        segments = _content_column_segments(dark_ratio, min_ratio=0.10)
+    if not segments:
         vivid = (hsv[:, :, 1] > 90) & (hsv[:, :, 2] > 80)
         segments = _content_column_segments(vivid.mean(axis=0), min_ratio=0.12)
     if not segments:
@@ -137,11 +147,11 @@ def _extract_price_icon(crop: np.ndarray) -> np.ndarray | None:
     return crop[:, left:right]
 
 
-def _score_currency_masks(icon: np.ndarray) -> tuple[float, float]:
-    """返回 (gem_ratio, resource_ratio)，仅统计非底色像素。
+def _score_currency_masks(icon: np.ndarray) -> tuple[float, float, float]:
+    """返回 (gem_ratio, resource_ratio, warm_ratio)。
 
-    gem = 高饱和青色钻石；resource = 肉/木/煤/铁。
-    不用低饱和浅蓝价签底当钻石，否则铁矿会被误判。
+    gem = 高饱和青色钻石；resource = 肉/木/煤/铁；warm = 仅木/肉。
+    warm 用于大额价签：右侧深蓝数字会抬高 gem，但左侧木/肉仍应判定为资源价。
     """
     hsv = cv2.cvtColor(icon, cv2.COLOR_BGR2HSV)
     hue = hsv[:, :, 0]
@@ -150,15 +160,15 @@ def _score_currency_masks(icon: np.ndarray) -> tuple[float, float]:
     content = (sat > 30) | (val < 200)
     content_n = int(content.sum())
     if content_n < 12:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     # 钻石宝石：高饱和青绿，排除价签浅蓝底
     gem_m = (hue >= 88) & (hue <= 115) & (sat >= 95) & (val >= 150)
     pale_btn = (hue >= 85) & (hue <= 120) & (sat < 95) & (val >= 170)
 
-    wood_m = cv2.inRange(hsv, (5, 40, 45), (32, 255, 255)) > 0
-    meat_m = (cv2.inRange(hsv, (0, 40, 40), (18, 255, 255)) > 0) | (
-        cv2.inRange(hsv, (160, 40, 40), (180, 255, 255)) > 0
+    wood_m = cv2.inRange(hsv, (5, 35, 40), (35, 255, 255)) > 0
+    meat_m = (cv2.inRange(hsv, (0, 35, 35), (18, 255, 255)) > 0) | (
+        cv2.inRange(hsv, (160, 35, 35), (180, 255, 255)) > 0
     )
     # 铁矿：灰银色块，排除宝石与浅蓝底
     iron_m = (sat < 75) & (val > 50) & (val < 190) & ~gem_m & ~pale_btn
@@ -170,15 +180,20 @@ def _score_currency_masks(icon: np.ndarray) -> tuple[float, float]:
         & ((hue < 75) | (hue > 135))
         & ~gem_m
     )
-    resource_m = (wood_m | meat_m | iron_m | coal_m) & ~gem_m
+    warm_m = (wood_m | meat_m) & ~gem_m
+    resource_m = (warm_m | iron_m | coal_m) & ~gem_m
 
     gem = float((gem_m & content).sum()) / content_n
     resource = float((resource_m & content).sum()) / content_n
-    return gem, resource
+    warm = float((warm_m & content).sum()) / content_n
+    return gem, resource, warm
 
 
-def _decide_kind(gem: float, resource: float) -> PriceKind:
+def _decide_kind(gem: float, resource: float, warm: float = 0.0) -> PriceKind:
     """同一窗口内比较钻石宝石色与资源色。"""
+    # 木/肉色明确 → 资源价（忽略「4000万」等深蓝数字抬高的 gem）
+    if warm >= 0.10:
+        return "resource"
     if resource >= 0.10 and resource >= gem * 0.45:
         return "resource"
     if gem >= 0.14 and gem >= resource * 1.2:
@@ -214,21 +229,23 @@ def classify_price_kind(crop: np.ndarray) -> PriceKind:
     saw_diamond = False
     best_resource = 0.0
     best_gem = 0.0
+    best_warm = 0.0
     for win in windows:
-        gem, resource = _score_currency_masks(win)
+        gem, resource, warm = _score_currency_masks(win)
         best_resource = max(best_resource, resource)
         best_gem = max(best_gem, gem)
-        kind = _decide_kind(gem, resource)
+        best_warm = max(best_warm, warm)
+        kind = _decide_kind(gem, resource, warm)
         if kind == "resource":
             saw_resource = True
         elif kind == "diamond":
             saw_diamond = True
 
-    if saw_resource:
+    if saw_resource or best_warm >= 0.10:
         return "resource"
     if saw_diamond:
         return "diamond"
-    return _decide_kind(best_gem, best_resource)
+    return _decide_kind(best_gem, best_resource, best_warm)
 
 
 def list_resource_price_centers(
@@ -242,17 +259,18 @@ def list_resource_price_centers(
         xb, yb = min(w, x2), min(h, y2)
         crop = screen[ya:yb, xa:xb]
         kind = classify_price_kind(crop)
-        best_gem = best_res = 0.0
+        best_gem = best_res = best_warm = 0.0
         for x0 in (0, 24, 48, 72):
             win = crop[:, x0 : min(crop.shape[1], x0 + 44)]
             if win.shape[1] < 12:
                 continue
-            g, r = _score_currency_masks(win)
+            g, r, warm = _score_currency_masks(win)
             best_gem = max(best_gem, g)
             best_res = max(best_res, r)
+            best_warm = max(best_warm, warm)
         logger.info(
             f"商店价格格{index} → {kind} "
-            f"(gem={best_gem:.2f} res={best_res:.2f})"
+            f"(gem={best_gem:.2f} res={best_res:.2f} warm={best_warm:.2f})"
         )
         if kind == "resource":
             found.append((index, (x1 + x2) // 2, (y1 + y2) // 2))

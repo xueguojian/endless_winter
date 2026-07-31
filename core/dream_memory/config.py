@@ -92,7 +92,7 @@ class DreamMemoryConfig:
     tap_delay: float = 1.2
     tap_between_delay: float = 0.2
     tap_between_delay_min: float = 0.2
-    tap_between_delay_max: float = 0.35
+    tap_between_delay_max: float = 0.5
     tap_between_delay_mode: float = 0.27
     tap_between_interval: str = TAP_INTERVAL_FIXED
     scan_interval: float = 0.3
@@ -188,7 +188,7 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
         timing = dict(
             tap_between_delay=0.2,
             tap_between_delay_min=0.2,
-            tap_between_delay_max=0.35,
+            tap_between_delay_max=0.5,
             tap_between_delay_mode=0.27,
             tap_between_interval=TAP_INTERVAL_FIXED,
             scan_interval=0.3,
