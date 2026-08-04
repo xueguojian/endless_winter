@@ -35,7 +35,7 @@ tasks:
     stamina_can_limit: 800
     check_march_heroes: true
     use_formation: true
-    skip_hour: 21
+    skip_hour: -1
     step_delay: 1.5
     coords:
       search_open:
@@ -77,7 +77,7 @@ tasks:
     stamina_can_limit: 800
     check_march_heroes: true
     use_formation: true
-    skip_hour: 21
+    skip_hour: -1
     step_delay: 1.5
     coords:
       world_map:

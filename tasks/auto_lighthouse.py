@@ -18,6 +18,7 @@ from core.lighthouse_vision import (
     LIGHTHOUSE_SCAN_ROI,
     MISSION_DETAIL_ABSOLUTE_MIN,
     LighthouseMission,
+    LighthouseScanResult,
     MissionDetailClassification,
     SKIP_MISSION_KINDS,
     classify_mission_detail_screen,
@@ -142,9 +143,12 @@ class AutoLighthouseTask:
         self.adb = adb
         self.coords = merged["coords"]
         self.interval = interval
-        self.formation_slot = formation_slot
+        self.formation_slot = int(formation_slot)
         self.use_stamina = use_stamina
         self.use_formation = merged["use_formation"]
+        if self.formation_slot <= 0:
+            self.use_formation = False
+            self.formation_slot = 0
         self.step_delay = merged["step_delay"]
         self.monster_cooldown = merged["monster_cooldown"]
         self.event_period = merged["event_period"]
@@ -155,10 +159,14 @@ class AutoLighthouseTask:
         self._slot_attempts: list[tuple[int, int, int]] = []
         self._skipped_centers: list[tuple[int, int]] = []
         self._monster_in_progress: list[tuple[int, int, float]] = []
+        # 图钉坐标缓存：首次全图识别后沿用，处理约半数后再重扫
+        self._pin_cache: list[LighthouseMission] = []
+        self._pin_cache_origin_count: int = 0
+        self._pin_actions_since_rescan: int = 0
         self.vision = Vision(TEMPLATE_DIR, threshold=0.70)
         self._deploy = DeployMarchHelper(
             adb,
-            formation_slot=formation_slot,
+            formation_slot=self.formation_slot,
             use_stamina=use_stamina,
             stamina_can_limit=stamina_can_limit,
             coords=self.coords,
@@ -444,10 +452,64 @@ class AutoLighthouseTask:
             )
         return screen, result
 
+    def _pin_rescan_threshold(self) -> int:
+        """首次识别 N 个任务后，约处理 N/2 次再全图重扫。"""
+        return max(1, int(self._pin_cache_origin_count) // 2)
+
+    def _clear_pin_cache(self) -> None:
+        self._pin_cache = []
+        self._pin_cache_origin_count = 0
+        self._pin_actions_since_rescan = 0
+
+    def _should_full_rescan_pins(self) -> bool:
+        if self._pin_cache_origin_count <= 0 or not self._pin_cache:
+            return True
+        return self._pin_actions_since_rescan >= self._pin_rescan_threshold()
+
+    def _store_pin_cache(self, missions: tuple[LighthouseMission, ...] | list) -> None:
+        self._pin_cache = list(missions)
+        self._pin_cache_origin_count = len(self._pin_cache)
+        self._pin_actions_since_rescan = 0
+        if self._pin_cache_origin_count:
+            self._emit(
+                f"已缓存 {self._pin_cache_origin_count} 个图钉坐标，"
+                f"约处理 {self._pin_rescan_threshold()} 次后重扫"
+            )
+
+    def _result_from_pin_cache(self) -> LighthouseScanResult:
+        missions = tuple(self._pin_cache)
+        best = max((m.confidence for m in missions), default=0.0)
+        primary = self._pick_executable_mission(list(missions))
+        if primary is None and missions:
+            primary = missions[0]
+        return LighthouseScanResult(
+            mission=primary,
+            missions=missions,
+            best_confidence=float(best),
+            best_label=primary.label if primary else "",
+            candidate_locations=len(missions),
+        )
+
     def _find_executable_mission(self) -> tuple[object | None, object, LighthouseMission | None]:
-        """扫描图标位置；仅在完全无候选时才刷新页面重试。"""
+        """优先沿用图钉缓存；首次或达到半数动作后再全图识别。"""
         self._sleep_interruptible(MISSION_SCAN_SETTLE_SEC)
+
+        if not self._should_full_rescan_pins():
+            remain = self._pin_rescan_threshold() - self._pin_actions_since_rescan
+            self._emit(
+                f"沿用图钉缓存（{len(self._pin_cache)} 个，"
+                f"{remain} 次动作后重扫）"
+            )
+            result = self._result_from_pin_cache()
+            mission = self._pick_executable_mission(list(result.missions))
+            return None, result, mission
+
         screen, result = self._capture_and_scan()
+        if result.missions:
+            self._store_pin_cache(result.missions)
+        else:
+            self._clear_pin_cache()
+
         mission = self._pick_executable_mission(result.missions)
         if mission is not None:
             return screen, result, mission
@@ -463,6 +525,8 @@ class AutoLighthouseTask:
         self._prepare_lighthouse_scan()
         self._sleep_interruptible(0.8)
         screen, result = self._capture_and_scan()
+        if result.missions:
+            self._store_pin_cache(result.missions)
         mission = self._pick_executable_mission(result.missions)
         if mission is not None or result.candidate_locations > 0:
             return screen, result, mission
@@ -471,6 +535,10 @@ class AutoLighthouseTask:
         self._prepare_lighthouse_scan()
         self._sleep_interruptible(SCAN_REOPEN_WAIT_SEC)
         screen, result = self._capture_and_scan()
+        if result.missions:
+            self._store_pin_cache(result.missions)
+        else:
+            self._clear_pin_cache()
         mission = self._pick_executable_mission(result.missions)
         return screen, result, mission
 
@@ -641,6 +709,7 @@ class AutoLighthouseTask:
         handled = 0
         self._slot_attempts.clear()
         self._skipped_centers.clear()
+        self._clear_pin_cache()
         iteration = 0
 
         while not self._interrupted():
@@ -696,6 +765,9 @@ class AutoLighthouseTask:
             )
 
             tap_target = mission
+            # 无论成功失败，都计入「动作次数」，用于半数重扫
+            self._pin_actions_since_rescan += 1
+
             if tap_target.confidence < MIN_PIN_CONFIDENCE:
                 self._emit(
                     f"图钉置信度 {tap_target.confidence:.2f} 过低，"

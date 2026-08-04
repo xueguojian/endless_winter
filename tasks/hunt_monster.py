@@ -90,7 +90,7 @@ class HuntMonsterTask:
         interval: float = 300.0,
         monster_level: int = 30,
         formation_name: str = "7",
-        skip_hour: int = 21,
+        skip_hour: int = -1,
         step_delay: float = 1.5,
         use_stamina: bool = True,
         stamina_can_limit: int = DEFAULT_STAMINA_CAN_LIMIT,
@@ -150,9 +150,19 @@ class HuntMonsterTask:
         return self._stop_event.is_set()
 
     def should_run(self) -> bool:
-        if datetime.now().hour == self.skip_hour:
+        if self.skip_hour >= 0 and datetime.now().hour == self.skip_hour:
             return False
         return time.time() - self._last_run >= self.interval
+
+    def wait_reason(self) -> str:
+        if self.skip_hour >= 0 and datetime.now().hour == self.skip_hour:
+            return f"跳过小时 {self.skip_hour}:00–{self.skip_hour}:59，整点后继续"
+        remain = self.interval - (time.time() - self._last_run)
+        if remain <= 0:
+            return "即将开始下一轮"
+        if remain >= 60:
+            return f"约 {int(remain // 60)} 分 {int(remain % 60)} 秒后再次搜索"
+        return f"约 {int(remain)} 秒后再次搜索"
 
     def _tap_xy(self, x: int, y: int, delay: float | None = None) -> None:
         if self._interrupted():

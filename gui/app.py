@@ -1230,7 +1230,7 @@ class EndlessWinterApp(tk.Tk):
 
         row = 0
         ttk.Label(tab_ice, text="集结间隔（分钟）").grid(row=row, column=0, sticky=tk.W, pady=2)
-        ttk.Spinbox(tab_ice, from_=5, to=120, textvariable=self.var_interval, width=8).grid(
+        ttk.Spinbox(tab_ice, from_=1, to=120, textvariable=self.var_interval, width=8).grid(
             row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX
         )
         row += 1
@@ -2041,7 +2041,7 @@ class EndlessWinterApp(tk.Tk):
             default_beast_level=hunt_cfg.get("default_beast_level", 1),
             formation_name=str(_normalize_formation_slot(self.var_formation_slot.get())),
             rally_duration_minutes=int(self.var_rally_duration.get()),
-            skip_hour=hunt_cfg.get("skip_hour", 21),
+            skip_hour=hunt_cfg.get("skip_hour", -1),
             step_delay=hunt_cfg.get("step_delay", 1.5),
             use_stamina=bool(self.var_common_use_stamina.get()),
             stamina_can_limit=int(self.var_common_stamina_can_limit.get()),
@@ -2059,7 +2059,7 @@ class EndlessWinterApp(tk.Tk):
             interval=float(self.var_monster_interval.get() * 60),
             monster_level=int(self.var_monster_level.get()),
             formation_name=str(_normalize_formation_slot(self.var_monster_formation_slot.get())),
-            skip_hour=monster_cfg.get("skip_hour", 21),
+            skip_hour=monster_cfg.get("skip_hour", -1),
             step_delay=monster_cfg.get("step_delay", 1.5),
             use_stamina=bool(self.var_common_use_stamina.get()),
             stamina_can_limit=int(self.var_common_stamina_can_limit.get()),
@@ -2979,6 +2979,7 @@ class EndlessWinterApp(tk.Tk):
 
         self._on_status("首次执行完成，进入循环等待…")
 
+        last_wait_log = 0.0
         while not self._loop_stop_event.is_set():
             ready_tasks = [
                 task
@@ -2987,6 +2988,23 @@ class EndlessWinterApp(tk.Tk):
             ]
 
             if not ready_tasks:
+                now = time.time()
+                if now - last_wait_log >= 30.0:
+                    last_wait_log = now
+                    hints: list[str] = []
+                    for task in self._loop_tasks:
+                        reason = getattr(task, "wait_reason", None)
+                        if callable(reason):
+                            hints.append(f"{task.name}：{reason()}")
+                        elif hasattr(task, "interval") and hasattr(task, "_last_run"):
+                            remain = float(task.interval) - (
+                                now - float(task._last_run)
+                            )
+                            hints.append(
+                                f"{task.name}：约 {max(0, int(remain))} 秒后"
+                            )
+                    if hints:
+                        self._on_status("循环等待中 — " + "；".join(hints))
                 for _ in range(20):
                     if self._loop_stop_event.is_set():
                         break
@@ -2999,6 +3017,7 @@ class EndlessWinterApp(tk.Tk):
 
             task = ready_tasks[0]
             try:
+                self._on_status(f"▶ 循环执行：{task.name}")
                 task.run_once()
             except InterruptedError:
                 self._on_status("循环任务已停止")
@@ -3006,6 +3025,7 @@ class EndlessWinterApp(tk.Tk):
             except Exception as exc:
                 self._on_status(f"[{task.name}] 异常：{exc}")
 
+            last_wait_log = 0.0
             for _ in range(20):
                 if self._loop_stop_event.is_set():
                     break

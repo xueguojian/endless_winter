@@ -27,6 +27,11 @@ from core.stamina_use import (
     is_stamina_get_more_title,
     use_stamina_cans_batch,
 )
+from core.march_target_conflict import (
+    SAME_TARGET_CANCEL_XY,
+    SameTargetConflictError,
+    is_same_target_conflict_dialog,
+)
 from core.vision import MatchResult, Vision
 from core.common_task_opts import (
     DEFAULT_ICE_BEAST_TAB,
@@ -130,6 +135,10 @@ class MarchHeroCheckError(RuntimeError):
     """出征英雄栏存在空槽位。"""
 
 
+# 同目标冲突时立刻重开搜索的最大次数，避免死循环
+MAX_SAME_TARGET_RETRIES = 8
+
+
 class HuntIceBeastTask:
     """搜索冰原巨兽并发起联盟集结。"""
 
@@ -142,7 +151,7 @@ class HuntIceBeastTask:
         default_beast_level: int = 1,
         formation_name: str = "7",
         rally_duration_minutes: int = DEFAULT_RALLY_DURATION,
-        skip_hour: int = 21,
+        skip_hour: int = -1,
         step_delay: float = 1.5,
         use_stamina: bool = True,
         stamina_can_limit: int = DEFAULT_STAMINA_CAN_LIMIT,
@@ -157,7 +166,14 @@ class HuntIceBeastTask:
         self.beast_level = beast_level
         self.default_beast_level = default_beast_level
         self.formation_name = str(formation_name).strip()
-        self.use_formation = use_formation
+        # 槽位 0 = 不启用编队、不校验英雄（优先于 use_formation 开关）
+        if self.formation_name == "0" or (
+            self.formation_name.isdigit() and int(self.formation_name) == 0
+        ):
+            self.use_formation = False
+            self.formation_name = "0"
+        else:
+            self.use_formation = bool(use_formation)
         self.adjust_level = adjust_level
         self.beast_icon_index = max(0, int(beast_icon_index))
         self._search_tab_step = resolve_search_tab_step(coords)
@@ -210,9 +226,20 @@ class HuntIceBeastTask:
         return self._stop_event.is_set()
 
     def should_run(self) -> bool:
-        if datetime.now().hour == self.skip_hour:
+        if self.skip_hour >= 0 and datetime.now().hour == self.skip_hour:
             return False
         return time.time() - self._last_run >= self.interval
+
+    def wait_reason(self) -> str:
+        """循环等待时的可读原因（给 GUI 心跳用）。"""
+        if self.skip_hour >= 0 and datetime.now().hour == self.skip_hour:
+            return f"跳过小时 {self.skip_hour}:00–{self.skip_hour}:59，整点后继续"
+        remain = self.interval - (time.time() - self._last_run)
+        if remain <= 0:
+            return "即将开始下一轮"
+        if remain >= 60:
+            return f"约 {int(remain // 60)} 分 {int(remain % 60)} 秒后再次集结"
+        return f"约 {int(remain)} 秒后再次集结"
 
     def _tap_xy(self, x: int, y: int, delay: float | None = None) -> None:
         if self._interrupted():
@@ -733,13 +760,22 @@ class HuntIceBeastTask:
             close_with_back=True,
         )
 
+    def _dismiss_same_target_conflict(self) -> None:
+        """点冲突弹窗左侧「取消」，放弃本次出征。"""
+        if "same_target_cancel" in self.coords:
+            cx, cy = tuple(self.coords["same_target_cancel"])
+        else:
+            cx, cy = SAME_TARGET_CANCEL_XY
+        self._emit(f"目标冲突弹窗，点击取消 @ ({cx},{cy})")
+        self._tap_xy(int(cx), int(cy), delay=1.0)
+
     def _wait_march_outcome(
         self, delay: float = MARCH_OUTCOME_DELAY_SEC
     ) -> tuple[bool, object]:
         """等待出征结果。
 
         返回 (是否体力不足弹窗, 本次截图)。
-        无弹窗时截图可复用给出征收尾，避免再截一张。
+        若出现「其他队伍目标相同」则点取消并抛 SameTargetConflictError。
         """
         self._emit("正在检测出征结果…")
         logger.info(f"开始检测出征结果（延迟 {delay:.1f}s 后 OCR 一次）")
@@ -748,6 +784,11 @@ class HuntIceBeastTask:
             raise InterruptedError("任务已停止")
 
         screen = self.adb.screenshot()
+        if is_same_target_conflict_dialog(screen):
+            logger.info("检测到同目标冲突弹窗（OCR）")
+            self._dismiss_same_target_conflict()
+            raise SameTargetConflictError("有其他队伍与出征目标相同")
+
         is_popup = self._is_stamina_popup(screen)
         if is_popup:
             logger.info("检测到体力不足弹窗（OCR）")
@@ -802,7 +843,20 @@ class HuntIceBeastTask:
 
         self._last_run = time.time()
         try:
-            self.run_hunt_cycle()
+            for attempt in range(1, MAX_SAME_TARGET_RETRIES + 1):
+                try:
+                    self.run_hunt_cycle()
+                    break
+                except SameTargetConflictError:
+                    self._emit(
+                        f"目标已被他人集结，已取消，立即重搜 "
+                        f"({attempt}/{MAX_SAME_TARGET_RETRIES})"
+                    )
+                    if attempt >= MAX_SAME_TARGET_RETRIES:
+                        self._emit("多次遇目标冲突，本轮放弃")
+                        self._wilderness.try_return_to_wilderness()
+                        return False
+                    continue
             self._emit(f"本轮完成，{int(self.interval // 60)} 分钟后再次集结")
             return True
         except InterruptedError:

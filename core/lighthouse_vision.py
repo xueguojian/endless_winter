@@ -47,6 +47,14 @@ UI_EXCLUDE_Y_MAX = 230
 UI_EXCLUDE_X_MAX = 120
 PLANE_EXCLUDE_Y_MIN = 820
 PLANE_EXCLUDE_X_MIN = 480
+PLANE_TEMPLATE = "lighthouse/small_plane.png"
+PLANE_PATCH_HALF = 42
+PLANE_ROTATE_MATCH_MIN = 0.45
+PLANE_ROTATE_ANGLES = tuple(range(0, 360, 30))
+PLANE_ORANGE_RATIO_MIN = 0.18
+PLANE_COCKPIT_PALE_MIN = 0.20
+PLANE_COLOR_TMPL_MIN = 0.38
+BASE_EXCLUDE_VIVID_KEEP_MIN = 0.35
 BG_PIN_DIFF_SEARCH_RADIUS = 50
 LIGHTHOUSE_PIN_PATCH_HALF = 36
 LIGHTHOUSE_SLOT_MERGE_DISTANCE = 18
@@ -201,15 +209,45 @@ def _is_ignored_background_pin(
     center: tuple[int, int],
     *,
     contour_area: float = 0.0,
+    hsv: np.ndarray | None = None,
+    roi_offset: tuple[int, int] = (0, 0),
 ) -> bool:
-    """排除中央固定基地、左上角 UI 头像等非任务元素。"""
+    """排除中央固定基地、左上角 UI 头像等非任务元素。
+
+    基地附近也可能刷出真实任务钉：若局部鲜艳色足够，则不忽略。
+    """
     x, y = center
     bx, by = BASE_EXCLUDE_CENTER
     if abs(x - bx) <= BASE_EXCLUDE_RADIUS and abs(y - by) <= BASE_EXCLUDE_RADIUS:
+        if hsv is not None:
+            local = (x - roi_offset[0], y - roi_offset[1])
+            if (
+                0 <= local[0] < hsv.shape[1]
+                and 0 <= local[1] < hsv.shape[0]
+                and _patch_vivid_ratio(hsv, local) >= BASE_EXCLUDE_VIVID_KEEP_MIN
+            ):
+                return False
         return True
     if x <= UI_EXCLUDE_X_MAX and y <= UI_EXCLUDE_Y_MAX:
         return True
     return False
+
+
+def _patch_looks_like_mission_pin(bgr_patch: np.ndarray) -> bool:
+    """彩色泪滴图钉（含橙色爪/帐篷），避免被飞机颜色启发误伤。"""
+    if bgr_patch.size == 0 or min(bgr_patch.shape[:2]) < 16:
+        return False
+    hsv = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2HSV)
+    mask = _build_vivid_pin_mask(hsv)
+    if cv2.countNonZero(mask) < 80:
+        return False
+    contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+    if not contours:
+        return False
+    biggest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(biggest) < 60:
+        return False
+    return _is_teardrop_contour(biggest, relaxed=True)
 
 
 def _is_super_boss_point(
@@ -218,10 +256,11 @@ def _is_super_boss_point(
     hsv: np.ndarray,
     roi_offset: tuple[int, int],
 ) -> bool:
-    """顶部超级大怪：位置靠上 + 大橙色块 + 内部白色兽头。"""
+    """橙光兽头大怪：大橙色块 + 内部白色兽脸。
+
+    顶部经典大怪靠位置放宽；中部橙光钉要求更强橙+白脸，避免误伤普通图钉。
+    """
     x, y = center
-    if y > SUPER_BOSS_Y_MAX:
-        return False
     rx, ry = x - roi_offset[0], y - roi_offset[1]
     radius = 48
     y1 = max(0, ry - radius)
@@ -234,11 +273,126 @@ def _is_super_boss_point(
     orange = cv2.inRange(
         patch_hsv, np.array((8, 100, 140)), np.array((28, 255, 255))
     )
-    if float(orange.mean()) / 255.0 < 0.22:
-        return False
+    orange_ratio = float(orange.mean()) / 255.0
     patch_gray = cv2.cvtColor(roi[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
     white_ratio = float((patch_gray > 200).mean())
-    return white_ratio >= 0.05 or y <= 290
+    # 顶部超级大怪
+    if y <= SUPER_BOSS_Y_MAX and orange_ratio >= 0.22:
+        return white_ratio >= 0.05 or y <= 290
+    # 中部橙光兽头钉（与附近普通任务钉区分）
+    return orange_ratio >= 0.35 and white_ratio >= 0.12
+
+
+def _extract_center_patch(
+    bgr: np.ndarray,
+    center: tuple[int, int],
+    *,
+    half: int = PLANE_PATCH_HALF,
+) -> np.ndarray:
+    x, y = int(center[0]), int(center[1])
+    h, w = bgr.shape[:2]
+    x1, y1 = max(0, x - half), max(0, y - half)
+    x2, y2 = min(w, x + half), min(h, y + half)
+    if x2 <= x1 or y2 <= y1:
+        return np.array([])
+    return bgr[y1:y2, x1:x2]
+
+
+def _plane_color_structure_scores(bgr_patch: np.ndarray) -> tuple[float, float]:
+    """返回 (橙机身占比, 橙块中心浅灰驾驶舱占比)。旋转不变。"""
+    if bgr_patch.size == 0 or min(bgr_patch.shape[:2]) < 16:
+        return 0.0, 0.0
+    hsv = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2HSV)
+    hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    orange = (hue >= 5) & (hue <= 32) & (sat >= 55) & (val >= 70)
+    orange_ratio = float(orange.mean())
+    if orange_ratio < 0.08:
+        return orange_ratio, 0.0
+    ys, xs = np.where(orange)
+    if xs.size < 24:
+        return orange_ratio, 0.0
+    cx, cy = int(xs.mean()), int(ys.mean())
+    ph, pw = bgr_patch.shape[:2]
+    radius = max(5, min(ph, pw) // 5)
+    y1, y2 = max(0, cy - radius), min(ph, cy + radius)
+    x1, x2 = max(0, cx - radius), min(pw, cx + radius)
+    cockpit = hsv[y1:y2, x1:x2]
+    if cockpit.size == 0:
+        return orange_ratio, 0.0
+    pale = (cockpit[:, :, 1] < 75) & (cockpit[:, :, 2] > 130)
+    return orange_ratio, float(pale.mean())
+
+
+def _match_plane_template_rotated(bgr_patch: np.ndarray) -> float:
+    """多角度模板匹配小飞机，返回最高分。"""
+    template_path = TEMPLATE_DIR / PLANE_TEMPLATE
+    if not template_path.exists() or bgr_patch.size == 0:
+        return 0.0
+    template = cv2.imread(str(template_path))
+    if template is None:
+        return 0.0
+    th, tw = template.shape[:2]
+    if th < 8 or tw < 8:
+        return 0.0
+    ph, pw = bgr_patch.shape[:2]
+    best = 0.0
+    for angle in PLANE_ROTATE_ANGLES:
+        matrix = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), float(angle), 1.0)
+        cos_a = abs(matrix[0, 0])
+        sin_a = abs(matrix[0, 1])
+        new_w = max(1, int(th * sin_a + tw * cos_a))
+        new_h = max(1, int(th * cos_a + tw * sin_a))
+        matrix[0, 2] += new_w / 2.0 - tw / 2.0
+        matrix[1, 2] += new_h / 2.0 - th / 2.0
+        rotated = cv2.warpAffine(
+            template,
+            matrix,
+            (new_w, new_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        rh, rw = rotated.shape[:2]
+        if rh > ph or rw > pw:
+            scale = min(ph / rh, pw / rw) * 0.92
+            rotated = cv2.resize(
+                rotated,
+                (max(8, int(rw * scale)), max(8, int(rh * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+            rh, rw = rotated.shape[:2]
+        if rh > ph or rw > pw or rh < 8 or rw < 8:
+            continue
+        score = float(
+            cv2.matchTemplate(bgr_patch, rotated, cv2.TM_CCOEFF_NORMED).max()
+        )
+        if score > best:
+            best = score
+    return best
+
+
+def _is_plane_like_appearance(bgr_patch: np.ndarray) -> bool:
+    """任意朝向小飞机：旋转模板为主，橙机身+中心浅驾驶舱为辅。"""
+    if bgr_patch.size == 0 or min(bgr_patch.shape[:2]) < 16:
+        return False
+    tmpl_score = _match_plane_template_rotated(bgr_patch)
+    if tmpl_score >= PLANE_ROTATE_MATCH_MIN:
+        logger.debug(f"小飞机模板命中 score={tmpl_score:.2f}")
+        return True
+    # 橙色爪印/帐篷钉也有「橙+白图标」，必须先排除泪滴图钉
+    if _patch_looks_like_mission_pin(bgr_patch):
+        return False
+    orange_ratio, pale_ratio = _plane_color_structure_scores(bgr_patch)
+    if (
+        orange_ratio >= PLANE_ORANGE_RATIO_MIN
+        and pale_ratio >= PLANE_COCKPIT_PALE_MIN
+        and tmpl_score >= PLANE_COLOR_TMPL_MIN
+    ):
+        logger.debug(
+            f"小飞机颜色结构命中 orange={orange_ratio:.2f} pale={pale_ratio:.2f} "
+            f"tmpl={tmpl_score:.2f}"
+        )
+        return True
+    return False
 
 
 def _is_plane_point(
@@ -247,8 +401,16 @@ def _is_plane_point(
     blob_area: float = 0.0,
     blob_width: int = 0,
     blob_height: int = 0,
+    roi: np.ndarray | None = None,
+    roi_offset: tuple[int, int] = (0, 0),
 ) -> bool:
-    """排除右下角移动小飞机（宽扁、面积大）。"""
+    """排除移动小飞机（任意朝向）。先外观，再回退右下角位置启发。"""
+    if roi is not None and roi.size > 0:
+        local = (center[0] - roi_offset[0], center[1] - roi_offset[1])
+        patch = _extract_center_patch(roi, local)
+        if _is_plane_like_appearance(patch):
+            return True
+
     x, y = center
     if y >= 880 and x >= 500:
         return True
@@ -479,7 +641,9 @@ def _append_pin_candidates_from_contours(
             continue
         if not _screen_center_in_map(center):
             continue
-        if _is_ignored_background_pin(center, contour_area=area):
+        if _is_ignored_background_pin(
+            center, contour_area=area, hsv=hsv, roi_offset=roi_offset
+        ):
             continue
         candidates.append((center, cv2.contourArea(contour)))
 
@@ -1843,8 +2007,6 @@ def _accept_pin_candidate(
 ) -> tuple[tuple[int, int], float] | None:
     if not _screen_center_in_map(center):
         return None
-    if _is_ignored_background_pin(center):
-        return None
     if _is_super_boss_point(center, roi, hsv, roi_offset):
         return None
     if _is_plane_point(
@@ -1852,6 +2014,8 @@ def _accept_pin_candidate(
         blob_area=blob_area,
         blob_width=blob_width,
         blob_height=blob_height,
+        roi=roi,
+        roi_offset=roi_offset,
     ):
         return None
 
@@ -1864,9 +2028,13 @@ def _accept_pin_candidate(
     if vivid < BG_DIFF_VIVID_MIN:
         return None
     refined = snapped
-    if _is_plane_point(refined):
+    if _is_plane_point(refined, roi=roi, roi_offset=roi_offset):
+        return None
+    if _is_super_boss_point(refined, roi, hsv, roi_offset):
         return None
     if not _screen_center_in_map(refined):
+        return None
+    if _is_ignored_background_pin(refined, hsv=hsv, roi_offset=roi_offset):
         return None
     return refined, float(max(confidence, vivid, diff_ratio))
 
@@ -2075,17 +2243,23 @@ def _find_mission_pins_bg_diff(
         if _is_ui_diff_blob(blob_cy, blob_height=bh, blob_width=bw):
             rejected["ui"] += 1
             continue
-        if _is_plane_point(
+        # 小飞机 / 橙光大怪可能与附近图钉粘成一大片。小块可整片剔除；
+        # 大块继续拆分，由单点 plane/boss 过滤掉干扰物本身。
+        plane_blob = _is_plane_point(
             (blob_cx, blob_cy),
             blob_area=blob_area,
             blob_width=bw,
             blob_height=bh,
-        ):
-            rejected["plane"] += 1
-            continue
-        if _is_super_boss_point((blob_cx, blob_cy), roi, hsv, roi_offset):
-            rejected["boss"] += 1
-            continue
+            roi=roi,
+            roi_offset=roi_offset,
+        )
+        boss_blob = _is_super_boss_point(
+            (blob_cx, blob_cy), roi, hsv, roi_offset
+        )
+        if plane_blob or boss_blob:
+            if blob_area < BG_LARGE_BLOB_AREA:
+                rejected["plane" if plane_blob else "boss"] += 1
+                continue
 
         for item in _extract_pins_from_diff_blob(
             blob, search_mask, hsv, roi, roi_offset, diff_mask
