@@ -51,7 +51,7 @@ DEFAULT_HERO_ROI = (98, 308, 246, 570)
 
 DEFAULT_COORDS: dict[str, list[int]] = {
     "world_map": [630, 1220],
-    "search_open": [55, 880],
+    "search_open": [42, 872],
     "meat_tab": [154, 914],
     "wood_tab": [320, 914],
     "coal_tab": [474, 914],
@@ -229,10 +229,13 @@ class AutoMiningTask:
         )
 
     def _is_search_panel_visible(self, screen=None) -> bool:
+        """以搜索确认按钮为准，避免野外地图误匹配 tab 模板而跳过点放大镜。"""
         if screen is None:
             screen = self.adb.screenshot()
-        for template in SEARCH_PANEL_TEMPLATES:
-            if self.vision.match_template(screen, template).found:
+        if self._match_in_roi(screen, SEARCH_CONFIRM_BTN, SEARCH_BTN_ROI).found:
+            return True
+        for template in (SEARCH_PANEL_MARKER, ICE_BEAST_TAB_TEMPLATE, ICE_BEAST_TAB_SELECTED):
+            if self._match_in_roi(screen, template, SEARCH_TAB_ROI).found:
                 return True
         return False
 
@@ -247,14 +250,17 @@ class AutoMiningTask:
         self._wilderness.ensure_wilderness()
 
     def _open_search_panel(self) -> None:
+        """与巨兽一致：野外固定点放大镜打开搜索，避免误判已打开而直接拖地图。"""
         self._ensure_wilderness()
         screen = self.adb.screenshot()
         if self._is_search_panel_visible(screen):
+            self._emit("搜索面板已打开")
             return
-        result = self._match_in_roi(screen, SEARCH_ICON, SEARCH_ICON_ROI)
-        if result.found:
-            self._tap_xy(*result.center, delay=1.5)
-        else:
+        sx, sy = self.coords["search_open"]
+        self._emit(f"打开搜索面板 @ ({int(sx)},{int(sy)})")
+        self._tap("search_open", delay=1.5)
+        if not self._is_search_panel_visible():
+            self._emit("未识别到搜索面板，再点一次放大镜")
             self._tap("search_open", delay=1.5)
         if not self._is_search_panel_visible():
             raise RuntimeError("搜索面板未打开")

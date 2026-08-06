@@ -39,8 +39,8 @@ tasks:
     step_delay: 1.5
     coords:
       search_open:
-      - 55
-      - 880
+      - 42
+      - 872
       beast_tab:
       - 84
       - 914
@@ -84,8 +84,8 @@ tasks:
       - 630
       - 1220
       search_open:
-      - 55
-      - 880
+      - 42
+      - 872
       ice_beast_tab:
       - 244
       - 918
@@ -147,8 +147,8 @@ tasks:
       - 630
       - 1220
       search_open:
-      - 55
-      - 880
+      - 42
+      - 872
       meat_tab:
       - 154
       - 914
