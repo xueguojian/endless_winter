@@ -444,7 +444,7 @@ class EndlessWinterApp(tk.Tk):
         apply_common_options(tasks, common_opts)
 
         ice = tasks.setdefault("hunt_ice_beast", {})
-        ice["interval"] = int(self.var_interval.get()) * 60
+        ice["interval"] = max(1.0, float(self.var_interval.get()) * 60.0)
         ice["beast_level"] = int(self.var_level.get())
         ice["formation_name"] = str(_normalize_formation_slot(self.var_formation_slot.get()))
         ice["rally_duration_minutes"] = int(self.var_rally_duration.get())
@@ -1175,7 +1175,9 @@ class EndlessWinterApp(tk.Tk):
             font=("", 8),
             foreground="gray",
         ).pack(side=tk.LEFT)
-        self.var_interval = tk.IntVar(value=hunt_cfg.get("interval", 120) // 60)
+        self.var_interval = tk.DoubleVar(
+            value=max(0.1, float(hunt_cfg.get("interval", 120)) / 60.0)
+        )
         self.var_lighthouse_interval = tk.IntVar(
             value=max(1, int(lighthouse_cfg.get("interval", 60) // 60))
         )
@@ -1230,8 +1232,16 @@ class EndlessWinterApp(tk.Tk):
 
         row = 0
         ttk.Label(tab_ice, text="集结间隔（分钟）").grid(row=row, column=0, sticky=tk.W, pady=2)
-        ttk.Spinbox(tab_ice, from_=1, to=120, textvariable=self.var_interval, width=8).grid(
-            row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX
+        ttk.Spinbox(
+            tab_ice,
+            from_=0.1,
+            to=120,
+            increment=0.1,
+            textvariable=self.var_interval,
+            width=8,
+        ).grid(row=row, column=1, sticky=tk.W, padx=FORM_INPUT_PADX)
+        ttk.Label(tab_ice, text="可小数，如 0.5=30秒", font=("", 8)).grid(
+            row=row, column=2, sticky=tk.W, padx=6
         )
         row += 1
 
