@@ -21,8 +21,8 @@ from core.lighthouse_vision import (
     LighthouseScanResult,
     MissionDetailClassification,
     SKIP_MISSION_KINDS,
+    auto_configure_lighthouse_scan,
     classify_mission_detail_screen,
-    configure_lighthouse_scan,
     is_lighthouse_intel_screen,
     mission_detail_action_ready,
     scan_mission_icons,
@@ -81,7 +81,6 @@ def merge_task_config(cfg: dict) -> dict:
         "step_delay": cfg.get("step_delay", DEFAULT_STEP_DELAY),
         "coords": coords,
         "monster_cooldown": float(cfg.get("monster_cooldown", DEFAULT_MONSTER_COOLDOWN)),
-        "event_period": bool(cfg.get("event_period", False)),
         "use_formation": resolve_use_formation(cfg),
     }
 
@@ -128,7 +127,6 @@ class AutoLighthouseTask:
         use_formation: bool = True,
         step_delay: float = DEFAULT_STEP_DELAY,
         monster_cooldown: float = DEFAULT_MONSTER_COOLDOWN,
-        event_period: bool = False,
         on_status: StatusCallback | None = None,
     ):
         merged = merge_task_config(
@@ -136,7 +134,6 @@ class AutoLighthouseTask:
                 "coords": coords or {},
                 "step_delay": step_delay,
                 "monster_cooldown": monster_cooldown,
-                "event_period": event_period,
                 "use_formation": use_formation,
             }
         )
@@ -151,7 +148,6 @@ class AutoLighthouseTask:
             self.formation_slot = 0
         self.step_delay = merged["step_delay"]
         self.monster_cooldown = merged["monster_cooldown"]
-        self.event_period = merged["event_period"]
         self.on_status = on_status
         self._last_run = 0.0
         self._last_monster_dispatch_at = 0.0
@@ -163,6 +159,7 @@ class AutoLighthouseTask:
         self._pin_cache: list[LighthouseMission] = []
         self._pin_cache_origin_count: int = 0
         self._pin_actions_since_rescan: int = 0
+        self._scan_bg_configured = False
         self.vision = Vision(TEMPLATE_DIR, threshold=0.70)
         self._deploy = DeployMarchHelper(
             adb,
@@ -179,7 +176,6 @@ class AutoLighthouseTask:
             is_lighthouse_intel=is_lighthouse_intel_screen,
             is_deploy_screen=self._deploy.is_deploy_screen,
         )
-        configure_lighthouse_scan(event_period=self.event_period)
 
     @property
     def name(self) -> str:
@@ -564,9 +560,21 @@ class AutoLighthouseTask:
         if self._is_on_lighthouse_intel_page(screen):
             self._emit("已在情报页，准备扫描")
             self._prepare_lighthouse_scan()
+        else:
+            self._emit("准备下一个小任务，打开情报页")
+            self._open_lighthouse_page()
+        self._configure_scan_background_once()
+
+    def _configure_scan_background_once(self) -> None:
+        """大循环内只在首次进情报页时比对平常/活动背景。"""
+        if self._scan_bg_configured:
             return
-        self._emit("准备下一个小任务，打开情报页")
-        self._open_lighthouse_page()
+        screen = self.adb.screenshot()
+        if not self._is_on_lighthouse_intel_page(screen):
+            return
+        is_event = auto_configure_lighthouse_scan(screen)
+        self._emit(f"情报背景：{'活动期' if is_event else '平常'}")
+        self._scan_bg_configured = True
 
     def _after_mission_completed(self) -> None:
         """每个小任务结束后：回到野外主界面。"""
@@ -710,6 +718,7 @@ class AutoLighthouseTask:
         self._slot_attempts.clear()
         self._skipped_centers.clear()
         self._clear_pin_cache()
+        self._scan_bg_configured = False
         iteration = 0
 
         while not self._interrupted():
@@ -853,7 +862,6 @@ class AutoLighthouseTask:
 
     def run_once(self, *, force: bool = False) -> bool:
         _ = force
-        configure_lighthouse_scan(event_period=self.event_period)
         self._last_run = time.time()
         try:
             count = self.run_lighthouse_cycle()

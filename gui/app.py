@@ -454,7 +454,6 @@ class EndlessWinterApp(tk.Tk):
         lighthouse["formation_slot"] = int(
             _normalize_formation_slot(self.var_lighthouse_formation_slot.get())
         )
-        lighthouse["event_period"] = bool(self.var_lighthouse_event_period.get())
         lighthouse["monster_cooldown"] = int(self.var_lighthouse_monster_cooldown.get()) * 60
         merged_lighthouse = merge_lighthouse_config(lighthouse)
         lighthouse["step_delay"] = merged_lighthouse["step_delay"]
@@ -1029,7 +1028,7 @@ class EndlessWinterApp(tk.Tk):
             command=lambda: self._start_quick_loop_task("hunt_ice_beast"),
             width=10,
         )
-        self.btn_quick_ice.pack(side=tk.LEFT)
+        self.btn_quick_ice.pack(side=tk.LEFT, padx=(0, 4))
 
         status_row = ttk.Frame(run_frame)
         status_row.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -1184,9 +1183,6 @@ class EndlessWinterApp(tk.Tk):
         self.var_lighthouse_formation_slot = tk.IntVar(
             value=_normalize_formation_slot(lighthouse_cfg.get("formation_slot", 8))
         )
-        self.var_lighthouse_event_period = tk.BooleanVar(
-            value=bool(lighthouse_cfg.get("event_period", False))
-        )
         self.var_lighthouse_monster_cooldown = tk.IntVar(
             value=max(1, int(lighthouse_cfg.get("monster_cooldown", 120) // 60))
         )
@@ -1318,13 +1314,6 @@ class EndlessWinterApp(tk.Tk):
             row=row, column=2, sticky=tk.W, padx=6
         )
         row += 1
-
-        ttk.Checkbutton(
-            tab_lighthouse,
-            text="活动期间（使用含红色晶簇的活动背景图扫描）",
-            variable=self.var_lighthouse_event_period,
-            command=self._save_config,
-        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
 
         tab_mining = ttk.Frame(notebook, padding=6)
         notebook.add(tab_mining, text="自动采集")
@@ -2035,7 +2024,6 @@ class EndlessWinterApp(tk.Tk):
             use_stamina=bool(self.var_common_use_stamina.get()),
             stamina_can_limit=int(self.var_common_stamina_can_limit.get()),
             use_formation=bool(self.var_common_use_formation.get()),
-            event_period=bool(self.var_lighthouse_event_period.get()),
             monster_cooldown=float(self.var_lighthouse_monster_cooldown.get() * 60),
             step_delay=merged["step_delay"],
             on_status=self._on_status,
@@ -2939,6 +2927,8 @@ class EndlessWinterApp(tk.Tk):
         except Exception as exc:
             self._on_status(f"✗ [{task.name}] 失败：{exc}")
         finally:
+            if getattr(task, "skip_return_to_main", False):
+                return
             try:
                 return_to_main_screen(self._get_adb(), on_status=self._on_status)
             except Exception as exc:
@@ -2959,6 +2949,8 @@ class EndlessWinterApp(tk.Tk):
         except Exception as exc:
             self._on_status(f"✗ [{task.name}] 失败：{exc}")
         finally:
+            if getattr(task, "skip_return_to_main", False):
+                return
             try:
                 return_to_main_screen(self._get_adb(), on_status=self._on_status)
             except Exception as exc:

@@ -292,7 +292,6 @@ tasks:
       - 566
   auto_lighthouse:
     enabled: false
-    event_period: false
     interval: 60
     formation_slot: 8
     check_march_heroes: true

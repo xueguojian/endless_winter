@@ -20,11 +20,12 @@ sys.path.insert(0, str(ROOT))
 
 from core.adb_client import AdbClient
 from core.lighthouse_vision import (
+    LIGHTHOUSE_SCAN_ROI,
+    auto_configure_lighthouse_scan,
     configure_lighthouse_scan,
     scan_mission_icons,
     _normalize_screen_for_scan,
     _refine_to_mission_pin_head,
-    LIGHTHOUSE_SCAN_ROI,
 )
 
 DEFAULT_EXPECT = (
@@ -61,8 +62,8 @@ def main() -> None:
     parser.add_argument(
         "--event",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="活动期间背景（默认开启）",
+        default=None,
+        help="强制活动/平常背景；默认根据截图自动判断",
     )
     parser.add_argument(
         "--expect",
@@ -81,11 +82,14 @@ def main() -> None:
             x_str, y_str = str(item).split(",")
             expected.append((int(x_str.strip()), int(y_str.strip())))
 
-    configure_lighthouse_scan(event_period=args.event)
     screen = _normalize_screen_for_scan(_load_screen(args.image, args.adb))
+    if args.event is None:
+        is_event = auto_configure_lighthouse_scan(screen)
+        print(f"背景: 自动判断 → event_period={is_event}")
+    else:
+        configure_lighthouse_scan(event_period=args.event)
+        print(f"背景: 手动指定 event_period={args.event}")
     result = scan_mission_icons(screen)
-
-    print(f"背景: event_period={args.event}")
     print(f"检测: {len(result.missions)} 个（差分候选 {result.candidate_locations}）")
     for i, m in enumerate(
         sorted(result.missions, key=lambda item: (item.center[1], item.center[0])), 1

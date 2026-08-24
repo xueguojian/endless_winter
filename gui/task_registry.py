@@ -70,15 +70,7 @@ TASK_ENTRIES: tuple[TaskEntry, ...] = (
         config_key="collect_pet_supplies",
         available=True,
     ),
-    TaskEntry(
-        task_id="auto_shop_exchange",
-        label="自动换资源",
-        kind="once",
-        config_key="auto_shop_exchange",
-        available=True,
-    ),
 )
-
 
 def loop_tasks() -> list[TaskEntry]:
     return [e for e in TASK_ENTRIES if e.kind == "loop"]
