@@ -259,6 +259,20 @@ class DreamMemorySession:
                 changed += 1
         return cleared > 0 or changed > 0
 
+    def _slot_hit(self, screen, slot_index: int, before_mean: float) -> bool:
+        patch = self._slot_patch(screen, slot_index)
+        if patch.size == 0:
+            return False
+        if not chip_is_active(
+            patch,
+            min_brightness=self.config.chip_active_min_brightness,
+        ):
+            return True
+        return (
+            abs(self._patch_mean(patch) - before_mean)
+            >= float(self.config.bar_change_mean_delta)
+        )
+
     def _wait_bar_refresh(self, batch: list[_BatchTap], before_means: dict[int, float]) -> None:
         """点完一批后等待底栏变灰或换目标，避免同一批 OCR 连点两轮。"""
         if not batch:
@@ -292,22 +306,44 @@ class DreamMemorySession:
         time.sleep(0.15)
 
     def _click_batch(self, batch: list[_BatchTap], *, before_means: dict[int, float]) -> int:
-        """普通模式：同一批识别结果连续点击。"""
+        """逐个点，本地截图确认；未确认重试一次，仍失败则停止本批（避免后续点乱）。"""
         labels = "、".join(item.text for item in batch)
         self._emit(f"本批 {len(batch)} 个: {labels}")
 
-        clicked = 0
+        clicked_items: list[_BatchTap] = []
+        settle = max(0.25, sample_tap_between_delay(self.config))
         for index, item in enumerate(batch):
             if self._interrupted():
                 break
-            self._emit(f"点击「{item.text}」@ ({item.x},{item.y})")
-            self.adb.tap(item.x, item.y)
-            clicked += 1
+            before_mean = before_means.get(item.slot_index, 0.0)
+            confirmed = False
+            for attempt in (1, 2):
+                self._emit(f"点击「{item.text}」@ ({item.x},{item.y})")
+                self.adb.tap(item.x, item.y)
+                time.sleep(settle)
+                try:
+                    screen = self.adb.screenshot()
+                except Exception as exc:
+                    logger.warning("点击「{}」后截图失败: {}", item.text, exc)
+                    continue
+                if self._slot_hit(screen, item.slot_index, before_mean):
+                    confirmed = True
+                    break
+                if attempt == 1:
+                    self._emit(f"「{item.text}」未确认，重试一次")
+            if not confirmed:
+                self._emit(
+                    f"「{item.text}」@ ({item.x},{item.y}) 仍未确认，本批停止"
+                )
+                break
+            clicked_items.append(item)
             if index < len(batch) - 1:
                 time.sleep(sample_tap_between_delay(self.config))
 
+        clicked = len(clicked_items)
         if clicked:
-            self._wait_bar_refresh(batch, before_means)
+            subset_means = {i.slot_index: before_means[i.slot_index] for i in clicked_items}
+            self._wait_bar_refresh(clicked_items, subset_means)
             self._fire_misclick_if_due(clicked)
         return clicked
 
