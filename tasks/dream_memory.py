@@ -122,6 +122,7 @@ class DreamMemorySession:
                 )
         elif self.config.pk_mode:
             self.name = "寻梦记忆PK"
+        self._unmatched_logged: set[str] = set()
         self._misclick: PseudoRandomMisclickScheduler | None = None
         if self.config.enable_misclick:
             self._misclick = PseudoRandomMisclickScheduler(
@@ -146,6 +147,22 @@ class DreamMemorySession:
         logger.info(f"[{self.name}] {message}")
         if self.on_status:
             self.on_status(message)
+
+    def _warn_unmatched_map(self, slot_index: int, raw: str) -> None:
+        """OCR 有字，但地图无此物品/无相似项 → 提示可能未标定。"""
+        key = (raw or "").strip()
+        if not key:
+            return
+        msg = (
+            f"槽位 {slot_index + 1} OCR「{key}」未匹配地图（无相似项），"
+            f"可能尚未标定"
+        )
+        if key not in self._unmatched_logged:
+            self._unmatched_logged.add(key)
+            logger.warning(f"[{self.name}] {msg}")
+            self._emit(msg)
+        else:
+            logger.debug(f"[{self.name}] {msg}（已提示过）")
 
     def _map_keys(self) -> tuple[str, ...]:
         return tuple(
@@ -215,21 +232,18 @@ class DreamMemorySession:
 
         batch: list[_BatchTap] = []
         for chip in sorted(chips, key=lambda c: c.slot_index):
-            if not chip.active or not chip.text:
-                if self.config.pk_mode and chip.active and not chip.text:
+            if not chip.active:
+                continue
+            raw = (chip.ocr_raw or chip.text or "").strip()
+            if not chip.text:
+                if raw:
+                    self._warn_unmatched_map(chip.slot_index, raw)
+                elif self.config.pk_mode:
                     logger.debug(f"槽位 {chip.slot_index + 1} 有内容但未识别，跳过")
                 continue
             coord = self._lookup_coord(chip.text)
             if coord is None:
-                if self.config.pk_mode:
-                    logger.debug(
-                        f"槽位 {chip.slot_index + 1} OCR「{chip.text}」— 未匹配地图，跳过"
-                    )
-                else:
-                    self._emit(
-                        f"槽位 {chip.slot_index + 1} OCR「{chip.text}」"
-                        f" — 未匹配地图，请标定"
-                    )
+                self._warn_unmatched_map(chip.slot_index, raw or chip.text)
                 continue
             x, y = coord
             batch.append(_BatchTap(chip.slot_index, chip.text, x, y))
