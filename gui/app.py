@@ -55,6 +55,7 @@ from gui.dream_memory_panel import (
     build_turbo_pk_controls,
     get_selected_map_id,
     get_selected_period,
+    get_tap_delay_seconds,
     get_tap_interval_mode,
     load_dream_cfg,
     rebuild_map_index,
@@ -497,7 +498,8 @@ class EndlessWinterApp(tk.Tk):
         collect["coords"] = merged_collect["coords"]
 
         train = tasks.setdefault("auto_train_troops", {})
-        train["enabled"] = bool(self._task_vars["auto_train_troops"].get())
+        # 练兵暂时禁用：保存时强制关掉，避免旧配置仍为 enabled
+        train["enabled"] = False
         train["interval"] = int(self.var_train_interval.get()) * 3600
         merged_train = merge_train_config(train)
         train["step_delay"] = merged_train["step_delay"]
@@ -557,6 +559,7 @@ class EndlessWinterApp(tk.Tk):
             dm["selected_map"] = get_selected_map_id(self._dream_widgets)
             dm["selected_period"] = get_selected_period(self._dream_widgets)
             dm["tap_between_delay_interval"] = get_tap_interval_mode(self._dream_widgets)
+            dm["tap_delay"] = get_tap_delay_seconds(self._dream_widgets)
         if self._dream_pk_widgets is not None:
             pk = cfg.setdefault("dream_memory_pk", {})
             pk["selected_map"] = get_selected_map_id(self._dream_pk_widgets)
@@ -758,7 +761,9 @@ class EndlessWinterApp(tk.Tk):
                 row_frame = ttk.Frame(parent)
                 row_frame.pack(fill=tk.X, pady=1)
 
-            var = tk.BooleanVar(value=self._task_enabled_in_config(entry))
+            var = tk.BooleanVar(
+                value=bool(self._task_enabled_in_config(entry)) if entry.available else False
+            )
             self._task_vars[entry.task_id] = var
 
             label = entry.label
@@ -2157,6 +2162,8 @@ class EndlessWinterApp(tk.Tk):
     def _collect_loop_tasks(self) -> list:
         tasks: list = []
         for entry in loop_tasks():
+            if not entry.available:
+                continue
             if self._task_vars[entry.task_id].get():
                 task = self._build_task_instance(entry)
                 if task is not None:
@@ -2175,7 +2182,9 @@ class EndlessWinterApp(tk.Tk):
         return tasks
 
     def _any_loop_selected(self) -> bool:
-        return any(self._task_vars[e.task_id].get() for e in loop_tasks())
+        return any(
+            self._task_vars[e.task_id].get() for e in loop_tasks() if e.available
+        )
 
     def _any_once_selected(self) -> bool:
         return any(
@@ -2564,24 +2573,16 @@ class EndlessWinterApp(tk.Tk):
 
         self._auto_click_stop_event.clear()
         self._update_run_control_buttons(running=True)
-        self._on_status(f"连点器：({x},{y}) 间隔 {interval:g}s")
 
         def work() -> None:
-            count = 0
             try:
                 if not self._ensure_device():
                     return
                 adb = self._get_adb()
                 while not self._auto_click_stop_event.is_set():
                     adb.tap(x, y)
-                    count += 1
-                    if count == 1 or count % 100 == 0:
-                        self._on_status(
-                            f"连点器运行中：({x},{y}) 已点击 {count} 次"
-                        )
                     if self._auto_click_stop_event.wait(interval):
                         break
-                self._on_status(f"连点器已停止（共 {count} 次）")
             except Exception as exc:
                 self._on_status(f"连点器异常：{exc}")
             finally:
@@ -2592,7 +2593,6 @@ class EndlessWinterApp(tk.Tk):
 
     def _stop_auto_click(self) -> None:
         self._auto_click_stop_event.set()
-        self._on_status("正在停止连点器…")
 
     def _on_auto_click_done(self) -> None:
         self._auto_click_worker = None

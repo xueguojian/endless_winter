@@ -47,7 +47,8 @@ TASK_ENTRIES: tuple[TaskEntry, ...] = (
         label="自动练兵",
         kind="loop",
         config_key="auto_train_troops",
-        available=True,
+        available=False,
+        hint="暂时禁用（有问题待修）",
     ),
     TaskEntry(
         task_id="collect_supplies",
@@ -70,6 +71,13 @@ TASK_ENTRIES: tuple[TaskEntry, ...] = (
         config_key="collect_pet_supplies",
         available=True,
     ),
+    TaskEntry(
+        task_id="auto_shop_exchange",
+        label="自动购买商店物资",
+        kind="once",
+        config_key="auto_shop_exchange",
+        available=True,
+    ),
 )
 
 def loop_tasks() -> list[TaskEntry]:
@@ -85,7 +93,7 @@ HOSTING_TASK_IDS: tuple[str, ...] = (
     "auto_mining",
     "auto_shop_exchange",
     "donate_alliance_supplies",
-    "auto_train_troops",
+    # "auto_train_troops",  # 暂时禁用：练兵逻辑有问题
     "collect_supplies",
     "collect_commander_supplies",
     "collect_pet_supplies",

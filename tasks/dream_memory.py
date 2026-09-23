@@ -6,7 +6,6 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-import numpy as np
 from loguru import logger
 
 from core.adb_client import AdbClient
@@ -23,7 +22,6 @@ from core.dream_memory.maps import DreamMemoryMap, load_map
 from core.dream_memory.misclick import PseudoRandomMisclickScheduler
 from core.dream_memory.ocr_engine import ocr_engine_available, resolve_ocr_engine, warmup_ocr
 from core.dream_memory.vision import (
-    chip_is_active,
     read_target_chips,
     resolve_item_coord,
     split_bar_grid_slots,
@@ -171,25 +169,6 @@ class DreamMemorySession:
             )
         )
 
-    def _slot_patch(self, screen, slot_index: int):
-        if slot_index >= len(self.config.target_slots):
-            return np.array([])
-        x1, y1, x2, y2 = self.config.target_slots[slot_index]
-        h, w = screen.shape[:2]
-        return screen[max(0, y1) : min(h, y2), max(0, x1) : min(w, x2)]
-
-    @staticmethod
-    def _patch_mean(patch) -> float:
-        if patch.size == 0:
-            return 0.0
-        gray = patch
-        if patch.ndim == 3:
-            gray = patch.mean(axis=2)
-        return float(gray.mean())
-
-    def _slot_fingerprints(self, screen, batch: list[_BatchTap]) -> dict[int, float]:
-        return {item.slot_index: self._patch_mean(self._slot_patch(screen, item.slot_index)) for item in batch}
-
     def _lookup_coord(self, label: str) -> tuple[int, int] | None:
         if self.config.pk_mode:
             return self.game_map.lookup_strict(label)
@@ -249,66 +228,6 @@ class DreamMemorySession:
             batch.append(_BatchTap(chip.slot_index, chip.text, x, y))
         return batch
 
-    def _bar_changed(
-        self,
-        screen,
-        batch: list[_BatchTap],
-        before_means: dict[int, float],
-    ) -> bool:
-        cleared = 0
-        changed = 0
-        delta_floor = self.config.bar_change_mean_delta
-        for item in batch:
-            patch = self._slot_patch(screen, item.slot_index)
-            if patch.size == 0:
-                continue
-            if not chip_is_active(
-                patch,
-                min_brightness=self.config.chip_active_min_brightness,
-            ):
-                cleared += 1
-                continue
-            before = before_means.get(item.slot_index, 0.0)
-            if abs(self._patch_mean(patch) - before) >= delta_floor:
-                changed += 1
-        return cleared > 0 or changed > 0
-
-    def _slot_hit(self, screen, slot_index: int, before_mean: float) -> bool:
-        patch = self._slot_patch(screen, slot_index)
-        if patch.size == 0:
-            return False
-        if not chip_is_active(
-            patch,
-            min_brightness=self.config.chip_active_min_brightness,
-        ):
-            return True
-        return (
-            abs(self._patch_mean(patch) - before_mean)
-            >= float(self.config.bar_change_mean_delta)
-        )
-
-    def _wait_bar_refresh(self, batch: list[_BatchTap], before_means: dict[int, float]) -> None:
-        """点完一批后等待底栏变灰或换目标，避免同一批 OCR 连点两轮。"""
-        if not batch:
-            return
-        floor = max(0.12, self.config.bar_refresh_min_wait)
-        time.sleep(floor)
-        deadline = time.time() + self.config.bar_refresh_timeout
-        poll = max(0.05, self.config.bar_refresh_poll)
-        while time.time() < deadline:
-            if self._interrupted():
-                return
-            try:
-                screen = self.adb.screenshot()
-            except Exception:
-                time.sleep(poll)
-                continue
-            if self._bar_changed(screen, batch, before_means):
-                logger.debug("底栏已刷新")
-                return
-            time.sleep(poll)
-        logger.debug("等待底栏刷新超时，继续下一轮")
-
     def _fire_misclick_if_due(self, normal_click_count: int) -> None:
         if self._misclick is None or normal_click_count <= 0 or self._interrupted():
             return
@@ -319,45 +238,28 @@ class DreamMemorySession:
         self.adb.tap(x, y)
         time.sleep(0.15)
 
-    def _click_batch(self, batch: list[_BatchTap], *, before_means: dict[int, float]) -> int:
-        """逐个点，本地截图确认；未确认重试一次，仍失败则停止本批（避免后续点乱）。"""
+    def _click_batch(self, batch: list[_BatchTap]) -> int:
+        """普通模式：截图识别后连点；已划线槽由 chip_is_active 跳过，不做点后确认。
+
+        tap_delay：本批点完后等待再进入下一轮截图，给游戏划线/换目标时间。
+        """
         labels = "、".join(item.text for item in batch)
         self._emit(f"本批 {len(batch)} 个: {labels}")
 
-        clicked_items: list[_BatchTap] = []
-        settle = max(0.25, sample_tap_between_delay(self.config))
+        clicked = 0
         for index, item in enumerate(batch):
             if self._interrupted():
                 break
-            before_mean = before_means.get(item.slot_index, 0.0)
-            confirmed = False
-            for attempt in (1, 2):
-                self._emit(f"点击「{item.text}」@ ({item.x},{item.y})")
-                self.adb.tap(item.x, item.y)
-                time.sleep(settle)
-                try:
-                    screen = self.adb.screenshot()
-                except Exception as exc:
-                    logger.warning("点击「{}」后截图失败: {}", item.text, exc)
-                    continue
-                if self._slot_hit(screen, item.slot_index, before_mean):
-                    confirmed = True
-                    break
-                if attempt == 1:
-                    self._emit(f"「{item.text}」未确认，重试一次")
-            if not confirmed:
-                self._emit(
-                    f"「{item.text}」@ ({item.x},{item.y}) 仍未确认，本批停止"
-                )
-                break
-            clicked_items.append(item)
+            self._emit(f"点击「{item.text}」@ ({item.x},{item.y})")
+            self.adb.tap(item.x, item.y)
+            clicked += 1
             if index < len(batch) - 1:
                 time.sleep(sample_tap_between_delay(self.config))
 
-        clicked = len(clicked_items)
         if clicked:
-            subset_means = {i.slot_index: before_means[i.slot_index] for i in clicked_items}
-            self._wait_bar_refresh(clicked_items, subset_means)
+            settle = max(0.0, float(self.config.tap_delay))
+            if settle > 0:
+                time.sleep(settle)
             self._fire_misclick_if_due(clicked)
         return clicked
 
@@ -508,8 +410,7 @@ class DreamMemorySession:
                     time.sleep(self.config.scan_interval)
                     continue
 
-                before_means = self._slot_fingerprints(screen, batch)
-                self._click_batch(batch, before_means=before_means)
+                self._click_batch(batch)
                 if self._interrupted():
                     break
 

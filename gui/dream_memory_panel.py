@@ -45,6 +45,7 @@ class DreamTabWidgets:
     btn_stop: ttk.Button
     var_tap_interval: tk.StringVar | None = None
     cmb_tap_interval: ttk.Combobox | None = None
+    var_tap_delay: tk.StringVar | None = None
     config_section: str = ""
     label_to_id: dict[str, str] = field(default_factory=dict)
     id_to_label: dict[str, str] = field(default_factory=dict)
@@ -102,6 +103,17 @@ def get_selected_period(widgets: DreamTabWidgets) -> int:
         widgets.var_period.get(),
         default=CURRENT_MAP_PERIOD,
     )
+
+
+def get_tap_delay_seconds(widgets: DreamTabWidgets, default: float = 0.5) -> float:
+    if widgets.var_tap_delay is None:
+        return float(default)
+    raw = (widgets.var_tap_delay.get() or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(default)
+    return max(0.0, value)
 
 
 def get_tap_interval_mode(widgets: DreamTabWidgets) -> str:
@@ -373,6 +385,22 @@ def build_dream_tab(
         foreground="#555",
     ).pack(side=tk.LEFT)
 
+    var_tap_delay: tk.StringVar | None = None
+    if section == "dream_memory":
+        tap_delay_val = float(section_cfg.get("tap_delay", dm_cfg.tap_delay))
+        var_tap_delay = tk.StringVar(value=f"{tap_delay_val:g}")
+        row_delay = ttk.Frame(parent)
+        row_delay.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(row_delay, text="点后截图延迟").pack(side=tk.LEFT)
+        ttk.Entry(row_delay, textvariable=var_tap_delay, width=8).pack(
+            side=tk.LEFT, padx=(8, 8)
+        )
+        ttk.Label(
+            row_delay,
+            text="秒（本批点完后再截图；太短易读到旧底栏）",
+            foreground="#555",
+        ).pack(side=tk.LEFT)
+
     preview_row = ttk.Frame(parent)
     preview_row.pack(anchor=tk.W, fill=tk.X, pady=(0, 4))
     preview_btn_frame = ttk.Frame(preview_row)
@@ -391,6 +419,7 @@ def build_dream_tab(
         btn_stop=ttk.Button(parent, text="结束"),
         var_tap_interval=var_tap_interval,
         cmb_tap_interval=cmb_tap_interval,
+        var_tap_delay=var_tap_delay,
         config_section=section,
         label_to_id=label_to_id,
         id_to_label=id_to_label,
