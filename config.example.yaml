@@ -440,10 +440,10 @@ dream_memory:
   selected_map: example_gazebo
   # 本批点完后等待再截图（秒）；太短会截到上一批未划线画面
   tap_delay: 0.5
-  tap_between_delay: 0.35
-  tap_between_delay_min: 0.35
-  tap_between_delay_max: 0.35
-  tap_between_delay_mode: 0.35
+  tap_between_delay: 0.3
+  tap_between_delay_min: 0.3
+  tap_between_delay_max: 0.3
+  tap_between_delay_mode: 0.3
   tap_between_delay_interval: fixed
   scan_interval: 0.3
   enable_misclick: false
@@ -452,6 +452,16 @@ dream_memory:
   bar_refresh_timeout: 2.5
   chip_active_min_brightness: 95
   ocr_engine: rapidocr
+  # 连续空识别后自动过关：继续 → 开始游戏 / 开启章节则结束
+  auto_advance: true
+  empty_rounds_before_advance: 10
+  continue_btn_roi: [210, 878, 512, 954]
+  chapter_btn_roi: [280, 1128, 568, 1214]
+  advance_wait_sec: 5.0
+  center_tap: [360, 640]
+  start_tip_roi: [256, 790, 464, 824]
+  claim_btn_roi: [200, 1034, 510, 1124]
+  reward_title_roi: [178, 264, 528, 330]
   target_slots:
     - [38, 1140, 248, 1194]
     - [250, 1142, 462, 1196]

@@ -43,7 +43,10 @@ def chip_is_active(
     *,
     min_brightness: float = 95.0,
 ) -> bool:
-    """未找到的目标按钮较亮；已划线/变灰的跳过（普通模式）。"""
+    """未找到的目标按钮较亮；已划线/变灰的跳过（普通模式）。
+
+    细/浅删除线单靠视觉仍可能漏检；任务层会对刚点过的槽位做短时抑制兜底。
+    """
     if chip_bgr.size == 0:
         return False
     gray = cv2.cvtColor(chip_bgr, cv2.COLOR_BGR2GRAY)
@@ -61,11 +64,31 @@ def chip_is_active(
         if top.size and bottom.size and mid.size:
             mid_mean = float(mid.mean())
             surround = float(np.mean([top.mean(), bottom.mean()]))
-            if mid_mean + 12 < surround:
+            # 阈值从 12 降到 8，略提高对细黑线的敏感度
+            if mid_mean + 8 < surround:
                 logger.debug(
                     f"chip 中间横线检测 mid={mid_mean:.1f} surround={surround:.1f}"
                 )
                 return False
+
+        # 补充：文字中部若存在「横穿大半宽度」的暗像素带，也视为划线
+        w = gray.shape[1]
+        y0, y1 = max(0, mid_y - max(2, h // 8)), min(h, mid_y + max(2, h // 8))
+        x0, x1 = int(w * 0.1), int(w * 0.9)
+        strip = gray[y0:y1, x0:x1]
+        if strip.size:
+            # 相对整块偏暗的像素占比；删除线会形成连续偏暗带
+            thr = float(gray.mean()) - 18.0
+            dark_ratio = float(np.mean(strip < thr))
+            if dark_ratio >= 0.35:
+                # 再要求至少有一行暗像素横向连续铺开
+                row_dark = (strip < thr).mean(axis=1)
+                if float(row_dark.max()) >= 0.55:
+                    logger.debug(
+                        f"chip 划线(暗带) dark_ratio={dark_ratio:.2f} "
+                        f"row_max={float(row_dark.max()):.2f}"
+                    )
+                    return False
     return True
 
 

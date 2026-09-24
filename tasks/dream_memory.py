@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -20,7 +21,12 @@ from core.dream_memory.config import (
 )
 from core.dream_memory.maps import DreamMemoryMap, load_map
 from core.dream_memory.misclick import PseudoRandomMisclickScheduler
-from core.dream_memory.ocr_engine import ocr_engine_available, resolve_ocr_engine, warmup_ocr
+from core.dream_memory.ocr_engine import (
+    ocr_chip_text,
+    ocr_engine_available,
+    resolve_ocr_engine,
+    warmup_ocr,
+)
 from core.dream_memory.vision import (
     read_target_chips,
     resolve_item_coord,
@@ -121,6 +127,9 @@ class DreamMemorySession:
         elif self.config.pk_mode:
             self.name = "寻梦记忆PK"
         self._unmatched_logged: set[str] = set()
+        # 普通模式：刚点过的槽位短时抑制，防止划线未检出时连点两轮
+        self._recent_taps: dict[int, tuple[str, float]] = {}
+        self._recent_tap_ttl = 2.0
         self._misclick: PseudoRandomMisclickScheduler | None = None
         if self.config.enable_misclick:
             self._misclick = PseudoRandomMisclickScheduler(
@@ -174,6 +183,189 @@ class DreamMemorySession:
             return self.game_map.lookup_strict(label)
         return resolve_item_coord(self.game_map, label)
 
+    def _sleep_interruptible(self, seconds: float) -> bool:
+        """可中断等待；返回 False 表示被 stop。"""
+        deadline = time.time() + max(0.0, float(seconds))
+        while time.time() < deadline:
+            if self._interrupted():
+                return False
+            time.sleep(min(0.1, max(0.0, deadline - time.time())))
+        return not self._interrupted()
+
+    def _roi_center(self, roi: tuple[int, int, int, int]) -> tuple[int, int]:
+        x1, y1, x2, y2 = roi
+        return (x1 + x2) // 2, (y1 + y2) // 2
+
+    def _crop_roi(self, screen, roi: tuple[int, int, int, int]):
+        x1, y1, x2, y2 = roi
+        h, w = screen.shape[:2]
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(w, int(x2)), min(h, int(y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return screen[y1:y2, x1:x2]
+
+    def _ocr_roi_text(
+        self,
+        screen,
+        roi: tuple[int, int, int, int],
+    ) -> str:
+        patch = self._crop_roi(screen, roi)
+        if patch is None or getattr(patch, "size", 0) == 0:
+            return ""
+        text, _engine = ocr_chip_text(
+            patch,
+            engine=self.config.ocr_engine,
+            tesseract_cmd=self.config.tesseract_cmd,
+        )
+        return re.sub(r"\s+", "", text or "")
+
+    def _ocr_aux_rois(
+        self,
+        screen,
+        rois: dict[str, tuple[int, int, int, int]],
+    ) -> dict[str, str]:
+        """辅助按钮区一次截图、多 ROI 一起 OCR（不走底栏三槽逻辑）。"""
+        keys = list(rois.keys())
+        patches = []
+        valid_keys: list[str] = []
+        for key in keys:
+            patch = self._crop_roi(screen, rois[key])
+            if patch is None or getattr(patch, "size", 0) == 0:
+                continue
+            patches.append(patch)
+            valid_keys.append(key)
+
+        results = {key: "" for key in keys}
+        if not patches:
+            return results
+
+        texts: list[str] = []
+        if resolve_ocr_engine(self.config.ocr_engine) == "rapidocr":
+            try:
+                from core.dream_memory.ocr_rapid import ocr_slots_batch
+
+                texts = ocr_slots_batch(patches)
+            except Exception as exc:
+                logger.warning(f"辅助区批量 OCR 失败，回退逐个: {exc}")
+                texts = []
+
+        if len(texts) != len(patches):
+            texts = []
+            for patch in patches:
+                text, _ = ocr_chip_text(
+                    patch,
+                    engine=self.config.ocr_engine,
+                    tesseract_cmd=self.config.tesseract_cmd,
+                )
+                texts.append(text)
+
+        for key, text in zip(valid_keys, texts):
+            results[key] = re.sub(r"\s+", "", text or "")
+        logger.debug(f"辅助区 OCR: {results}")
+        return results
+
+    def _dismiss_continue_overlay(self) -> bool:
+        """「您的奖励增加了」但无「继续」时，按回退关掉遮挡面板。"""
+        self._emit("检测到奖励结算但无「继续」，按回退关闭遮挡…")
+        self.adb.back()
+        return self._sleep_interruptible(0.6)
+
+    def _try_auto_advance(self) -> str:
+        """过关推进监视循环：各辅助 ROI 每轮一起 OCR，按结果分支。
+
+        返回:
+          - ``started``：已进入关卡，应恢复底栏 OCR
+          - ``stop_chapter``：出现「开启章节/领取」，应结束任务
+          - ``stopped``：用户手动停止
+        """
+        self._emit(
+            f"连续 {self.config.empty_rounds_before_advance} 次未识别到底栏目标，"
+            f"暂停底栏 OCR，批量检查过关界面…"
+        )
+        wait = max(0.0, float(self.config.advance_wait_sec))
+        aux_rois = {
+            "continue": tuple(int(v) for v in self.config.continue_btn_roi),
+            "chapter": tuple(int(v) for v in self.config.chapter_btn_roi),
+            "start_tip": tuple(int(v) for v in self.config.start_tip_roi),
+            "claim": tuple(int(v) for v in self.config.claim_btn_roi),
+            "reward_title": tuple(int(v) for v in self.config.reward_title_roi),
+        }
+
+        while not self._interrupted():
+            try:
+                screen = self.adb.screenshot()
+            except Exception as exc:
+                self._emit(f"截图失败: {exc}")
+                if not self._sleep_interruptible(0.5):
+                    return "stopped"
+                continue
+
+            texts = self._ocr_aux_rois(screen, aux_rois)
+            continue_text = texts.get("continue", "")
+            chapter_text = texts.get("chapter", "")
+            tip_text = texts.get("start_tip", "")
+            claim_text = texts.get("claim", "")
+            reward_title = texts.get("reward_title", "")
+            has_reward_title = (
+                "您的奖励增加了" in reward_title or "奖励增加了" in reward_title
+            )
+            has_continue = "继续" in continue_text
+
+            # 1) 结束类：领取 / 开启章节
+            if "领取" in claim_text:
+                self._emit(f"检测到「领取」（{claim_text}），自动结束")
+                return "stop_chapter"
+            if "开启章节" in chapter_text:
+                self._emit(f"检测到「开启章节」（{chapter_text}），自动结束")
+                return "stop_chapter"
+
+            # 2) 已在开局提示界面 → 点提示区，立刻恢复 OCR
+            if "点击任意位置开始" in tip_text or "任意位置开始" in tip_text:
+                tx, ty = self._roi_center(aux_rois["start_tip"])
+                self._emit(f"检测到「点击任意位置开始」，点击 @ ({tx},{ty})")
+                self.adb.tap(tx, ty)
+                self._recent_taps.clear()
+                self._emit("已进入关卡，立即恢复底栏识别")
+                return "started"
+
+            # 3) 大厅「开始游戏」→ 点击后等动画，下一轮再一起 OCR
+            if "开始游戏" in chapter_text:
+                bx, by = self._roi_center(aux_rois["chapter"])
+                self._emit(f"检测到「开始游戏」，点击 @ ({bx},{by})")
+                self.adb.tap(bx, by)
+                if not self._sleep_interruptible(wait):
+                    return "stopped"
+                continue
+
+            # 4) 小关结算：先看标题「您的奖励增加了」
+            if has_reward_title:
+                if has_continue:
+                    bx, by = self._roi_center(aux_rois["continue"])
+                    self._emit(f"检测到「继续」，点击 @ ({bx},{by})")
+                    self.adb.tap(bx, by)
+                    if not self._sleep_interruptible(wait):
+                        return "stopped"
+                    continue
+                # 有奖励标题但没有继续 → 被遮挡
+                if not self._dismiss_continue_overlay():
+                    return "stopped"
+                continue
+
+            # 5) 无奖励标题时仍看到继续（兜底）
+            if has_continue:
+                bx, by = self._roi_center(aux_rois["continue"])
+                self._emit(f"检测到「继续」，点击 @ ({bx},{by})")
+                self.adb.tap(bx, by)
+                if not self._sleep_interruptible(wait):
+                    return "stopped"
+                continue
+
+            if not self._sleep_interruptible(1.0):
+                return "stopped"
+
+        return "stopped"
+
     def _grab_pk_frame(self) -> tuple[object, tuple[tuple[int, int, int, int], ...]]:
         """返回 (图像, 槽位ROI)。极速模式抓窗口底栏并均分六格。"""
         if self.turbo_pk and self._turbo_capture is not None and self._turbo_bar_roi is not None:
@@ -210,8 +402,10 @@ class DreamMemorySession:
             logger.debug(f"PK 当前亮槽 {active_count}/{len(chips)}")
 
         batch: list[_BatchTap] = []
+        now = time.time()
         for chip in sorted(chips, key=lambda c: c.slot_index):
             if not chip.active:
+                self._recent_taps.pop(chip.slot_index, None)
                 continue
             raw = (chip.ocr_raw or chip.text or "").strip()
             if not chip.text:
@@ -220,6 +414,22 @@ class DreamMemorySession:
                 elif self.config.pk_mode:
                     logger.debug(f"槽位 {chip.slot_index + 1} 有内容但未识别，跳过")
                 continue
+            # 普通模式：刚点过且文字未变 → 视为划线未检出，跳过
+            if not self.config.pk_mode:
+                recent = self._recent_taps.get(chip.slot_index)
+                if recent is not None:
+                    recent_text, recent_ts = recent
+                    if now - recent_ts > self._recent_tap_ttl:
+                        self._recent_taps.pop(chip.slot_index, None)
+                    elif recent_text == chip.text:
+                        logger.debug(
+                            f"槽位 {chip.slot_index + 1}「{chip.text}」刚点过，"
+                            f"跳过（防重复）"
+                        )
+                        continue
+                    else:
+                        # 槽位已换成新目标
+                        self._recent_taps.pop(chip.slot_index, None)
             coord = self._lookup_coord(chip.text)
             if coord is None:
                 self._warn_unmatched_map(chip.slot_index, raw or chip.text)
@@ -252,6 +462,8 @@ class DreamMemorySession:
                 break
             self._emit(f"点击「{item.text}」@ ({item.x},{item.y})")
             self.adb.tap(item.x, item.y)
+            if not self.config.pk_mode:
+                self._recent_taps[item.slot_index] = (item.text, time.time())
             clicked += 1
             if index < len(batch) - 1:
                 time.sleep(sample_tap_between_delay(self.config))
@@ -384,6 +596,10 @@ class DreamMemorySession:
         else:
             mode_hint = "普通"
             pk_hint = f"·{format_tap_interval_hint(self.config)}·扫描 {self.config.scan_interval:g}s"
+            if self.config.auto_advance:
+                pk_hint += (
+                    f"·空识别{self.config.empty_rounds_before_advance}次后自动过关"
+                )
         misclick_hint = "·含误点" if self.config.enable_misclick else ""
         self._emit(
             f"开始({mode_hint}{misclick_hint}{pk_hint}) — 地图「{self.game_map.name}」"
@@ -397,6 +613,7 @@ class DreamMemorySession:
                 self._emit("已结束")
                 return
 
+            empty_rounds = 0
             while not self._interrupted():
                 try:
                     screen = self.adb.screenshot()
@@ -406,13 +623,28 @@ class DreamMemorySession:
                     continue
 
                 batch = self._scan_batch(screen)
-                if not batch:
-                    time.sleep(self.config.scan_interval)
+                if batch:
+                    empty_rounds = 0
+                    self._click_batch(batch)
+                    if self._interrupted():
+                        break
                     continue
 
-                self._click_batch(batch)
-                if self._interrupted():
-                    break
+                empty_rounds += 1
+                if (
+                    self.config.auto_advance
+                    and empty_rounds >= int(self.config.empty_rounds_before_advance)
+                ):
+                    outcome = self._try_auto_advance()
+                    if outcome == "stop_chapter":
+                        break
+                    if outcome == "stopped":
+                        break
+                    # started → 恢复底栏 OCR
+                    empty_rounds = 0
+                    continue
+
+                time.sleep(self.config.scan_interval)
 
             self._emit("已结束")
         finally:

@@ -49,6 +49,19 @@ DEFAULT_OCR_ENGINE = "rapidocr"
 DEFAULT_MAP_PERIOD = 4
 CURRENT_MAP_PERIOD = 8
 
+# 过关自动推进（普通模式）：连续空识别后检查「继续」→「开始游戏/开启章节」
+DEFAULT_EMPTY_ROUNDS_BEFORE_ADVANCE = 10
+DEFAULT_CONTINUE_BTN_ROI: tuple[int, int, int, int] = (210, 878, 512, 954)
+DEFAULT_CHAPTER_BTN_ROI: tuple[int, int, int, int] = (280, 1128, 568, 1214)
+DEFAULT_ADVANCE_WAIT_SEC = 5.0
+DEFAULT_CENTER_TAP: tuple[int, int] = (360, 640)
+# 点「开始游戏」后：等待再识别「点击任意位置开始」
+DEFAULT_START_TIP_ROI: tuple[int, int, int, int] = (256, 790, 464, 824)
+# 「领取」通关奖励按钮；出现则结束（等同开启章节）
+DEFAULT_CLAIM_BTN_ROI: tuple[int, int, int, int] = (200, 1034, 510, 1124)
+# 小关结算标题「您的奖励增加了」；有标题无「继续」= 被遮挡
+DEFAULT_REWARD_TITLE_ROI: tuple[int, int, int, int] = (178, 264, 528, 330)
+
 TAP_INTERVAL_FIXED = "fixed"
 TAP_INTERVAL_RANDOM = "random"
 TAP_INTERVAL_CHOICES = (TAP_INTERVAL_FIXED, TAP_INTERVAL_RANDOM)
@@ -90,10 +103,10 @@ class DreamMemoryConfig:
     selected_map: str = ""
     selected_period: int = CURRENT_MAP_PERIOD
     tap_delay: float = 0.5  # 本批点完 → 下一轮截图前等待（秒）
-    tap_between_delay: float = 0.35
-    tap_between_delay_min: float = 0.35
-    tap_between_delay_max: float = 0.35
-    tap_between_delay_mode: float = 0.35
+    tap_between_delay: float = 0.3
+    tap_between_delay_min: float = 0.3
+    tap_between_delay_max: float = 0.3
+    tap_between_delay_mode: float = 0.3
     tap_between_interval: str = TAP_INTERVAL_FIXED
     scan_interval: float = 0.3
     chip_active_min_brightness: float = 95.0
@@ -120,6 +133,16 @@ class DreamMemoryConfig:
     bar_refresh_poll: float = 0.08
     bar_refresh_timeout: float = 2.5
     bar_change_mean_delta: float = 8.0
+    # 普通模式：连续空识别后自动过关推进
+    auto_advance: bool = True
+    empty_rounds_before_advance: int = DEFAULT_EMPTY_ROUNDS_BEFORE_ADVANCE
+    continue_btn_roi: tuple[int, int, int, int] = DEFAULT_CONTINUE_BTN_ROI
+    chapter_btn_roi: tuple[int, int, int, int] = DEFAULT_CHAPTER_BTN_ROI
+    advance_wait_sec: float = DEFAULT_ADVANCE_WAIT_SEC
+    center_tap: tuple[int, int] = DEFAULT_CENTER_TAP
+    start_tip_roi: tuple[int, int, int, int] = DEFAULT_START_TIP_ROI
+    claim_btn_roi: tuple[int, int, int, int] = DEFAULT_CLAIM_BTN_ROI
+    reward_title_roi: tuple[int, int, int, int] = DEFAULT_REWARD_TITLE_ROI
 
     def ensure_dirs(self) -> None:
         self.maps_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +164,21 @@ def _parse_bar(raw: list | None) -> tuple[int, int, int, int]:
     if isinstance(raw, (list, tuple)) and len(raw) == 4:
         return tuple(int(v) for v in raw)  # type: ignore[return-value]
     return DEFAULT_TARGET_BAR
+
+
+def _parse_roi(
+    raw,
+    default: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    if isinstance(raw, (list, tuple)) and len(raw) == 4:
+        return tuple(int(v) for v in raw)  # type: ignore[return-value]
+    return default
+
+
+def _parse_point(raw, default: tuple[int, int]) -> tuple[int, int]:
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        return int(raw[0]), int(raw[1])
+    return default
 
 
 def _parse_optional_path(raw: str | None, default: Path) -> Path:
@@ -186,10 +224,10 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
         default_maps = MAPS_DIR
         default_previews = PREVIEWS_DIR
         timing = dict(
-            tap_between_delay=0.35,
-            tap_between_delay_min=0.35,
-            tap_between_delay_max=0.35,
-            tap_between_delay_mode=0.35,
+            tap_between_delay=0.3,
+            tap_between_delay_min=0.3,
+            tap_between_delay_max=0.3,
+            tap_between_delay_mode=0.3,
             tap_between_interval=TAP_INTERVAL_FIXED,
             scan_interval=0.3,
             bar_refresh_min_wait=0.4,
@@ -253,6 +291,20 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
             raw.get("bar_refresh_timeout", timing["bar_refresh_timeout"])
         ),
         bar_change_mean_delta=float(raw.get("bar_change_mean_delta", 8.0)),
+        auto_advance=bool(raw.get("auto_advance", True)),
+        empty_rounds_before_advance=max(
+            1,
+            int(raw.get("empty_rounds_before_advance", DEFAULT_EMPTY_ROUNDS_BEFORE_ADVANCE)),
+        ),
+        continue_btn_roi=_parse_roi(raw.get("continue_btn_roi"), DEFAULT_CONTINUE_BTN_ROI),
+        chapter_btn_roi=_parse_roi(raw.get("chapter_btn_roi"), DEFAULT_CHAPTER_BTN_ROI),
+        advance_wait_sec=max(0.0, float(raw.get("advance_wait_sec", DEFAULT_ADVANCE_WAIT_SEC))),
+        center_tap=_parse_point(raw.get("center_tap"), DEFAULT_CENTER_TAP),
+        start_tip_roi=_parse_roi(raw.get("start_tip_roi"), DEFAULT_START_TIP_ROI),
+        claim_btn_roi=_parse_roi(raw.get("claim_btn_roi"), DEFAULT_CLAIM_BTN_ROI),
+        reward_title_roi=_parse_roi(
+            raw.get("reward_title_roi"), DEFAULT_REWARD_TITLE_ROI
+        ),
     )
     cfg.maps_dir = _parse_optional_path(raw.get("maps_dir"), default_maps)
     cfg.previews_dir = _parse_optional_path(raw.get("previews_dir"), default_previews)
