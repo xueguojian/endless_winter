@@ -45,9 +45,9 @@ TURBO_PK_TAP_BETWEEN = 0.09
 DEFAULT_TESSERACT_CMD = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
 DEFAULT_OCR_ENGINE = "rapidocr"
 
-# 寻梦地图期数：旧 YAML 无 period 时默认第 4 期；当前活动第 8 期
+# 寻梦地图期数：旧 YAML 无 period 时默认第 4 期；当前活动第 9 期
 DEFAULT_MAP_PERIOD = 4
-CURRENT_MAP_PERIOD = 8
+CURRENT_MAP_PERIOD = 9
 
 # 过关自动推进（普通模式）：连续空识别后检查「继续」→「开始游戏/开启章节」
 DEFAULT_EMPTY_ROUNDS_BEFORE_ADVANCE = 10
