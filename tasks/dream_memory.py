@@ -19,7 +19,8 @@ from core.dream_memory.config import (
     load_dream_memory_config,
     sample_tap_between_delay,
 )
-from core.dream_memory.maps import DreamMemoryMap, load_map
+from core.dream_memory.map_detect import detect_map_from_screen
+from core.dream_memory.maps import DreamMemoryMap, list_maps
 from core.dream_memory.misclick import PseudoRandomMisclickScheduler
 from core.dream_memory.ocr_engine import (
     ocr_chip_text,
@@ -86,7 +87,7 @@ class DreamMemorySession:
     def __init__(
         self,
         adb: AdbClient,
-        game_map: DreamMemoryMap,
+        game_map: DreamMemoryMap | None = None,
         *,
         config: DreamMemoryConfig | None = None,
         on_status: StatusCallback | None = None,
@@ -95,11 +96,17 @@ class DreamMemorySession:
         turbo_bar_roi: tuple[int, int, int, int] | None = None,
         turbo_scan_fast: float = TURBO_PK_SCAN_FAST,
         turbo_scan_slow: float = TURBO_PK_SCAN_SLOW,
+        on_map_changed: Callable[[DreamMemoryMap], None] | None = None,
     ):
         self.adb = adb
-        self.game_map = game_map
         self.config = config or load_dream_memory_config()
+        self.game_map = game_map or DreamMemoryMap(
+            map_id="",
+            name="待识别",
+            period=int(self.config.selected_period or 0) or 1,
+        )
         self.on_status = on_status
+        self.on_map_changed = on_map_changed
         self._stop_event = threading.Event()
         self.turbo_pk = bool(turbo_pk) and bool(self.config.pk_mode)
         self._turbo_capture: WindowCapture | None = None
@@ -130,6 +137,8 @@ class DreamMemorySession:
         # 普通模式：刚点过的槽位短时抑制，防止划线未检出时连点两轮
         self._recent_taps: dict[int, tuple[str, float]] = {}
         self._recent_tap_ttl = 2.0
+        # 点过「开启章节」后，下一关地图会换，进入关卡时需重新认图
+        self._pending_new_chapter = False
         self._misclick: PseudoRandomMisclickScheduler | None = None
         if self.config.enable_misclick:
             self._misclick = PseudoRandomMisclickScheduler(
@@ -178,6 +187,75 @@ class DreamMemorySession:
             )
         )
 
+    def _apply_detected_map(self, dream_map: DreamMemoryMap, *, reason: str = "") -> None:
+        prev = self.game_map.map_id if self.game_map else ""
+        self.game_map = dream_map
+        self._recent_taps.clear()
+        self._unmatched_logged.clear()
+        hint = f"（{reason}）" if reason else ""
+        self._emit(f"自动认图：{dream_map.name} [{dream_map.map_id}]{hint}")
+        if prev != dream_map.map_id and self.on_map_changed is not None:
+            try:
+                self.on_map_changed(dream_map)
+            except Exception as exc:
+                logger.debug(f"on_map_changed 回调失败: {exc}")
+
+    def _detect_and_apply_map(
+        self,
+        *,
+        retries: int = 8,
+        retry_wait: float = 0.45,
+        allow_keep_current: bool = False,
+    ) -> bool:
+        """OCR 底栏反推当期地图并切换。成功返回 True。"""
+        if self.config.pk_mode or self.turbo_pk:
+            # PK / 极速暂不自动换图（底栏布局不同）
+            return bool(self.game_map and self.game_map.items)
+
+        period = int(self.config.selected_period or self.game_map.period or 0)
+        maps = list_maps(self.config.maps_dir, period=period)
+        if not maps:
+            self._emit(f"自动认图失败：第 {period} 期没有地图")
+            return False
+
+        last_reason = ""
+        for attempt in range(max(1, int(retries))):
+            if self._interrupted():
+                return False
+            try:
+                screen = self.adb.screenshot()
+            except Exception as exc:
+                last_reason = f"截图失败: {exc}"
+                self._emit(last_reason)
+                if not self._sleep_interruptible(retry_wait):
+                    return False
+                continue
+
+            result = detect_map_from_screen(
+                screen,
+                self.config,
+                maps=maps,
+                period=period,
+            )
+            last_reason = result.reason
+            if result.dream_map is not None:
+                self._apply_detected_map(result.dream_map, reason=result.reason)
+                return True
+
+            if attempt == 0 or (attempt + 1) % 3 == 0:
+                labels = "、".join(result.labels) if result.labels else "无"
+                self._emit(
+                    f"自动认图中…（{attempt + 1}/{retries}）底栏={labels}；{result.reason}"
+                )
+            if not self._sleep_interruptible(retry_wait):
+                return False
+
+        if allow_keep_current and self.game_map and self.game_map.items:
+            self._emit(f"自动认图未锁定，继续使用「{self.game_map.name}」（{last_reason}）")
+            return True
+        self._emit(f"自动认图失败：{last_reason or '未知原因'}")
+        return False
+
     def _lookup_coord(self, label: str) -> tuple[int, int] | None:
         if self.config.pk_mode:
             return self.game_map.lookup_strict(label)
@@ -195,6 +273,75 @@ class DreamMemorySession:
     def _roi_center(self, roi: tuple[int, int, int, int]) -> tuple[int, int]:
         x1, y1, x2, y2 = roi
         return (x1 + x2) // 2, (y1 + y2) // 2
+
+    @staticmethod
+    def _looks_like_open_chapter(text: str) -> bool:
+        """识别「开启章节」及其常见 OCR 漏字（如「开启节」），避免误伤底栏物品名。"""
+        t = re.sub(r"\s+", "", text or "")
+        if not t or "开始游戏" in t:
+            return False
+        if "开启章节" in t or "开启节" in t:
+            return True
+        # 「开」「启」「章」「节」至少命中开+节，且带启或章
+        return ("开" in t and "节" in t) and ("启" in t or "章" in t)
+
+    @staticmethod
+    def _looks_like_overtime(text: str) -> bool:
+        """失败界面「加时 / 100」按钮（两行字拼在一起后匹配）。"""
+        t = re.sub(r"\s+", "", text or "")
+        if "加时" in t:
+            return True
+        # 极端漏字：有「加」且有「100」
+        return "加" in t and "100" in t
+
+    def _ocr_two_line_button(
+        self,
+        screen,
+        roi: tuple[int, int, int, int],
+        *,
+        label: str,
+    ) -> str:
+        """两行按钮（上标题、下费用）：整块纯识别常只出首字，上下半分别认再拼接。"""
+        patch = self._crop_roi(screen, tuple(int(v) for v in roi))
+        if patch is None or getattr(patch, "size", 0) == 0:
+            return ""
+        h = int(patch.shape[0])
+        mid = max(1, h // 2)
+        parts = [patch[:mid], patch[mid:]]
+        texts: list[str] = []
+        if resolve_ocr_engine(self.config.ocr_engine) == "rapidocr":
+            try:
+                from core.dream_memory.ocr_rapid import ocr_slots_batch
+
+                texts = ocr_slots_batch(parts, label=label)
+            except Exception as exc:
+                logger.warning(f"{label} OCR 失败，回退逐块: {exc}")
+                texts = []
+        if len(texts) != len(parts):
+            texts = []
+            for part in parts:
+                text, _ = ocr_chip_text(
+                    part,
+                    engine=self.config.ocr_engine,
+                    tesseract_cmd=self.config.tesseract_cmd,
+                )
+                texts.append(text or "")
+        return re.sub(r"\s+", "", "".join(texts))
+
+    def _ocr_overtime_button(self, screen) -> str:
+        return self._ocr_two_line_button(
+            screen,
+            tuple(int(v) for v in self.config.overtime_btn_roi),
+            label="加时按钮",
+        )
+
+    def _ocr_chapter_button(self, screen) -> str:
+        """「开启章节 / 开始游戏」同为两行按钮。"""
+        return self._ocr_two_line_button(
+            screen,
+            tuple(int(v) for v in self.config.chapter_btn_roi),
+            label="章节按钮",
+        )
 
     def _crop_roi(self, screen, roi: tuple[int, int, int, int]):
         x1, y1, x2, y2 = roi
@@ -245,7 +392,7 @@ class DreamMemorySession:
             try:
                 from core.dream_memory.ocr_rapid import ocr_slots_batch
 
-                texts = ocr_slots_batch(patches)
+                texts = ocr_slots_batch(patches, label="辅助区")
             except Exception as exc:
                 logger.warning(f"辅助区批量 OCR 失败，回退逐个: {exc}")
                 texts = []
@@ -271,12 +418,108 @@ class DreamMemorySession:
         self.adb.back()
         return self._sleep_interruptible(0.6)
 
+    def _tap_upper_screen_after_claim(self) -> bool:
+        """领取后点屏幕上方若干次（可中断）。返回 False 表示被 stop。"""
+        ux, uy = (int(v) for v in self.config.upper_tap)
+        count = max(1, int(self.config.upper_tap_count))
+        gap = max(0.0, float(self.config.upper_tap_interval_sec))
+        for i in range(count):
+            self._emit(f"领取后点屏幕上方（{i + 1}/{count}）@ ({ux},{uy})")
+            self.adb.tap(ux, uy)
+            if i + 1 >= count:
+                break
+            if not self._sleep_interruptible(gap):
+                return False
+        return True
+
+    def _enter_level_outcome(self) -> str:
+        """根据是否刚开新章节，返回 started / started_new_chapter。"""
+        self._recent_taps.clear()
+        if self._pending_new_chapter:
+            self._pending_new_chapter = False
+            self._emit("已进入新章节关卡，立即恢复底栏识别（需重新认图）")
+            return "started_new_chapter"
+        self._emit("已进入关卡，立即恢复底栏识别")
+        return "started"
+
+    def _bottom_has_targets(self, screen) -> bool:
+        """底栏是否已出现可识别目标（关卡进行中）。"""
+        chips = read_target_chips(
+            screen,
+            self.config.target_slots,
+            map_keys=self._map_keys() if self.game_map else frozenset(),
+            map_aliases=self.game_map.aliases if self.game_map else {},
+            tesseract_cmd=self.config.tesseract_cmd,
+            ocr_engine=self.config.ocr_engine,
+            min_brightness=self.config.chip_active_min_brightness,
+            refs_dir=self.config.chip_refs_dir,
+            template_min_score=self.config.chip_template_min_score,
+            template_min_margin=self.config.chip_template_min_margin,
+            fuzzy_min_ratio=self.config.chip_fuzzy_min_ratio,
+            pk_mode=False,
+        )
+        return sum(1 for c in chips if c.active and (c.text or c.ocr_raw)) >= 2
+
+    def _poll_after_start_click(self, wait: float) -> str | None:
+        """点完开始游戏/开启章节/确定后轮询开局提示或底栏。
+
+        返回 ``started`` / ``started_new_chapter`` / ``stopped``；
+        超时仍未进关则返回 ``None``，由外层继续监视。
+        """
+        tip_roi = tuple(int(v) for v in self.config.start_tip_roi)
+        deadline = time.time() + max(0.5, float(wait))
+        self._emit(f"等待进入关卡（最多 {wait:g}s：开局提示或底栏目标）…")
+        while not self._interrupted():
+            try:
+                screen = self.adb.screenshot()
+            except Exception as exc:
+                self._emit(f"截图失败: {exc}")
+                if not self._sleep_interruptible(0.4):
+                    return "stopped"
+                continue
+
+            tip_text = self._ocr_roi_text(screen, tip_roi)
+            if "点击任意位置开始" in tip_text or "任意位置开始" in tip_text:
+                tx, ty = self._roi_center(tip_roi)
+                self._emit(f"检测到「点击任意位置开始」，点击 @ ({tx},{ty})")
+                self.adb.tap(tx, ty)
+                if not self._sleep_interruptible(0.35):
+                    return "stopped"
+                return self._enter_level_outcome()
+
+            # 提示已过/未出现，但底栏三槽已亮 → 游戏已开始
+            if self._bottom_has_targets(screen):
+                self._emit("底栏目标已出现，结束过关监视，恢复三槽识别")
+                return self._enter_level_outcome()
+
+            if time.time() >= deadline:
+                break
+            if not self._sleep_interruptible(0.35):
+                return "stopped"
+
+        # 超时再点一次提示区兜底（OCR 漏识时）
+        tx, ty = self._roi_center(tip_roi)
+        self._emit(f"开局提示未稳定识别，尝试点击提示区 @ ({tx},{ty})")
+        self.adb.tap(tx, ty)
+        if not self._sleep_interruptible(0.5):
+            return "stopped"
+        try:
+            screen = self.adb.screenshot()
+        except Exception as exc:
+            self._emit(f"截图失败: {exc}")
+            return None
+        if self._bottom_has_targets(screen):
+            self._emit("兜底点击后底栏已出现，恢复三槽识别")
+            return self._enter_level_outcome()
+        return None
+
     def _try_auto_advance(self) -> str:
         """过关推进监视循环：各辅助 ROI 每轮一起 OCR，按结果分支。
 
         返回:
-          - ``started``：已进入关卡，应恢复底栏 OCR
-          - ``stop_chapter``：出现「开启章节/领取」，应结束任务
+          - ``started``：已进入关卡（同地图），恢复底栏 OCR
+            （含失败「加时→确定」后走开始游戏：等提示点空地再恢复三槽）
+          - ``started_new_chapter``：开启新章节后进入关卡，需重新认图
           - ``stopped``：用户手动停止
         """
         self._emit(
@@ -284,12 +527,16 @@ class DreamMemorySession:
             f"暂停底栏 OCR，批量检查过关界面…"
         )
         wait = max(0.0, float(self.config.advance_wait_sec))
+        claim_wait = max(0.0, float(self.config.claim_after_wait_sec))
+        overtime_roi = tuple(int(v) for v in self.config.overtime_btn_roi)
+        chapter_roi = tuple(int(v) for v in self.config.chapter_btn_roi)
+        fail_continue_roi = tuple(int(v) for v in self.config.fail_continue_btn_roi)
         aux_rois = {
             "continue": tuple(int(v) for v in self.config.continue_btn_roi),
-            "chapter": tuple(int(v) for v in self.config.chapter_btn_roi),
             "start_tip": tuple(int(v) for v in self.config.start_tip_roi),
             "claim": tuple(int(v) for v in self.config.claim_btn_roi),
             "reward_title": tuple(int(v) for v in self.config.reward_title_roi),
+            "fail_continue": fail_continue_roi,
         }
 
         while not self._interrupted():
@@ -303,42 +550,106 @@ class DreamMemorySession:
 
             texts = self._ocr_aux_rois(screen, aux_rois)
             continue_text = texts.get("continue", "")
-            chapter_text = texts.get("chapter", "")
             tip_text = texts.get("start_tip", "")
             claim_text = texts.get("claim", "")
             reward_title = texts.get("reward_title", "")
+            fail_continue_text = texts.get("fail_continue", "")
+            # 两行按钮单独上下半识别（勿整块丢进辅助区 batch，否则常只出首字）
+            overtime_text = self._ocr_overtime_button(screen)
+            chapter_text = self._ocr_chapter_button(screen)
             has_reward_title = (
                 "您的奖励增加了" in reward_title or "奖励增加了" in reward_title
             )
+            has_time_up = "时间到" in reward_title
             has_continue = "继续" in continue_text
+            has_fail_confirm = "确定" in fail_continue_text
 
-            # 1) 结束类：领取 / 开启章节
-            if "领取" in claim_text:
-                self._emit(f"检测到「领取」（{claim_text}），自动结束")
-                return "stop_chapter"
-            if "开启章节" in chapter_text:
-                self._emit(f"检测到「开启章节」（{chapter_text}），自动结束")
-                return "stop_chapter"
-
-            # 2) 已在开局提示界面 → 点提示区，立刻恢复 OCR
-            if "点击任意位置开始" in tip_text or "任意位置开始" in tip_text:
-                tx, ty = self._roi_center(aux_rois["start_tip"])
-                self._emit(f"检测到「点击任意位置开始」，点击 @ ({tx},{ty})")
-                self.adb.tap(tx, ty)
-                self._recent_taps.clear()
-                self._emit("已进入关卡，立即恢复底栏识别")
-                return "started"
-
-            # 3) 大厅「开始游戏」→ 点击后等动画，下一轮再一起 OCR
-            if "开始游戏" in chapter_text:
-                bx, by = self._roi_center(aux_rois["chapter"])
-                self._emit(f"检测到「开始游戏」，点击 @ ({bx},{by})")
+            # 0) 失败加时：点「加时」→「确定」后等同「开始游戏」
+            if has_fail_confirm:
+                bx, by = self._roi_center(fail_continue_roi)
+                self._emit(
+                    f"检测到失败后「确定」（{fail_continue_text}），"
+                    f"点击 @ ({bx},{by})，随后轮询开局/底栏"
+                )
                 self.adb.tap(bx, by)
+                outcome = self._poll_after_start_click(wait)
+                if outcome is not None:
+                    return outcome
+                continue
+
+            if self._looks_like_overtime(overtime_text) or (
+                has_time_up and ("加时" in overtime_text or "加" in overtime_text)
+            ):
+                bx, by = self._roi_center(overtime_roi)
+                self._emit(
+                    f"检测到失败「加时」（{overtime_text or reward_title}），"
+                    f"点击 @ ({bx},{by})"
+                )
+                self.adb.tap(bx, by)
+                if not self._sleep_interruptible(0.8):
+                    return "stopped"
+                continue
+
+            # 标题已是「时间到」但按钮 OCR 仍空：直接点加时区（紫按钮）
+            if has_time_up:
+                bx, by = self._roi_center(overtime_roi)
+                self._emit(
+                    f"检测到「时间到」且未见确定，点击加时区 @ ({bx},{by})"
+                )
+                self.adb.tap(bx, by)
+                if not self._sleep_interruptible(0.8):
+                    return "stopped"
+                continue
+
+            # 1) 「领取」：点领取 → 等待 → 上方点两次 → 继续监视「继续/开始」
+            if "领取" in claim_text:
+                bx, by = self._roi_center(aux_rois["claim"])
+                self._emit(f"检测到「领取」（{claim_text}），点击 @ ({bx},{by})")
+                self.adb.tap(bx, by)
+                if not self._sleep_interruptible(claim_wait):
+                    return "stopped"
+                if not self._tap_upper_screen_after_claim():
+                    return "stopped"
+                # 再等一会让界面切到大厅/开始，下一轮继续 OCR
                 if not self._sleep_interruptible(wait):
                     return "stopped"
                 continue
 
-            # 4) 小关结算：先看标题「您的奖励增加了」
+            # 2) 「开启章节」：点击后立刻轮询开局提示/底栏，避免死等错过进关
+            if self._looks_like_open_chapter(chapter_text):
+                bx, by = self._roi_center(chapter_roi)
+                self._pending_new_chapter = True
+                self._emit(
+                    f"检测到「开启章节」（{chapter_text}），点击 @ ({bx},{by})"
+                    f"（新章节将重新认图）"
+                )
+                self.adb.tap(bx, by)
+                outcome = self._poll_after_start_click(wait)
+                if outcome is not None:
+                    return outcome
+                continue
+
+            # 3) 已在开局提示界面 → 点提示区，立刻恢复 OCR
+            if "点击任意位置开始" in tip_text or "任意位置开始" in tip_text:
+                tx, ty = self._roi_center(aux_rois["start_tip"])
+                self._emit(f"检测到「点击任意位置开始」，点击 @ ({tx},{ty})")
+                self.adb.tap(tx, ty)
+                if not self._sleep_interruptible(0.35):
+                    return "stopped"
+                return self._enter_level_outcome()
+
+            # 4) 大厅「开始游戏」→ 点击后轮询开局提示/底栏
+            if "开始游戏" in chapter_text:
+                bx, by = self._roi_center(chapter_roi)
+                # 不改 _pending_new_chapter：若刚点过开启章节，仍记为新章节
+                self._emit(f"检测到「开始游戏」，点击 @ ({bx},{by})")
+                self.adb.tap(bx, by)
+                outcome = self._poll_after_start_click(wait)
+                if outcome is not None:
+                    return outcome
+                continue
+
+            # 5) 小关结算：先看标题「您的奖励增加了」
             if has_reward_title:
                 if has_continue:
                     bx, by = self._roi_center(aux_rois["continue"])
@@ -352,7 +663,7 @@ class DreamMemorySession:
                     return "stopped"
                 continue
 
-            # 5) 无奖励标题时仍看到继续（兜底）
+            # 6) 无奖励标题时仍看到继续（兜底）
             if has_continue:
                 bx, by = self._roi_center(aux_rois["continue"])
                 self._emit(f"检测到「继续」，点击 @ ({bx},{by})")
@@ -360,6 +671,15 @@ class DreamMemorySession:
                 if not self._sleep_interruptible(wait):
                     return "stopped"
                 continue
+
+            # 7) 辅助区无匹配，但底栏已亮（漏掉开局提示）→ 直接恢复三槽
+            if (
+                not self._looks_like_open_chapter(chapter_text)
+                and "开始游戏" not in chapter_text
+                and self._bottom_has_targets(screen)
+            ):
+                self._emit("过关监视中发现底栏目标，恢复三槽识别")
+                return self._enter_level_outcome()
 
             if not self._sleep_interruptible(1.0):
                 return "stopped"
@@ -570,14 +890,27 @@ class DreamMemorySession:
                 f"未找到 Tesseract: {self.config.tesseract_cmd}\n"
                 "安装: https://github.com/UB-Mannheim/tesseract/wiki"
             )
-        if not self.game_map.items:
+        engine = resolve_ocr_engine(self.config.ocr_engine)
+        warmup_ocr(self.config.ocr_engine)
+
+        auto_map = bool(self.config.auto_select_map) and not self.config.pk_mode and not self.turbo_pk
+        if auto_map:
+            self._emit("自动认图已开启，正在根据底栏目标匹配当期地图…")
+            if not self._detect_and_apply_map(
+                retries=10,
+                retry_wait=0.5,
+                allow_keep_current=bool(self.game_map and self.game_map.items),
+            ):
+                raise ValueError(
+                    "自动认图失败：请确认已进入关卡且底栏有目标，"
+                    "或先手动选择地图后关闭「自动认图」"
+                )
+        elif not self.game_map.items:
             raise ValueError(
                 f"地图「{self.game_map.name}」尚无标定物品，"
                 f"请运行 tools/calibrate_dream_memory_map.py"
             )
 
-        engine = resolve_ocr_engine(self.config.ocr_engine)
-        warmup_ocr(self.config.ocr_engine)
         if self.turbo_pk:
             mode_hint = "极速PK·窗口抓屏"
             roi = self._turbo_bar_roi
@@ -600,6 +933,8 @@ class DreamMemorySession:
                 pk_hint += (
                     f"·空识别{self.config.empty_rounds_before_advance}次后自动过关"
                 )
+            if auto_map:
+                pk_hint += "·自动认图"
         misclick_hint = "·含误点" if self.config.enable_misclick else ""
         self._emit(
             f"开始({mode_hint}{misclick_hint}{pk_hint}) — 地图「{self.game_map.name}」"
@@ -636,12 +971,28 @@ class DreamMemorySession:
                     and empty_rounds >= int(self.config.empty_rounds_before_advance)
                 ):
                     outcome = self._try_auto_advance()
-                    if outcome == "stop_chapter":
-                        break
                     if outcome == "stopped":
                         break
-                    # started → 恢复底栏 OCR
                     empty_rounds = 0
+                    # 开启章节后地图会变，必须重认；「开始游戏」同地图，仅在自动认图开启时可选重认
+                    if outcome == "started_new_chapter":
+                        self._emit("新章节关卡，根据底栏目标重新认图…")
+                        ok = self._detect_and_apply_map(
+                            retries=12,
+                            retry_wait=0.5,
+                            allow_keep_current=False,
+                        )
+                        if not ok:
+                            self._emit(
+                                "新章节认图失败，请确认底栏目标已出现；"
+                                "将继续重试识别过关界面/底栏"
+                            )
+                    elif outcome == "started" and auto_map:
+                        self._detect_and_apply_map(
+                            retries=8,
+                            retry_wait=0.45,
+                            allow_keep_current=True,
+                        )
                     continue
 
                 time.sleep(self.config.scan_interval)

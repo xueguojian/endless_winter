@@ -53,6 +53,7 @@ from gui.dream_memory_panel import (
     TurboPkControls,
     build_dream_tab,
     build_turbo_pk_controls,
+    get_auto_select_map,
     get_selected_map_id,
     get_selected_period,
     get_tap_delay_seconds,
@@ -61,6 +62,7 @@ from gui.dream_memory_panel import (
     rebuild_map_index,
     set_map_selection,
     set_period_selection,
+    set_selected_map_id,
     update_summary,
 )
 from gui.task_registry import TaskEntry, HOSTING_TASK_IDS, loop_tasks, once_tasks, TASK_ENTRIES
@@ -74,11 +76,6 @@ from tasks.alliance_mobilization import (
     AllianceMobilizationSession,
     merge_task_config as merge_alliance_config,
     normalize_type_keep_rules,
-)
-from tasks.alliance_mobilization_admin import (
-    AllianceMobilizationAdminSession,
-    CALIBRATED_DETAIL_MASK_TAP,
-    merge_task_config as merge_alliance_admin_config,
 )
 from tasks.auto_lighthouse import AutoLighthouseTask, merge_task_config as merge_lighthouse_config
 from tasks.auto_mining import AutoMiningTask, merge_task_config as merge_mining_config
@@ -114,11 +111,12 @@ TASK_TAB_TO_PARAM_TAB: dict[str, str] = {
     "循环任务": "冰原巨兽",
     "一次性任务": "灯塔任务",
     "联盟刷新": "联盟总动员",
-    "管理员刷新": "联盟总动员",
 }
 
 MAIN_WIDTH = 760
-MAIN_HEIGHT = 820
+MAIN_HEIGHT = 870
+# 「运行任务」最小高度（实际会按寻梦记忆内容再抬高；须用 tk.Frame）
+TASK_PANEL_HEIGHT = 340
 LOG_WIDTH = 300
 ONCE_TASK_GAP_SEC = 3
 ONCE_TASK_COLUMNS = 2
@@ -323,8 +321,6 @@ class EndlessWinterApp(tk.Tk):
         self._dream_turbo_pk_preview_window: tk.Toplevel | None = None
         self._alliance_worker: threading.Thread | None = None
         self._alliance_session: AllianceMobilizationSession | None = None
-        self._alliance_admin_worker: threading.Thread | None = None
-        self._alliance_admin_session: AllianceMobilizationAdminSession | None = None
         self._alliance_type_bg_vars: dict[str, dict[str, tk.BooleanVar]] = {}
         self._account_check_worker: threading.Thread | None = None
         self._account_check_stop_event = threading.Event()
@@ -560,6 +556,10 @@ class EndlessWinterApp(tk.Tk):
             dm["selected_period"] = get_selected_period(self._dream_widgets)
             dm["tap_between_delay_interval"] = get_tap_interval_mode(self._dream_widgets)
             dm["tap_delay"] = get_tap_delay_seconds(self._dream_widgets)
+            if self._dream_widgets.var_auto_select_map is not None:
+                dm["auto_select_map"] = get_auto_select_map(self._dream_widgets)
+            if self._dream_widgets.var_auto_select_map is not None:
+                dm["auto_select_map"] = get_auto_select_map(self._dream_widgets)
         if self._dream_pk_widgets is not None:
             pk = cfg.setdefault("dream_memory_pk", {})
             pk["selected_map"] = get_selected_map_id(self._dream_pk_widgets)
@@ -608,46 +608,8 @@ class EndlessWinterApp(tk.Tk):
         # slots 使用代码默认值，不写入配置，避免 yaml 序列化 Python 对象
         alliance.pop("slots", None)
         # 分数阈值不再由 GUI 配置，保留文件内已有值或默认
-
-        alliance_admin = cfg.setdefault("alliance_mobilization_admin", {})
-        alliance_admin["type_keep_rules"] = dict(alliance["type_keep_rules"])
-        alliance_admin["target_types"] = list(selected_types)
-        alliance_admin["keep_orange_types"] = list(selected_types)
-        if hasattr(self, "var_alliance_admin_scan_minutes"):
-            alliance_admin["scan_interval"] = (
-                float(self.var_alliance_admin_scan_minutes.get()) * 60.0
-            )
-        merged_admin = merge_alliance_admin_config(alliance_admin)
-        alliance_admin["scan_interval"] = merged_admin["scan_interval"]
-        alliance_admin["step_delay"] = merged_admin["step_delay"]
-        alliance_admin["match_threshold"] = merged_admin["match_threshold"]
-        alliance_admin["countdown_threshold"] = merged_admin["countdown_threshold"]
-        alliance_admin["ocr_engine"] = merged_admin["ocr_engine"]
-        alliance_admin["coords"] = merged_admin["coords"]
-        alliance_admin["list_roi"] = list(merged_admin["list_roi"])
-        alliance_admin["exclude_top_px"] = merged_admin["exclude_top_px"]
-        alliance_admin["column_count"] = merged_admin["column_count"]
-        alliance_admin["scroll"] = merged_admin["scroll"]
-        alliance_admin["detail_refresh_btn_roi"] = list(
-            merged_admin["detail_refresh_btn_roi"]
-        )
-        alliance_admin["detail_icon_roi"] = list(merged_admin["detail_icon_roi"])
-        alliance_admin["detail_score_roi"] = list(merged_admin["detail_score_roi"])
-        alliance_admin["detail_title_roi"] = list(merged_admin["detail_title_roi"])
-        alliance_admin["detail_close_btn_roi"] = list(
-            merged_admin["detail_close_btn_roi"]
-        )
-        alliance_admin["detail_match_threshold"] = merged_admin[
-            "detail_match_threshold"
-        ]
-        alliance_admin["keep_orange_types"] = list(merged_admin["keep_orange_types"])
-        alliance_admin["type_keep_rules"] = {
-            tid: {"bg_colors": colors}
-            for tid, colors in merged_admin["type_keep_rules"].items()
-        }
-        alliance_admin.pop("keep_bg_colors", None)
-        alliance_admin["use_score_ocr"] = False
-        alliance_admin["target_types"] = list(merged_admin.get("target_types") or selected_types)
+        # 已移除管理员刷新，保存时清掉旧配置
+        cfg.pop("alliance_mobilization_admin", None)
 
         with open(self.config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
@@ -1434,18 +1396,11 @@ class EndlessWinterApp(tk.Tk):
 
         alliance_cfg = self.config.get("alliance_mobilization", {})
         alliance_merged = merge_alliance_config(alliance_cfg)
-        admin_cfg = self.config.get("alliance_mobilization_admin", {})
-        admin_merged = merge_alliance_admin_config(admin_cfg)
         type_keep_rules = (
-            admin_merged.get("type_keep_rules")
-            or alliance_merged.get("type_keep_rules")
-            or normalize_type_keep_rules({})
+            alliance_merged.get("type_keep_rules") or normalize_type_keep_rules({})
         )
         self.var_alliance_scan_minutes = tk.IntVar(
             value=max(1, int(round(float(alliance_merged.get("scan_interval", 360)) / 60)))
-        )
-        self.var_alliance_admin_scan_minutes = tk.IntVar(
-            value=max(1, int(round(float(admin_merged.get("scan_interval", 600)) / 60)))
         )
 
         for type_id in GUI_ALLIANCE_TYPE_ORDER:
@@ -1465,21 +1420,12 @@ class EndlessWinterApp(tk.Tk):
         row = 0
         cycle_row = ttk.Frame(tab_alliance)
         cycle_row.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 2))
-        ttk.Label(cycle_row, text="普通循环").pack(side=tk.LEFT)
+        ttk.Label(cycle_row, text="循环间隔").pack(side=tk.LEFT)
         ttk.Spinbox(
             cycle_row,
             from_=1,
             to=720,
             textvariable=self.var_alliance_scan_minutes,
-            width=5,
-            command=self._save_config,
-        ).pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Label(cycle_row, text="管理员循环").pack(side=tk.LEFT)
-        ttk.Spinbox(
-            cycle_row,
-            from_=1,
-            to=720,
-            textvariable=self.var_alliance_admin_scan_minutes,
             width=5,
             command=self._save_config,
         ).pack(side=tk.LEFT, padx=(4, 0))
@@ -1542,11 +1488,15 @@ class EndlessWinterApp(tk.Tk):
             anchor=tk.W
         )
 
-        task_frame = ttk.LabelFrame(self._left, text="运行任务", padding=4)
-        task_frame.pack(fill=tk.X, **pad)
+        # 寻梦记忆控件较多，用 tk.Frame 锁高；主窗口也加高，避免被底部「运行控制」挤掉
+        self._task_wrap = tk.Frame(self._left, height=TASK_PANEL_HEIGHT)
+        self._task_wrap.pack_propagate(False)
+        self._task_wrap.pack(fill=tk.X, **pad)
+        task_frame = ttk.LabelFrame(self._task_wrap, text="运行任务", padding=4)
+        task_frame.pack(fill=tk.BOTH, expand=True)
 
         self._task_notebook = ttk.Notebook(task_frame)
-        self._task_notebook.pack(fill=tk.X)
+        self._task_notebook.pack(fill=tk.BOTH, expand=True)
         task_notebook = self._task_notebook
 
         tab_loop = ttk.Frame(task_notebook, padding=6)
@@ -1564,9 +1514,6 @@ class EndlessWinterApp(tk.Tk):
         tab_alliance_run = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_alliance_run, text="联盟刷新")
 
-        tab_alliance_admin_run = ttk.Frame(task_notebook, padding=6)
-        task_notebook.add(tab_alliance_admin_run, text="管理员刷新")
-
         tab_dream = ttk.Frame(task_notebook, padding=6)
         task_notebook.add(tab_dream, text="寻梦记忆")
         self._build_dream_memory_tab(tab_dream)
@@ -1580,6 +1527,17 @@ class EndlessWinterApp(tk.Tk):
         self._build_dream_turbo_pk_tab(tab_dream_turbo_pk)
 
         self._task_notebook.bind("<<NotebookTabChanged>>", self._on_task_notebook_changed)
+
+        def _fit_task_panel_height() -> None:
+            try:
+                self.update_idletasks()
+                # Tab 头 + LabelFrame 边框约 56px
+                need = int(tab_dream.winfo_reqheight()) + 56
+                self._task_wrap.configure(height=max(TASK_PANEL_HEIGHT, need))
+            except tk.TclError:
+                pass
+
+        self.after_idle(_fit_task_panel_height)
 
         self._log_frame = ttk.LabelFrame(self._container, text="运行日志", padding=8)
         self.log_text = scrolledtext.ScrolledText(
@@ -2208,17 +2166,8 @@ class EndlessWinterApp(tk.Tk):
     def _is_any_dream_running(self) -> bool:
         return self._is_dream_memory_running() or self._is_dream_pk_running()
 
-    def _is_alliance_regular_running(self) -> bool:
-        return self._alliance_worker is not None and self._alliance_worker.is_alive()
-
-    def _is_alliance_admin_running(self) -> bool:
-        return (
-            self._alliance_admin_worker is not None
-            and self._alliance_admin_worker.is_alive()
-        )
-
     def _is_alliance_running(self) -> bool:
-        return self._is_alliance_regular_running() or self._is_alliance_admin_running()
+        return self._alliance_worker is not None and self._alliance_worker.is_alive()
 
     def _is_account_check_running(self) -> bool:
         return (
@@ -2299,9 +2248,6 @@ class EndlessWinterApp(tk.Tk):
     def _set_alliance_buttons(self, running: bool) -> None:
         self._update_run_control_buttons(running=running)
 
-    def _set_alliance_admin_buttons(self, running: bool) -> None:
-        self._update_run_control_buttons(running=running)
-
     def _set_dream_buttons(self, running: bool, *, pk: bool) -> None:
         _ = pk
         self._update_run_control_buttons(running=running)
@@ -2331,7 +2277,6 @@ class EndlessWinterApp(tk.Tk):
             "循环任务": self._start_loop,
             "一次性任务": self._run_once_batch,
             "联盟刷新": self._start_alliance_mobilization,
-            "管理员刷新": self._start_alliance_admin,
             "寻梦记忆": lambda: self._start_dream_session(pk=False),
             "寻梦PK": lambda: self._start_dream_session(pk=True),
             "极速寻梦PK": lambda: self._start_dream_session(pk=True, turbo=True),
@@ -2352,10 +2297,8 @@ class EndlessWinterApp(tk.Tk):
             self._stop_loop()
         if self._is_once_running():
             self._stop_once()
-        if self._is_alliance_regular_running():
+        if self._is_alliance_running():
             self._stop_alliance_mobilization()
-        if self._is_alliance_admin_running():
-            self._stop_alliance_admin()
         if self._is_dream_memory_running():
             self._stop_dream_session(pk=False)
         if self._is_dream_pk_running():
@@ -3068,7 +3011,8 @@ class EndlessWinterApp(tk.Tk):
 
         widgets = self._dream_widgets_for(pk, turbo=turbo)
         map_id = get_selected_map_id(widgets)
-        if not map_id:
+        auto_select = (not pk) and (not turbo) and get_auto_select_map(widgets)
+        if not auto_select and not map_id:
             messagebox.showwarning("提示", "请先选择或创建地图")
             return
 
@@ -3109,7 +3053,16 @@ class EndlessWinterApp(tk.Tk):
                         turbo_raw.get("tap_between_delay_mode", tap)
                     ),
                 )
-            game_map = load_map(map_id, maps_dir=dm_cfg.maps_dir)
+            if not pk and not turbo and widgets.var_auto_select_map is not None:
+                dm_cfg = replace(
+                    dm_cfg, auto_select_map=get_auto_select_map(widgets)
+                )
+            game_map = None
+            if map_id:
+                game_map = load_map(map_id, maps_dir=dm_cfg.maps_dir)
+            elif not auto_select:
+                messagebox.showwarning("提示", "请先选择或创建地图")
+                return
         except FileNotFoundError as exc:
             messagebox.showerror("地图错误", str(exc))
             return
@@ -3135,7 +3088,14 @@ class EndlessWinterApp(tk.Tk):
         title = "极速寻梦PK" if turbo else ("寻梦记忆PK" if pk else "寻梦记忆")
         self._dream_pk_turbo_active = bool(turbo)
         self._set_dream_buttons(running=True, pk=pk)
-        self._on_status(f"{title}：{game_map.name}")
+        if auto_select:
+            self._on_status(f"{title}：自动认图中…")
+        else:
+            self._on_status(f"{title}：{game_map.name if game_map else map_id}")
+
+        def _sync_map_ui(dream_map) -> None:
+            self.after(0, lambda: set_selected_map_id(widgets, dream_map.map_id))
+            self.after(0, lambda: self._on_status(f"{title}：{dream_map.name}"))
 
         def work():
             try:
@@ -3149,6 +3109,7 @@ class EndlessWinterApp(tk.Tk):
                     turbo_pk=turbo,
                     window_hwnd=window_hwnd,
                     turbo_bar_roi=turbo_bar_roi,
+                    on_map_changed=_sync_map_ui if auto_select else None,
                 )
                 if pk:
                     self._dream_pk_session = session
@@ -3277,81 +3238,6 @@ class EndlessWinterApp(tk.Tk):
         self._set_alliance_buttons(running=False)
         self._alliance_worker = None
 
-    def _start_alliance_admin(self) -> None:
-        if self._is_alliance_running():
-            messagebox.showwarning("提示", "联盟总动员已在运行")
-            return
-        if (
-            self._is_loop_running()
-            or self._is_once_running()
-            or self._is_any_dream_running()
-            or self._is_auto_click_running()
-        ):
-            messagebox.showwarning("提示", "请先停止其他任务")
-            return
-
-        type_keep_rules = self._collect_alliance_type_keep_rules()
-        if not type_keep_rules:
-            messagebox.showwarning(
-                "提示",
-                "请先在「功能参数 → 联盟总动员」勾选类型并指定保留底色",
-            )
-            return
-
-        try:
-            self.config = self._load_config()
-            self._save_config()
-            self.config = self._load_config()
-            admin_cfg = merge_alliance_admin_config(
-                self.config.get("alliance_mobilization_admin", {})
-            )
-        except Exception as exc:
-            messagebox.showerror("参数错误", str(exc))
-            return
-
-        rules_text = self._format_type_keep_rules(admin_cfg["type_keep_rules"])
-        self._set_alliance_admin_buttons(running=True)
-        mask_xy = admin_cfg["coords"].get(
-            "detail_mask_tap", list(CALIBRATED_DETAIL_MASK_TAP)
-        )
-        self._on_status(
-            f"联盟管理员刷新：保留 {rules_text}，"
-            f"循环 {int(admin_cfg['scan_interval'] // 60)} 分钟，"
-            f"遮罩 ({mask_xy[0]},{mask_xy[1]})"
-        )
-
-        def work():
-            try:
-                if not self._ensure_device():
-                    return
-                run_cfg = dict(admin_cfg)
-                run_cfg["use_score_ocr"] = False
-                session = AllianceMobilizationAdminSession(
-                    self._get_adb(),
-                    admin_cfg=run_cfg,
-                    on_status=self._on_status,
-                )
-                self._alliance_admin_session = session
-                session.run_until_stopped()
-            except Exception as exc:
-                self._on_status(f"联盟管理员刷新异常：{exc}")
-            finally:
-                self._alliance_admin_session = None
-                self.after(0, self._on_alliance_admin_worker_done)
-
-        self._alliance_admin_worker = threading.Thread(target=work, daemon=True)
-        self._alliance_admin_worker.start()
-
-    def _stop_alliance_admin(self) -> None:
-        session = self._alliance_admin_session
-        if session is not None:
-            session.stop()
-        self._on_status("正在结束联盟管理员刷新…")
-
-    def _on_alliance_admin_worker_done(self) -> None:
-        self._set_alliance_admin_buttons(running=False)
-        self._alliance_admin_worker = None
-
     def _on_loop_worker_done(self) -> None:
         self._set_loop_buttons(running=False)
         self._loop_tasks.clear()
@@ -3370,7 +3256,6 @@ class EndlessWinterApp(tk.Tk):
                 self._stop_dream_memory()
                 self._stop_dream_session(pk=True)
                 self._stop_alliance_mobilization()
-                self._stop_alliance_admin()
                 self._stop_check_account_name()
                 self._stop_auto_click()
                 self.destroy()

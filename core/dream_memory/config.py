@@ -45,22 +45,32 @@ TURBO_PK_TAP_BETWEEN = 0.09
 DEFAULT_TESSERACT_CMD = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
 DEFAULT_OCR_ENGINE = "rapidocr"
 
-# 寻梦地图期数：旧 YAML 无 period 时默认第 4 期；当前活动第 9 期
+# 寻梦地图期数：旧 YAML 无 period 时默认第 4 期；当前活动第 10 期
 DEFAULT_MAP_PERIOD = 4
-CURRENT_MAP_PERIOD = 9
+CURRENT_MAP_PERIOD = 10
 
 # 过关自动推进（普通模式）：连续空识别后检查「继续」→「开始游戏/开启章节」
 DEFAULT_EMPTY_ROUNDS_BEFORE_ADVANCE = 10
 DEFAULT_CONTINUE_BTN_ROI: tuple[int, int, int, int] = (210, 878, 512, 954)
+# 「开始游戏 / 开启章节」共用（勿收太紧，否则易与底栏槽位叠读）
 DEFAULT_CHAPTER_BTN_ROI: tuple[int, int, int, int] = (280, 1128, 568, 1214)
 DEFAULT_ADVANCE_WAIT_SEC = 5.0
 DEFAULT_CENTER_TAP: tuple[int, int] = (360, 640)
 # 点「开始游戏」后：等待再识别「点击任意位置开始」
 DEFAULT_START_TIP_ROI: tuple[int, int, int, int] = (256, 790, 464, 824)
-# 「领取」通关奖励按钮；出现则结束（等同开启章节）
+# 「领取」通关奖励：点击后等一会，再点屏幕上方两次，继续识别「继续/开始」
 DEFAULT_CLAIM_BTN_ROI: tuple[int, int, int, int] = (200, 1034, 510, 1124)
+DEFAULT_CLAIM_AFTER_WAIT_SEC = 3.0
+DEFAULT_UPPER_TAP: tuple[int, int] = (360, 220)
+DEFAULT_UPPER_TAP_COUNT = 2
+DEFAULT_UPPER_TAP_INTERVAL_SEC = 1.2
 # 小关结算标题「您的奖励增加了」；有标题无「继续」= 被遮挡
 DEFAULT_REWARD_TITLE_ROI: tuple[int, int, int, int] = (178, 264, 528, 330)
+# 失败加时：「加时 100」→「确定」→ 等同开始游戏（等动画再点空地提示后恢复三槽）
+DEFAULT_OVERTIME_BTN_ROI: tuple[int, int, int, int] = (386, 904, 636, 974)
+DEFAULT_FAIL_CONTINUE_BTN_ROI: tuple[int, int, int, int] = (378, 734, 666, 808)
+# 保留兼容；实际等待用 advance_wait_sec（与开始游戏一致）
+DEFAULT_FAIL_CONTINUE_RESUME_WAIT_SEC = 0.5
 
 TAP_INTERVAL_FIXED = "fixed"
 TAP_INTERVAL_RANDOM = "random"
@@ -135,6 +145,8 @@ class DreamMemoryConfig:
     bar_change_mean_delta: float = 8.0
     # 普通模式：连续空识别后自动过关推进
     auto_advance: bool = True
+    # 根据底栏三个目标反推当期地图（无需手选）
+    auto_select_map: bool = False
     empty_rounds_before_advance: int = DEFAULT_EMPTY_ROUNDS_BEFORE_ADVANCE
     continue_btn_roi: tuple[int, int, int, int] = DEFAULT_CONTINUE_BTN_ROI
     chapter_btn_roi: tuple[int, int, int, int] = DEFAULT_CHAPTER_BTN_ROI
@@ -142,7 +154,14 @@ class DreamMemoryConfig:
     center_tap: tuple[int, int] = DEFAULT_CENTER_TAP
     start_tip_roi: tuple[int, int, int, int] = DEFAULT_START_TIP_ROI
     claim_btn_roi: tuple[int, int, int, int] = DEFAULT_CLAIM_BTN_ROI
+    claim_after_wait_sec: float = DEFAULT_CLAIM_AFTER_WAIT_SEC
+    upper_tap: tuple[int, int] = DEFAULT_UPPER_TAP
+    upper_tap_count: int = DEFAULT_UPPER_TAP_COUNT
+    upper_tap_interval_sec: float = DEFAULT_UPPER_TAP_INTERVAL_SEC
     reward_title_roi: tuple[int, int, int, int] = DEFAULT_REWARD_TITLE_ROI
+    overtime_btn_roi: tuple[int, int, int, int] = DEFAULT_OVERTIME_BTN_ROI
+    fail_continue_btn_roi: tuple[int, int, int, int] = DEFAULT_FAIL_CONTINUE_BTN_ROI
+    fail_continue_resume_wait_sec: float = DEFAULT_FAIL_CONTINUE_RESUME_WAIT_SEC
 
     def ensure_dirs(self) -> None:
         self.maps_dir.mkdir(parents=True, exist_ok=True)
@@ -292,6 +311,7 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
         ),
         bar_change_mean_delta=float(raw.get("bar_change_mean_delta", 8.0)),
         auto_advance=bool(raw.get("auto_advance", True)),
+        auto_select_map=bool(raw.get("auto_select_map", False)),
         empty_rounds_before_advance=max(
             1,
             int(raw.get("empty_rounds_before_advance", DEFAULT_EMPTY_ROUNDS_BEFORE_ADVANCE)),
@@ -302,8 +322,31 @@ def _build_config(raw: dict, *, pk: bool) -> DreamMemoryConfig:
         center_tap=_parse_point(raw.get("center_tap"), DEFAULT_CENTER_TAP),
         start_tip_roi=_parse_roi(raw.get("start_tip_roi"), DEFAULT_START_TIP_ROI),
         claim_btn_roi=_parse_roi(raw.get("claim_btn_roi"), DEFAULT_CLAIM_BTN_ROI),
+        claim_after_wait_sec=max(
+            0.0, float(raw.get("claim_after_wait_sec", DEFAULT_CLAIM_AFTER_WAIT_SEC))
+        ),
+        upper_tap=_parse_point(raw.get("upper_tap"), DEFAULT_UPPER_TAP),
+        upper_tap_count=max(1, int(raw.get("upper_tap_count", DEFAULT_UPPER_TAP_COUNT))),
+        upper_tap_interval_sec=max(
+            0.0, float(raw.get("upper_tap_interval_sec", DEFAULT_UPPER_TAP_INTERVAL_SEC))
+        ),
         reward_title_roi=_parse_roi(
             raw.get("reward_title_roi"), DEFAULT_REWARD_TITLE_ROI
+        ),
+        overtime_btn_roi=_parse_roi(
+            raw.get("overtime_btn_roi"), DEFAULT_OVERTIME_BTN_ROI
+        ),
+        fail_continue_btn_roi=_parse_roi(
+            raw.get("fail_continue_btn_roi"), DEFAULT_FAIL_CONTINUE_BTN_ROI
+        ),
+        fail_continue_resume_wait_sec=max(
+            0.0,
+            float(
+                raw.get(
+                    "fail_continue_resume_wait_sec",
+                    DEFAULT_FAIL_CONTINUE_RESUME_WAIT_SEC,
+                )
+            ),
         ),
     )
     cfg.maps_dir = _parse_optional_path(raw.get("maps_dir"), default_maps)

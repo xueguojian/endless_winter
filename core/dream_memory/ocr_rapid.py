@@ -157,8 +157,9 @@ def ocr_slots_batch(
     patches: list[np.ndarray],
     *,
     scale: float = DEFAULT_SCALE,
+    label: str = "槽",
 ) -> list[str]:
-    """逐槽纯识别（底栏 ROI 固定，比合并检测快且不会串字）。"""
+    """逐块纯识别（底栏 / 辅助区共用）。"""
     if not patches:
         return []
 
@@ -178,7 +179,7 @@ def ocr_slots_batch(
                 logger.debug(f"RapidOCR rec scale={scale}: {text!r} ({total:.3f}s)")
             texts.append(text)
     elapsed = time.perf_counter() - t0
-    logger.info(f"RapidOCR {len(patches)} 槽识别: {texts} ({elapsed:.2f}s)")
+    logger.info(f"RapidOCR {len(patches)} {label}识别: {texts} ({elapsed:.2f}s)")
     return texts
 
 

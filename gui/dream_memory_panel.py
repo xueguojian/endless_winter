@@ -46,6 +46,7 @@ class DreamTabWidgets:
     var_tap_interval: tk.StringVar | None = None
     cmb_tap_interval: ttk.Combobox | None = None
     var_tap_delay: tk.StringVar | None = None
+    var_auto_select_map: tk.BooleanVar | None = None
     config_section: str = ""
     label_to_id: dict[str, str] = field(default_factory=dict)
     id_to_label: dict[str, str] = field(default_factory=dict)
@@ -98,6 +99,21 @@ def get_selected_map_id(widgets: DreamTabWidgets) -> str:
     return sel
 
 
+def get_auto_select_map(widgets: DreamTabWidgets) -> bool:
+    if widgets.var_auto_select_map is None:
+        return False
+    return bool(widgets.var_auto_select_map.get())
+
+
+def set_selected_map_id(widgets: DreamTabWidgets, map_id: str) -> None:
+    """程序内切换地图下拉（自动认图后同步 UI）。"""
+    map_id = (map_id or "").strip()
+    if not map_id:
+        return
+    label = widgets.id_to_label.get(map_id, map_id)
+    widgets.var_map.set(label)
+
+
 def get_selected_period(widgets: DreamTabWidgets) -> int:
     return parse_period_choice(
         widgets.var_period.get(),
@@ -144,17 +160,15 @@ def update_summary(app: EndlessWinterApp, widgets: DreamTabWidgets) -> None:
     try:
         dm_cfg = load_dream_cfg(app, widgets.pk)
         dream_map = load_map(map_id, maps_dir=dm_cfg.maps_dir)
-        slot_hint = f"{len(dm_cfg.target_slots)} 槽"
         preview_hint = (
-            " · 已上传预览图"
+            "·已上传预览图"
             if has_map_preview(map_id, previews_dir=dm_cfg.previews_dir)
             else ""
         )
         widgets.lbl_summary.configure(
             text=(
-                f"第 {dream_map.period} 期 · 显示名：{dream_map.name}"
-                f" · 已标定 {len(dream_map.items)} 个物品"
-                f" · 识别区 {slot_hint}{preview_hint}"
+                f"第{dream_map.period}期·{dream_map.name}"
+                f"·已标定{len(dream_map.items)}物品{preview_hint}"
             )
         )
     except FileNotFoundError:
@@ -347,8 +361,6 @@ def build_dream_tab(
         parent,
         text="",
         foreground="#555",
-        wraplength=480,
-        justify=tk.LEFT,
     )
     if show_summary:
         lbl_summary.pack(anchor=tk.W, pady=(0, 4))
@@ -386,6 +398,7 @@ def build_dream_tab(
     ).pack(side=tk.LEFT)
 
     var_tap_delay: tk.StringVar | None = None
+    var_auto_select_map: tk.BooleanVar | None = None
     if section == "dream_memory":
         tap_delay_val = float(section_cfg.get("tap_delay", dm_cfg.tap_delay))
         var_tap_delay = tk.StringVar(value=f"{tap_delay_val:g}")
@@ -399,6 +412,25 @@ def build_dream_tab(
             row_delay,
             text="秒（本批点完后再截图；太短易读到旧底栏）",
             foreground="#555",
+        ).pack(side=tk.LEFT)
+
+        auto_default = bool(
+            section_cfg.get("auto_select_map", getattr(dm_cfg, "auto_select_map", False))
+        )
+        var_auto_select_map = tk.BooleanVar(value=auto_default)
+        row_auto = ttk.Frame(parent)
+        row_auto.pack(fill=tk.X, pady=(0, 6))
+        def _persist_auto_select() -> None:
+            try:
+                app._save_config()
+            except Exception:
+                pass
+
+        ttk.Checkbutton(
+            row_auto,
+            text="自动认图（根据底栏三个目标反推当期地图，无需手选）",
+            variable=var_auto_select_map,
+            command=_persist_auto_select,
         ).pack(side=tk.LEFT)
 
     preview_row = ttk.Frame(parent)
@@ -420,6 +452,7 @@ def build_dream_tab(
         var_tap_interval=var_tap_interval,
         cmb_tap_interval=cmb_tap_interval,
         var_tap_delay=var_tap_delay,
+        var_auto_select_map=var_auto_select_map,
         config_section=section,
         label_to_id=label_to_id,
         id_to_label=id_to_label,
